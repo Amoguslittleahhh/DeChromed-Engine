@@ -1,0 +1,20 @@
+[package]
+name = "shell"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "dechromed"
+path = "src/main.rs"
+
+[dependencies]
+dom = { path = "../dom" }
+html = { path = "../html" }
+css = { path = "../css" }
+layout = { path = "../layout" }
+paint = { path = "../paint" }
+net = { path = "../net" }

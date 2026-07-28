@@ -76,11 +76,19 @@ block/inline layout → canvas paint. ~10 CSS properties, no real HTML5
 algorithm, no JS. Proves pipeline shape only.
 **Exit:** met. Frozen as a demo artifact; real work starts at A1.
 
-### A1. Project foundation
-Real multi-crate Rust workspace (see "Language & repo shape" below).
-CI running. WPT test harness wired up end-to-end even at ~0% pass rate, so
-pass-rate becomes the metric from day one.
-**Exit:** empty-but-structured repo, CI green, WPT harness executing.
+### A1. Project foundation — *done*
+Real multi-crate Rust workspace under `engine/` (see "Language & repo
+shape" below and `engine/README.md`): `dom`, `html`, `css`, `layout`,
+`paint`, `js_bindings`, `net`, `media`, `a11y`, `devtools`, `shell`, plus
+`html5lib_harness` — a conformance harness (html5lib-tests' JSON tokenizer
+suite, not full WPT, since WPT needs a JS engine to run `testharness.js`
+and Track C doesn't exist yet) wired end to end against a deliberately
+unimplemented tokenizer. CI (`.github/workflows/engine-ci.yml`) runs
+fmt/clippy/build/test/harness/smoke-test on every push touching `engine/`.
+**Exit:** met — repo structured, CI green, harness executing and reporting
+a real (near-zero, as expected) baseline: **0.2% (15/6487)** on
+html5lib-tests tokenizer tests. That number is the metric A2 moves toward
+95%.
 
 ### A2. WHATWG-spec HTML tokenizer
 The real [~80-state tokenizer state machine](https://html.spec.whatwg.org/multipage/parsing.html#tokenization),
@@ -838,12 +846,19 @@ Two of the highest-leverage precedents above aren't phase-specific at all:
 
 ## What to actually do next
 
-Given everything above, the highest-leverage starting point is unchanged
-from before: **A1** (project foundation) immediately followed by **A2-A3**
-(spec-real HTML parsing) and **A4-A7** (spec-real CSS). That slice is
-tractable as an ongoing project between us without a team, produces a
-genuinely useful standalone HTML+CSS engine faster than any other path
-through this document, and every later track (B especially) depends on it
-existing first regardless of which fork you take on the JS engine question.
+**A1 is done** — see `engine/` and `engine/README.md`. The highest-leverage
+next step is unchanged in shape: **A2** (the real WHATWG tokenizer state
+machine, replacing the placeholder in `engine/crates/html/src/tokenizer.rs`)
+immediately followed by **A3** (tree construction) and **A4-A7** (spec-real
+CSS). That slice is tractable as an ongoing project between us without a
+team, produces a genuinely useful standalone HTML+CSS engine faster than any
+other path through this document, and every later track (B especially)
+depends on it existing first regardless of which fork you take on the JS
+engine question.
 
-Say the word and I'll scaffold the Rust workspace for A1.
+Progress is now trackable concretely: run `cargo run --release -p
+html5lib_harness` from `engine/` and watch the pass rate climb from its
+current 0.2% baseline toward A2's 95% exit criterion as the real tokenizer
+gets built out state by state.
+
+Say the word and I'll start on A2.

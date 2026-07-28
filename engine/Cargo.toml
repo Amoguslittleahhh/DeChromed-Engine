@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dom",
+    "crates/html",
+    "crates/css",
+    "crates/layout",
+    "crates/paint",
+    "crates/js_bindings",
+    "crates/net",
+    "crates/media",
+    "crates/a11y",
+    "crates/devtools",
+    "crates/shell",
+    "crates/html5lib_harness",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[profile.dev]
+# Keep incremental builds fast for a workspace this shape will grow into.
+debug = 1

@@ -1,0 +1,49 @@
+name: engine-ci
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "engine/**"
+      - ".github/workflows/engine-ci.yml"
+  pull_request:
+    paths:
+      - "engine/**"
+      - ".github/workflows/engine-ci.yml"
+
+defaults:
+  run:
+    working-directory: engine
+
+jobs:
+  build-test-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine -> target
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --verbose
+
+      - name: Unit tests
+        run: cargo test --workspace --verbose
+
+      - name: html5lib-tests tokenizer harness
+        run: cargo run --release -p html5lib_harness
+
+      - name: Pipeline smoke test
+        run: cargo run -p shell
