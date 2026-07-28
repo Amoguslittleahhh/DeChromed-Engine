@@ -12,6 +12,9 @@ dependencies = [
 [[package]]
 name = "css"
 version = "0.0.0"
+dependencies = [
+ "dom",
+]
 
 [[package]]
 name = "devtools"
@@ -36,6 +39,7 @@ dependencies = [
 name = "html5lib_harness"
 version = "0.0.0"
 dependencies = [
+ "dom",
  "html",
  "serde",
  "serde_json",

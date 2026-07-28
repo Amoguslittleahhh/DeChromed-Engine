@@ -16,15 +16,20 @@
 //! itself works, but `escapeFlag.test` specifically exercises the escaped
 //! variants and is expected to fail until that's filled in.
 //!
-//! Because tree construction (A3) doesn't exist yet to signal "the next
-//! start tag's content is RCDATA/RAWTEXT" the way a real parser does,
-//! `tokenize()` takes an explicit starting state -- this mirrors
-//! html5lib-tests' own `initialStates` field, which exists precisely
-//! because the tokenizer can't know this on its own without a tree builder
-//! driving it.
+//! `tokenize()`/`tokenize_from()`/`tokenize_with()` run the tokenizer to
+//! completion in one call, matching html5lib-tests' tokenizer-only test
+//! format (which specifies a fixed `initialStates` up front). A3's tree
+//! builder needs something more dynamic than that: the real spec has tree
+//! construction tell the tokenizer *while parsing* to switch into RCDATA/
+//! RAWTEXT/ScriptData/PLAINTEXT the moment it sees a `<title>`/`<style>`/
+//! `<script>`/`<plaintext>` start tag, and switch back to Data afterward --
+//! [`Tokenizer`] (the struct, made public for this) plus [`Tokenizer::next_token`]
+//! and [`Tokenizer::set_state`] expose exactly that: pull one token at a
+//! time, and change state in between pulls.
 
 use crate::entities;
 use crate::Token;
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Not all states are reachable until ScriptData escaping is implemented.
@@ -137,7 +142,7 @@ pub fn tokenize_with(
     let mut tok = Tokenizer::new(input, start_state);
     tok.last_start_tag_name = last_start_tag.map(str::to_string);
     tok.run();
-    tok.tokens
+    Vec::from(tok.tokens)
 }
 
 /// Codepoints 0x80-0x9F map to these characters instead of themselves when
@@ -152,12 +157,12 @@ const C1_REPLACEMENTS: [char; 32] = [
     '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{009D}', '\u{017E}', '\u{0178}',
 ];
 
-struct Tokenizer {
+pub struct Tokenizer {
     chars: Vec<char>,
     pos: usize,
     state: TokenizerState,
     return_state: TokenizerState,
-    tokens: Vec<Token>,
+    tokens: VecDeque<Token>,
 
     // Current tag being built (start or end).
     tag_name: String,
@@ -201,14 +206,14 @@ fn normalize_newlines(input: &str) -> String {
 }
 
 impl Tokenizer {
-    fn new(input: &str, start_state: TokenizerState) -> Self {
+    pub fn new(input: &str, start_state: TokenizerState) -> Self {
         let normalized = normalize_newlines(input);
         Tokenizer {
             chars: normalized.chars().collect(),
             pos: 0,
             state: start_state,
             return_state: TokenizerState::Data,
-            tokens: Vec::new(),
+            tokens: VecDeque::new(),
             tag_name: String::new(),
             tag_is_end: false,
             tag_self_closing: false,
@@ -258,7 +263,7 @@ impl Tokenizer {
     }
 
     fn emit_char(&mut self, c: char) {
-        self.tokens.push(Token::Character(c));
+        self.tokens.push_back(Token::Character(c));
     }
 
     fn emit_str(&mut self, s: &str) {
@@ -295,12 +300,12 @@ impl Tokenizer {
     fn emit_tag(&mut self) {
         self.finish_attribute();
         if self.tag_is_end {
-            self.tokens.push(Token::EndTag {
+            self.tokens.push_back(Token::EndTag {
                 name: self.tag_name.clone(),
             });
         } else {
             self.last_start_tag_name = Some(self.tag_name.clone());
-            self.tokens.push(Token::StartTag {
+            self.tokens.push_back(Token::StartTag {
                 name: self.tag_name.clone(),
                 attributes: self.attrs.clone(),
                 self_closing: self.tag_self_closing,
@@ -309,11 +314,11 @@ impl Tokenizer {
     }
 
     fn emit_comment(&mut self) {
-        self.tokens.push(Token::Comment(self.comment.clone()));
+        self.tokens.push_back(Token::Comment(self.comment.clone()));
     }
 
     fn emit_doctype(&mut self) {
-        self.tokens.push(Token::Doctype {
+        self.tokens.push_back(Token::Doctype {
             name: self.doctype_name.clone(),
             public_id: self.doctype_public_id.clone(),
             system_id: self.doctype_system_id.clone(),
@@ -357,6 +362,54 @@ impl Tokenizer {
         }
     }
 
+    /// Pulls the next token, running the state machine just far enough to
+    /// produce one. Used by the tree builder (A3), which needs to inspect
+    /// each token (and possibly call [`Tokenizer::set_state`] in response)
+    /// before the next one is produced -- unlike `run()`, which tokenizes
+    /// an entire input up front assuming a fixed state throughout.
+    pub fn next_token(&mut self) -> Token {
+        if let Some(t) = self.tokens.pop_front() {
+            return t;
+        }
+        let max_steps = 200_000usize;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            assert!(
+                steps <= max_steps,
+                "tokenizer exceeded {max_steps} steps producing one token (likely an infinite loop) in state {:?} at pos {}",
+                self.state,
+                self.pos
+            );
+            let done = self.step();
+            if let Some(t) = self.tokens.pop_front() {
+                return t;
+            }
+            if done {
+                return Token::Eof;
+            }
+        }
+    }
+
+    /// Switches the tokenizer's state -- how the tree builder (A3) tells it
+    /// "the content of the element you're about to see is RCDATA/RAWTEXT/
+    /// ScriptData/PLAINTEXT, not ordinary markup," per the tree
+    /// construction algorithm's various "switch the tokenizer to the ...
+    /// state" steps.
+    pub fn set_state(&mut self, state: TokenizerState) {
+        self.state = state;
+    }
+
+    /// Sets the "last start tag emitted," used by RCDATA/RAWTEXT/ScriptData's
+    /// "appropriate end tag token" check. The tree builder calls this
+    /// whenever it processes a start tag, so the tokenizer's later matching
+    /// end-tag check reflects real parsing rather than a value primed once
+    /// up front (which is all `tokenize_with` can do without a tree builder
+    /// driving it).
+    pub fn set_last_start_tag(&mut self, name: Option<String>) {
+        self.last_start_tag_name = name;
+    }
+
     /// Runs one state's worth of work. Returns `true` when tokenization is
     /// complete (EOF has been emitted).
     fn step(&mut self) -> bool {
@@ -365,7 +418,7 @@ impl Tokenizer {
             Data => {
                 match self.advance() {
                     None => {
-                        self.tokens.push(Token::Eof);
+                        self.tokens.push_back(Token::Eof);
                         return true;
                     }
                     Some('&') => {
@@ -382,7 +435,7 @@ impl Tokenizer {
             }
             RcData => match self.advance() {
                 None => {
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some('&') => {
@@ -395,7 +448,7 @@ impl Tokenizer {
             },
             RawText => match self.advance() {
                 None => {
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some('<') => self.state = RawTextLessThanSign,
@@ -404,7 +457,7 @@ impl Tokenizer {
             },
             ScriptData => match self.advance() {
                 None => {
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some('<') => self.state = ScriptDataLessThanSign,
@@ -413,7 +466,7 @@ impl Tokenizer {
             },
             PlainText => match self.advance() {
                 None => {
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some('\0') => self.emit_char('\u{FFFD}'),
@@ -439,7 +492,7 @@ impl Tokenizer {
                 }
                 None => {
                     self.emit_char('<');
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -458,7 +511,7 @@ impl Tokenizer {
                 }
                 None => {
                     self.emit_str("</");
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -479,7 +532,7 @@ impl Tokenizer {
                 Some('\0') => self.tag_name.push('\u{FFFD}'),
                 Some(c) => self.tag_name.push(c),
                 None => {
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },
@@ -627,7 +680,7 @@ impl Tokenizer {
                     self.state = Data;
                 }
                 None => {
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -663,7 +716,7 @@ impl Tokenizer {
                 Some('\0') => self.attr_value.push('\u{FFFD}'),
                 Some(c) => self.attr_value.push(c),
                 None => {
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },
@@ -676,7 +729,7 @@ impl Tokenizer {
                 Some('\0') => self.attr_value.push('\u{FFFD}'),
                 Some(c) => self.attr_value.push(c),
                 None => {
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },
@@ -693,7 +746,7 @@ impl Tokenizer {
                 Some('\0') => self.attr_value.push('\u{FFFD}'),
                 Some(c) => self.attr_value.push(c),
                 None => {
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },
@@ -712,7 +765,7 @@ impl Tokenizer {
                     self.state = Data;
                 }
                 None => {
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => self.state = BeforeAttributeName,
@@ -725,7 +778,7 @@ impl Tokenizer {
                     self.state = Data;
                 }
                 None => {
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => self.state = BeforeAttributeName,
@@ -740,7 +793,7 @@ impl Tokenizer {
                 Some(c) => self.comment.push(c),
                 None => {
                     self.emit_comment();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },
@@ -793,7 +846,7 @@ impl Tokenizer {
                 }
                 None => {
                     self.emit_comment();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -811,7 +864,7 @@ impl Tokenizer {
                 Some(c) => self.comment.push(c),
                 None => {
                     self.emit_comment();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },
@@ -851,7 +904,7 @@ impl Tokenizer {
                 }
                 None => {
                     self.emit_comment();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -875,7 +928,7 @@ impl Tokenizer {
                 }
                 None => {
                     self.emit_comment();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -896,7 +949,7 @@ impl Tokenizer {
                 }
                 None => {
                     self.emit_comment();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -915,7 +968,7 @@ impl Tokenizer {
                     self.doctype_name = None;
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => self.state = BeforeDoctypeName,
@@ -940,7 +993,7 @@ impl Tokenizer {
                     self.doctype_name = None;
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(c) => {
@@ -967,7 +1020,7 @@ impl Tokenizer {
                 None => {
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },
@@ -988,7 +1041,7 @@ impl Tokenizer {
                         None => {
                             self.doctype_force_quirks = true;
                             self.emit_doctype();
-                            self.tokens.push(Token::Eof);
+                            self.tokens.push_back(Token::Eof);
                             return true;
                         }
                         Some(_) => {
@@ -1022,7 +1075,7 @@ impl Tokenizer {
                 None => {
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -1053,7 +1106,7 @@ impl Tokenizer {
                 None => {
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -1079,7 +1132,7 @@ impl Tokenizer {
                 None => {
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },
@@ -1101,7 +1154,7 @@ impl Tokenizer {
                 None => {
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },
@@ -1128,7 +1181,7 @@ impl Tokenizer {
                 None => {
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -1158,7 +1211,7 @@ impl Tokenizer {
                 None => {
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -1190,7 +1243,7 @@ impl Tokenizer {
                 None => {
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -1221,7 +1274,7 @@ impl Tokenizer {
                 None => {
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => {
@@ -1247,7 +1300,7 @@ impl Tokenizer {
                 None => {
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },
@@ -1269,7 +1322,7 @@ impl Tokenizer {
                 None => {
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },
@@ -1285,7 +1338,7 @@ impl Tokenizer {
                 None => {
                     self.doctype_force_quirks = true;
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
                 Some(_) => self.state = BogusDoctype,
@@ -1298,7 +1351,7 @@ impl Tokenizer {
                 Some(_) => {}
                 None => {
                     self.emit_doctype();
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },
@@ -1307,7 +1360,7 @@ impl Tokenizer {
                 Some(']') => self.state = CdataSectionBracket,
                 Some(c) => self.emit_char(c),
                 None => {
-                    self.tokens.push(Token::Eof);
+                    self.tokens.push_back(Token::Eof);
                     return true;
                 }
             },

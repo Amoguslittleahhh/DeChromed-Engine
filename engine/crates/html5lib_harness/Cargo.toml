@@ -4,14 +4,23 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[lib]
+name = "html5lib_harness"
+path = "src/lib.rs"
+
 [[bin]]
 name = "html5lib_harness"
 path = "src/main.rs"
+
+[[bin]]
+name = "tree_construction_harness"
+path = "src/bin/tree_construction_harness.rs"
 
 [lints]
 workspace = true
 
 [dependencies]
+dom = { path = "../dom" }
 html = { path = "../html" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,8 +1,6 @@
-//! Roadmap phase: Track A2 (tokenizer) / A3 (tree construction).
-//!
-//! A2's real WHATWG tokenizer state machine lives in `tokenizer.rs` (see its
-//! module docs for exactly what's implemented vs. still a known gap). A3's
-//! tree construction (`tree_builder.rs`) is still a placeholder.
+//! Roadmap phase: Track A2 (tokenizer, done) / A3 (tree construction, done
+//! for the common HTML-content case; see `tree_builder.rs` module docs for
+//! documented gaps -- foreign content, fragment parsing, framesets).
 //!
 //! Reference: <https://html.spec.whatwg.org/multipage/parsing.html#tokenization>
 
@@ -12,5 +10,5 @@ pub mod tokenizer;
 pub mod tree_builder;
 
 pub use token::Token;
-pub use tokenizer::{tokenize, tokenize_from, tokenize_with, TokenizerState};
-pub use tree_builder::build_tree;
+pub use tokenizer::{tokenize, tokenize_from, tokenize_with, Tokenizer, TokenizerState};
+pub use tree_builder::{build_tree, parse_document};

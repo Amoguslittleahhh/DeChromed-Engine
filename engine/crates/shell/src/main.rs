@@ -1,22 +1,32 @@
 //! Roadmap phase: Track F7 (browser UI shell), but today this is just a
-//! CLI smoke test wiring every crate together end to end -- html -> dom ->
-//! (eventually) css -> layout -> paint -- so A1's exit criterion ("empty
-//! but structured repo") means something more concrete than "it compiles":
-//! the pipeline shape actually runs, even though every stage is currently
-//! a placeholder per its own crate's docs.
+//! CLI smoke test wiring every crate together end to end. A2 (tokenizer),
+//! A3 (tree construction), A4 (CSS parser), and A5 (selectors) are real
+//! now -- this demonstrates parsing a real document, parsing a real
+//! stylesheet, and matching a real selector against the resulting tree.
+//! Layout/paint are still placeholders (Track B).
 
 fn main() {
-    let input = "<p>hello</p>";
+    let input = "<!DOCTYPE html><html><body><p class=\"greeting\">hello</p></body></html>";
+    let document = html::parse_document(input);
 
-    let tokens = html::tokenize(input);
-    let document = html::build_tree(&tokens);
-    let _stylesheet = css::parse_stylesheet("p { color: red; }");
+    let stylesheet = css::parse_stylesheet("p.greeting { color: red; }");
+    let selector =
+        css::selectors::parse_selector_list("p.greeting").expect("selector should parse");
+
     let fragments = layout::layout();
     let _display_list = paint::build_display_list(&fragments);
 
     println!("DeChromed Engine -- pipeline smoke test");
     println!("input: {input:?}");
-    println!("tokens: {tokens:?}");
     println!("dom:\n{document}");
-    println!("(css/layout/paint stages ran but are placeholders -- see ROADMAP.md Track A/B)");
+    println!("stylesheet: {} rule(s) parsed", stylesheet.rules.len());
+
+    let mut matched = 0;
+    document.walk(document.root(), &mut |id, _depth| {
+        if css::selectors::matches(&document, id, &selector) {
+            matched += 1;
+        }
+    });
+    println!("selector \"p.greeting\" matched {matched} element(s) in the tree");
+    println!("(layout/paint stages ran but are placeholders -- see ROADMAP.md Track B)");
 }
