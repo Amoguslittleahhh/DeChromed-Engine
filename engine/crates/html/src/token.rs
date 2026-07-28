@@ -5,7 +5,9 @@
 pub enum Token {
     Doctype {
         name: Option<String>,
-        // public_id / system_id / force_quirks land here once A2 needs them.
+        public_id: Option<String>,
+        system_id: Option<String>,
+        force_quirks: bool,
     },
     StartTag {
         name: String,

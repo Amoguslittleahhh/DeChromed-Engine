@@ -1,10 +1,9 @@
 # engine/
 
 The real (as opposed to `chrome-engine.html`'s toy) implementation, per
-[`ROADMAP.md`](../ROADMAP.md). This is Phase A1's deliverable: a structured
-Rust workspace with a real, if near-zero-pass-rate, conformance-test harness
-wired end to end — the metric pipeline the rest of Track A onward reports
-progress against.
+[`ROADMAP.md`](../ROADMAP.md). A1 (project foundation) and A2 (the real
+WHATWG HTML tokenizer) are done — the tokenizer passes 99.9% of the vendored
+html5lib-tests suite. A3 (tree construction) is next.
 
 ## Layout
 
@@ -13,7 +12,7 @@ engine/
   Cargo.toml                 workspace manifest
   crates/
     dom/                     tree representation shared by html/css/layout/js_bindings (C1's future home)
-    html/                    A2 (tokenizer) + A3 (tree construction) -- currently placeholders
+    html/                    A2 (tokenizer, done) + A3 (tree construction, still a placeholder)
     css/                     A4-A7 (parser/cascade/CSSOM) -- currently placeholders
     layout/                  B1-B9 (box tree -> fragment tree) -- currently placeholders
     paint/                   B10-B12 (text shaping, rasterization, compositing) -- currently placeholders
@@ -23,7 +22,7 @@ engine/
     a11y/                    F2 (accessibility tree) -- currently placeholders
     devtools/                F1 (inspector protocol) -- currently placeholders
     shell/                   binary crate; today just a CLI smoke test wiring every stage together
-    html5lib_harness/        A2's conformance harness (see below)
+    html5lib_harness/        A2/A3's conformance harness (see below)
 ```
 
 Every placeholder crate's `lib.rs` doc comment says which roadmap phase
@@ -43,11 +42,11 @@ cargo build --workspace
 # Run the unit tests every crate ships
 cargo test --workspace
 
-# Run the pipeline smoke test (html -> dom -> css -> layout -> paint, all
-# placeholder stages, but wired together end to end)
+# Run the pipeline smoke test (html -> dom -> css -> layout -> paint --
+# tokenizer is real now, everything after it is still a placeholder)
 cargo run -p shell
 
-# Run A2's conformance harness
+# Run the html5lib-tests conformance harness
 cargo run --release -p html5lib_harness
 ```
 
@@ -67,11 +66,17 @@ Test files are vendored under `crates/html5lib_harness/vendor/tokenizer/`
 CI and local runs work offline and reproducibly, rather than depending on
 GitHub being reachable at test time.
 
-**Current baseline: ~0.2% (15/6487) passing.** That's expected, not a bug —
-`html::tokenize()` in `crates/html/src/tokenizer.rs` is a deliberate
-placeholder that always returns just an EOF token, so the harness has a real
-number to report from day one. This percentage is the metric A2's actual
-implementation work should move toward 95%.
+**Current: 99.9% (6708/6713) passing**, against A2's >=95% exit criterion.
+The 5 remaining failures are a documented gap (ScriptData's escaped/
+double-escaped states aren't implemented -- see `tokenizer.rs`'s module
+docs) plus 3 cases in `xmlViolation.test` that test a separate XML5
+character-validation mode standard HTML tokenization doesn't apply.
+
+The harness supports per-test `initialStates` (some tests must run starting
+in RCDATA/RAWTEXT/PLAINTEXT/CDATA-section state rather than the default
+Data state) and `lastStartTag` (primes the "appropriate end tag" check for
+RCDATA/RAWTEXT/ScriptData, which normally only matters once a tree builder
+exists to track it), both used by `html::tokenize_with()`.
 
 ## Why placeholders instead of nothing
 

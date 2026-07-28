@@ -13,7 +13,7 @@
 //! report a near-zero pass rate -- that's A1's exit criterion being met,
 //! not a bug in the harness.
 
-use html::Token;
+use html::{Token, TokenizerState};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
@@ -35,6 +35,27 @@ struct TestCase {
     output: Vec<Value>,
     #[serde(rename = "doubleEscaped", default)]
     double_escaped: bool,
+    /// Which tokenizer state(s) to start in; defaults to "Data state" when
+    /// absent. A test with multiple states should be run once per state
+    /// per html5lib-tests' own convention.
+    #[serde(rename = "initialStates", default)]
+    initial_states: Vec<String>,
+    /// Primes `last_start_tag_name` for RCDATA/RAWTEXT/ScriptData's
+    /// "appropriate end tag token" check, since without a tree builder
+    /// driving the tokenizer there's no earlier start tag to have set it.
+    #[serde(rename = "lastStartTag", default)]
+    last_start_tag: Option<String>,
+}
+
+fn parse_initial_state(s: &str) -> TokenizerState {
+    match s {
+        "PLAINTEXT state" => TokenizerState::PlainText,
+        "RCDATA state" => TokenizerState::RcData,
+        "RAWTEXT state" => TokenizerState::RawText,
+        "Script data state" => TokenizerState::ScriptData,
+        "CDATA section state" => TokenizerState::CdataSection,
+        _ => TokenizerState::Data,
+    }
 }
 
 /// A canonical, comparison-friendly view of a token stream: consecutive
@@ -43,7 +64,12 @@ struct TestCase {
 /// EOF is dropped since expected `output` arrays never include it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Canonical {
-    Doctype(String),
+    Doctype {
+        name: String,
+        public_id: Option<String>,
+        system_id: Option<String>,
+        correctness: bool,
+    },
     StartTag(String, Vec<(String, String)>),
     EndTag(String),
     Comment(String),
@@ -65,12 +91,27 @@ fn canonicalize_actual(tokens: &[Token]) -> Vec<Canonical> {
             other => {
                 flush(&mut pending_chars, &mut out);
                 out.push(match other {
-                    Token::Doctype { name, .. } => {
-                        Canonical::Doctype(name.clone().unwrap_or_default())
-                    }
+                    Token::Doctype {
+                        name,
+                        public_id,
+                        system_id,
+                        force_quirks,
+                    } => Canonical::Doctype {
+                        name: name.clone().unwrap_or_default(),
+                        public_id: public_id.clone(),
+                        system_id: system_id.clone(),
+                        correctness: !force_quirks,
+                    },
                     Token::StartTag {
                         name, attributes, ..
-                    } => Canonical::StartTag(name.clone(), attributes.clone()),
+                    } => {
+                        // Attribute order isn't spec-observable (expected
+                        // output is a JSON object/set), so sort both sides
+                        // the same way before comparing.
+                        let mut attrs = attributes.clone();
+                        attrs.sort();
+                        Canonical::StartTag(name.clone(), attrs)
+                    }
                     Token::EndTag { name } => Canonical::EndTag(name.clone()),
                     Token::Comment(c) => Canonical::Comment(c.clone()),
                     Token::Character(_) | Token::Eof => unreachable!(),
@@ -109,7 +150,18 @@ fn canonicalize_expected(output: &[Value]) -> Vec<Canonical> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                out.push(Canonical::Doctype(name));
+                let public_id = arr.get(2).and_then(Value::as_str).map(str::to_string);
+                let system_id = arr.get(3).and_then(Value::as_str).map(str::to_string);
+                // The spec's expected-output array's 5th element is
+                // "correctness" (true = not force-quirks); absent means
+                // true, matching html5lib-tests' own convention.
+                let correctness = arr.get(4).and_then(Value::as_bool).unwrap_or(true);
+                out.push(Canonical::Doctype {
+                    name,
+                    public_id,
+                    system_id,
+                    correctness,
+                });
             }
             "StartTag" => {
                 flush(&mut pending_chars, &mut out);
@@ -206,8 +258,6 @@ fn main() {
         };
 
         for case in file.tests {
-            total += 1;
-
             let input = if case.double_escaped {
                 unescape_double_escaped(&case.input)
             } else {
@@ -228,19 +278,33 @@ fn main() {
                     .collect();
             }
 
-            let actual = canonicalize_actual(&html::tokenize(&input));
+            let states = if case.initial_states.is_empty() {
+                vec!["Data state".to_string()]
+            } else {
+                case.initial_states.clone()
+            };
 
-            if actual == expected {
-                passed += 1;
-            } else if failures_shown < MAX_FAILURES_SHOWN {
-                failures_shown += 1;
-                eprintln!(
-                    "FAIL [{}] {}: expected {:?}, got {:?}",
-                    path.file_name().unwrap().to_string_lossy(),
-                    case.description,
-                    expected,
-                    actual
-                );
+            for state_name in &states {
+                total += 1;
+                let state = parse_initial_state(state_name);
+                let actual = canonicalize_actual(&html::tokenize_with(
+                    &input,
+                    state,
+                    case.last_start_tag.as_deref(),
+                ));
+
+                if actual == expected {
+                    passed += 1;
+                } else if failures_shown < MAX_FAILURES_SHOWN {
+                    failures_shown += 1;
+                    eprintln!(
+                        "FAIL [{}] {} ({state_name}): expected {:?}, got {:?}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        case.description,
+                        expected,
+                        actual
+                    );
+                }
             }
         }
     }

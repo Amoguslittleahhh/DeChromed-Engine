@@ -90,11 +90,26 @@ a real (near-zero, as expected) baseline: **0.2% (15/6487)** on
 html5lib-tests tokenizer tests. That number is the metric A2 moves toward
 95%.
 
-### A2. WHATWG-spec HTML tokenizer
-The real [~80-state tokenizer state machine](https://html.spec.whatwg.org/multipage/parsing.html#tokenization),
-not a regex/char-scan toy: character references, CDATA sections, doctype
-parsing, attribute quoting edge cases, script/RAWTEXT/RCDATA modes.
-**Exit:** tokenizer-level tests from html5lib-tests passing ≥95%.
+### A2. WHATWG-spec HTML tokenizer — *done*
+The real [~80-state tokenizer state machine](https://html.spec.whatwg.org/multipage/parsing.html#tokenization)
+in `engine/crates/html/src/tokenizer.rs`: character references (numeric +
+the full 2231-entry named-reference table, vendored from the spec's
+`entities.json`), CDATA sections, doctype parsing (including public/system
+identifiers and force-quirks), attribute quoting edge cases,
+script/RAWTEXT/RCDATA modes with "appropriate end tag" matching, newline
+normalization, and the Windows-1252 control-code remapping table for
+numeric references.
+
+Known gap: the ScriptData escaped/double-escaped states (`<script>`'s
+`<!--`-inside-script-content mechanism) aren't implemented yet --
+`escapeFlag.test` and two `domjs.test` cases fail because of it. Flagged
+in the crate's own module docs rather than silently passing.
+
+**Exit:** met — **99.9% (6708/6713)** on the vendored html5lib-tests
+tokenizer suite, against a ≥95% bar. The remaining 5 failures are the
+ScriptData-escaping gap above (2) plus 3 cases in `xmlViolation.test`,
+which tests a separate XML5 character-validation mode that standard HTML
+tokenization doesn't apply.
 
 ### A3. HTML tree construction
 The insertion-mode state machine, the **adoption agency algorithm** for
@@ -846,19 +861,17 @@ Two of the highest-leverage precedents above aren't phase-specific at all:
 
 ## What to actually do next
 
-**A1 is done** — see `engine/` and `engine/README.md`. The highest-leverage
-next step is unchanged in shape: **A2** (the real WHATWG tokenizer state
-machine, replacing the placeholder in `engine/crates/html/src/tokenizer.rs`)
-immediately followed by **A3** (tree construction) and **A4-A7** (spec-real
-CSS). That slice is tractable as an ongoing project between us without a
-team, produces a genuinely useful standalone HTML+CSS engine faster than any
-other path through this document, and every later track (B especially)
-depends on it existing first regardless of which fork you take on the JS
-engine question.
+**A1 and A2 are done** — see `engine/` and `engine/README.md`. The real
+tokenizer passes 99.9% of the vendored html5lib-tests suite. Next up is
+**A3** (tree construction: the insertion-mode state machine, the adoption
+agency algorithm, foster parenting, `<template>` handling), which replaces
+the flat-append placeholder in `engine/crates/html/src/tree_builder.rs` and
+needs its own conformance harness against html5lib-tests' tree-construction
+`.dat` format (a different, more involved format than the tokenizer JSON
+tests already vendored). After that, **A4-A7** (spec-real CSS) — that slice
+is tractable as an ongoing project between us without a team, produces a
+genuinely useful standalone HTML+CSS engine faster than any other path
+through this document, and every later track (B especially) depends on it
+existing first regardless of which fork you take on the JS engine question.
 
-Progress is now trackable concretely: run `cargo run --release -p
-html5lib_harness` from `engine/` and watch the pass rate climb from its
-current 0.2% baseline toward A2's 95% exit criterion as the real tokenizer
-gets built out state by state.
-
-Say the word and I'll start on A2.
+Say the word and I'll start on A3.
