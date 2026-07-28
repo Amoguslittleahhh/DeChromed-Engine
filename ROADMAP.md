@@ -58,7 +58,7 @@ staff these — separate teams own layout, JS, networking, security, etc.).
 - **Track C — Script & Runtime**: JavaScript, WebAssembly, the DOM API surface.
 - **Track D — Platform & Storage**: networking, storage, media, device APIs.
 - **Track E — Security & Privacy**: sandboxing, origin isolation, safe browsing.
-- **Track F — Product & Ops**: DevTools, extensions, updates, telemety, UX chrome.
+- **Track F — Product & Ops**: DevTools, extensions, updates, telemetry, UX chrome.
 
 A rough dependency map: **A → B** (can't lay out what you haven't parsed/
 styled), **A/B → C** (DOM needs a tree to expose, JS needs a DOM to touch),
