@@ -2,238 +2,599 @@
 
 ## Ground truth, stated up front
 
-Blink (Chromium) and Gecko (Firefox) are ~15-25 million lines of C++/Rust each,
-built by hundreds of engineers over 20+ years. Mozilla's own from-scratch
-attempt at a modern engine — Servo, in Rust — has consumed dozens of
-person-years and still isn't a full consumer replacement for Gecko. The
-[Ladybird](https://ladybird.org) project (an independent from-scratch browser,
-started 2019) is the closest real-world precedent for "build a browser engine
-from zero" and it runs on a paid team plus a large open-source community, over
-multiple years, and is still pre-1.0.
+Blink (Chromium) and Gecko (Firefox) are ~15-25 million lines of C++/Rust
+each, built by hundreds of engineers over 20+ years, backed by full-time
+security teams, spec editors sitting on the W3C/WHATWG/TC39 standards bodies
+themselves, and release infrastructure most companies never build at all.
+"One-on-one replica" is the goal stated here, so this document is written as
+if that's genuinely the target — but the scope needs to be seen clearly
+before committing to it:
 
-So: this roadmap is real, but the honest unit of measurement is **phases
-measured in weeks-to-months each**, not a single build. `chrome-engine.html`
-is Phase 0 — a working toy that proves the pipeline shape. Everything below
-replaces one toy piece at a time with a spec-correct one, in a real multi-file
-project, until what's left resembles an actual engine architecture.
+- Mozilla's own from-scratch modern-engine attempt, **Servo** (Rust),
+  consumed dozens of person-years and, over a decade in, still isn't a full
+  consumer replacement for Gecko — it was eventually folded back in as a
+  component supplier to Gecko rather than replacing it wholesale.
+- **Ladybird** (independent from-scratch browser, started 2019) is the
+  closest real precedent for exactly this ambition. It runs on a funded
+  team plus a large open-source community, across years, and is still
+  pre-1.0 with large spec gaps.
+- Chromium alone ships **~30 separate subsystems** you'd need to match for
+  true parity: not just HTML/CSS/JS/layout, but PDF rendering, DRM (Widevine
+  EME), a sync backend, an extension platform, a password manager with
+  breach-detection, Safe Browsing, WebGPU, a full accessibility tree bridged
+  to four different OS accessibility APIs, and more — most of which have
+  nothing to do with "rendering a webpage" and everything to do with "being
+  a product people trust with their whole digital life."
 
-Treat each phase as a milestone with its own PR(s), tests, and a demo. Do not
-start a phase before the previous one has working tests — this project dies
-the moment "mostly working" piles up without verification, same as any real
-engine team's approach (both Blink and Gecko live and die by their test
-suites: web-platform-tests, WPT).
+None of that means don't do this — it means measure progress in **phases**,
+each independently shippable and testable, not in "days until done." This
+document numbers phases across tracks so you always know what "next" means,
+and every phase has a concrete, checkable exit criterion instead of a vibe.
+`chrome-engine.html` (Phase 0) is the only phase currently complete.
 
----
-
-## Phase 0 — Toy pipeline (done)
-
-`chrome-engine.html`: hand-rolled tokenizer → DOM → CSSOM → cascade → block/
-inline layout → canvas paint, wrapped in a fake Chrome UI. No JS execution,
-no networking, ~10 CSS properties, no real HTML5 parsing algorithm. Proves
-the pipeline shape and nothing else. Good for demos, useless as a foundation
-to build directly on top of (single file, no module boundaries, canvas
-painting is not how real engines represent output).
-
-**Exit criterion:** already met. Kept as a reference/demo artifact, not
-extended further — Phase 1 starts a real project structure.
-
----
-
-## Phase 1 — Project foundation & language choice
-
-Decide the real substrate before writing more engine code.
-
-- **Recommendation: Rust.** Memory safety without a GC (matches how a
-  DOM/layout tree with lots of aliasing needs to behave), first-class WASM
-  target if you ever want it running in-browser again as a demo, and it's
-  the same choice Servo made for exactly this kind of project. C++ is the
-  "authentic" choice (what Blink/Gecko are actually written in) but buys you
-  a much larger footgun surface for no real benefit at this project's scale.
-- Set up a real workspace: separate crates/modules for `html`, `css`, `dom`,
-  `layout`, `paint`, `net`, `js` (stub for now) — mirrors how Servo and
-  Ladybird are structured (`components/script`, `components/layout`,
-  `components/style`, etc. in Servo's case).
-- Pull in [html5ever](https://github.com/servo/html5ever) as a *reference*
-  to test your own tokenizer against, not to depend on directly if the goal
-  is "recreate," not "wrap."
-- Set up **web-platform-tests (WPT)** harness early, even with near-zero
-  pass rate. This is the industry-standard conformance suite both Chromium
-  and Firefox gate on. Track pass-rate per phase as the actual metric of
-  progress instead of vibes.
-
-**Exit criterion:** empty-but-structured repo, CI running, WPT harness
-executing (and failing almost everything) end to end.
+**Working rule for every phase below:** no phase starts until the previous
+phase in its track has passing tests checked into CI. This is not
+bureaucracy for its own sake — it's the actual reason Blink and Gecko are
+usable today: both gate all merges on **web-platform-tests (WPT)**, the
+cross-browser conformance suite at [wpt.fyi](https://wpt.fyi), and treat a
+regression there as a shipped bug. Do the same from day one, at whatever
+tiny scale you're at, or scope creep silently rots the codebase the way it
+has killed nearly every "build a browser from scratch" hobby project that
+never finished.
 
 ---
 
-## Phase 2 — Spec-compliant HTML parsing
+## How this document is organized
 
-Replace the toy tokenizer with the actual
-[WHATWG HTML parsing algorithm](https://html.spec.whatwg.org/multipage/parsing.html):
-a real tokenizer state machine (~80 states) and tree construction algorithm
-with insertion modes, the "adoption agency algorithm" for malformed tag
-soup, implicit tag closing rules, `<template>` handling, foreign content
-(SVG/MathML) parsing rules.
+Real engines are not built as one linear pipeline — they're built as
+several parallel subsystems (tracks) that occasionally need to sync up.
+Phases are grouped into tracks; phases within a track are ordered and
+dependent on each other, but different tracks can, once their prerequisites
+land, be worked in parallel (exactly how Chromium and Firefox actually
+staff these — separate teams own layout, JS, networking, security, etc.).
 
-- This is where most of "how does the browser handle broken HTML" lives —
-  it's the single most under-estimated subsystem to reimplement correctly.
-- Target: pass the `html5lib-tests` tree-construction test suite (the
-  standard corpus both engines validate against).
+- **Track A — Content & Style**: parsing HTML/CSS/SVG into a styled tree.
+- **Track B — Layout & Graphics**: turning the styled tree into pixels.
+- **Track C — Script & Runtime**: JavaScript, WebAssembly, the DOM API surface.
+- **Track D — Platform & Storage**: networking, storage, media, device APIs.
+- **Track E — Security & Privacy**: sandboxing, origin isolation, safe browsing.
+- **Track F — Product & Ops**: DevTools, extensions, updates, telemety, UX chrome.
 
-**Exit criterion:** ≥95% pass rate on html5lib-tests tree construction.
-
----
-
-## Phase 3 — Real CSS engine
-
-- Full selector grammar: combinators (`>`, `+`, `~`, descendant), attribute
-  selectors, pseudo-classes (`:hover`, `:nth-child`, `:not()`, ...),
-  pseudo-elements (`::before`/`::after`).
-- Real cascade: origin/importance ordering (user-agent, user, author,
-  `!important`), cascade layers, specificity per spec, not the toy sum used
-  in Phase 0.
-- Computed-value pipeline: specified → computed → used values, proper
-  inheritance rules per property, `initial`/`inherit`/`unset`.
-- CSSOM: `CSSStyleSheet`, `CSSRule` object model so later JS integration
-  (`document.styleSheets`) has something real to bind to.
-
-**Exit criterion:** pass rate tracked against WPT's `css/cssom` and
-`css/selectors` suites.
+A rough dependency map: **A → B** (can't lay out what you haven't parsed/
+styled), **A/B → C** (DOM needs a tree to expose, JS needs a DOM to touch),
+**C → D** (fetch/storage APIs are JS-surfaced), **B/C/D → E** (nothing to
+sandbox until there's something running), **all → F** (nothing to inspect,
+extend, or ship until it exists).
 
 ---
 
-## Phase 4 — Layout (the actual hard part)
+## Track A — Content & Style
 
-- Box generation from the styled tree (anonymous boxes, `display` table).
-- Formatting contexts: block, inline (with proper line-breaking/BiDi later),
-  float positioning, table layout.
-- Modern layout modes: **flexbox**, then **grid** — each is its own
-  multi-week sub-project; these are the two things that most differentiate
-  "toy layout" from "web can actually render on this."
-- Positioning schemes: relative, absolute, fixed, sticky, and stacking
-  contexts (needed before paint order/z-index means anything).
-- Replace the canvas-box-list output from Phase 0 with a proper **fragment
-  tree** / **display list** — the actual intermediate representation real
-  engines use between layout and paint (this is what lets you later add
-  incremental layout, hit-testing, and a real compositor).
+### A0. Toy pipeline — *done*
+`chrome-engine.html`: hand-rolled tokenizer → DOM → CSSOM → cascade →
+block/inline layout → canvas paint. ~10 CSS properties, no real HTML5
+algorithm, no JS. Proves pipeline shape only.
+**Exit:** met. Frozen as a demo artifact; real work starts at A1.
 
-**Exit criterion:** WPT `css/css-flexbox` and `css/css-grid` pass rates
-tracked; visual regression tests via reference-rendering comparison
-(the same "reftest" approach Gecko/WPT use).
+### A1. Project foundation
+Real multi-crate Rust workspace (see "Language & repo shape" below).
+CI running. WPT test harness wired up end-to-end even at ~0% pass rate, so
+pass-rate becomes the metric from day one.
+**Exit:** empty-but-structured repo, CI green, WPT harness executing.
 
----
+### A2. WHATWG-spec HTML tokenizer
+The real [~80-state tokenizer state machine](https://html.spec.whatwg.org/multipage/parsing.html#tokenization),
+not a regex/char-scan toy: character references, CDATA sections, doctype
+parsing, attribute quoting edge cases, script/RAWTEXT/RCDATA modes.
+**Exit:** tokenizer-level tests from html5lib-tests passing ≥95%.
 
-## Phase 5 — Text & painting
+### A3. HTML tree construction
+The insertion-mode state machine, the **adoption agency algorithm** for
+mismatched tags, implicit element closing (`<p>` auto-close rules, table
+foster parenting), `<template>` content documents, foreign content mode
+switching for embedded SVG/MathML.
+**Exit:** ≥95% on html5lib-tests tree-construction suite (the same corpus
+Gecko/Blink/WebKit validate against).
 
-- Real text shaping (a HarfBuzz-equivalent or binding) — Phase 0's
-  `ctx.measureText` word-wrap is not shaping; it doesn't handle ligatures,
-  complex scripts, kerning, or BiDi.
-- Font loading/matching (`@font-face`, system font fallback chains).
-- A real paint backend: software rasterizer or GPU (wgpu, matching Rust
-  choice) instead of directly drawing to an HTML canvas — the canvas
-  dependency was a Phase-0 shortcut, not an architecture.
-- Compositing: layers, transforms, opacity, basic filters.
+### A4. CSS tokenizer & parser
+Full [CSS Syntax Module](https://www.w3.org/TR/css-syntax-3/) tokenizer,
+at-rule and qualified-rule parsing, error recovery per spec (CSS parsing
+*must* degrade gracefully — that's load-bearing for the whole web).
+**Exit:** WPT `css/css-syntax` passing ≥90%.
 
-**Exit criterion:** can render a real, non-trivial static webpage
-(e.g. a saved Wikipedia article) pixel-comparably to a reference screenshot
-from Firefox/Chrome within a tolerance threshold.
+### A5. Selectors
+Full [Selectors Level 4](https://www.w3.org/TR/selectors-4/) grammar:
+combinators, attribute selectors with case-sensitivity flags, structural
+pseudo-classes (`:nth-child`, `:nth-of-type`, `An+B` syntax), logical
+pseudo-classes (`:not()`, `:is()`, `:where()`, `:has()`), pseudo-elements.
+**Exit:** WPT `css/selectors` passing ≥85%.
 
----
+### A6. Cascade & computed values
+Origin/importance ordering (UA/user/author/`!important`/transition/
+animation origins), cascade layers (`@layer`), full specificity per spec,
+the specified→computed→used value pipeline, `initial`/`inherit`/`unset`/
+`revert`, custom properties (`--foo`) and `var()` substitution.
+**Exit:** WPT `css/cssom`, `css/css-cascade`, `css/css-variables` ≥85%.
 
-## Phase 6 — DOM & the event loop
+### A7. CSSOM & style invalidation
+`CSSStyleSheet`/`CSSRule` object graph mutable from script, `getComputedStyle`,
+and — critically — **style invalidation**: recomputing only the minimal
+subtree when a class/attribute/rule changes, instead of full-tree
+recompute. This is a real algorithmic problem (Blink's "style invalidation
+sets," Gecko's "restyle hints") and directly determines whether the engine
+is usably fast on real pages.
+**Exit:** invalidation-set unit tests + no full-tree-restyle on targeted
+mutation benchmarks.
 
-- Implement the actual DOM spec (nodes, live `NodeList`s, mutation
-  semantics) as an addressable API, not an internal-only tree.
-- Event loop: microtasks/macrotasks, `requestAnimationFrame`, timers.
-- Event dispatch: capture/target/bubble phases, default actions.
+### A8. SVG
+SVG parsing as its own XML-ish document type, the SVG geometry/paint
+properties, `<use>`/`<symbol>` reuse, integration with the HTML tree
+(inline `<svg>`), SVG-as-image and SVG-as-document loading paths.
+**Exit:** WPT `svg/` core suites ≥70%.
 
-**Exit criterion:** WPT `dom/` and `html/webappapis/` suites passing at a
-meaningful rate.
+### A9. MathML
+Parsing and basic layout for `<math>` content — smaller subsystem, but
+required for genuine spec parity (both Chromium and Firefox ship it).
+**Exit:** WPT `mathml/` core suites ≥60%.
 
----
-
-## Phase 7 — JavaScript
-
-This is a full second engine-scale project on its own (V8 and SpiderMonkey
-are each bigger than the rest of their respective browsers combined). Two
-honest paths:
-
-- **Pragmatic:** embed an existing engine (rusty_v8 bindings to V8, or
-  SpiderMonkey via `mozjs`) and focus your original work on the DOM/layout
-  binding layer. This is what almost every "build your own browser" project
-  that wants to actually finish does.
-- **Purist ("recreate from scratch"):** write your own ECMAScript
-  interpreter (parser → AST → bytecode VM), no JIT initially. This alone is
-  a multi-month-to-multi-year effort even for ES5-only support, before
-  touching modern ES features, async/await, or a JIT tier. Flag explicitly
-  if this is really the intent, since it changes the whole roadmap's shape.
-
-**Exit criterion:** Test262 (the ECMAScript conformance suite) pass rate
-tracked; DOM bindings enough to run something like a basic React counter
-app.
-
----
-
-## Phase 8 — Networking
-
-- HTTP/1.1 client, then HTTP/2; TLS via an existing crate (rustls) — nobody
-  reimplements TLS from scratch, that's a security liability, not a feature.
-- Resource loading pipeline (HTML/CSS/JS/image fetch, caching headers,
-  redirects), `fetch()`/XHR bindings once Phase 7 exists.
-- Cookie jar, CORS enforcement, mixed-content blocking.
-
-**Exit criterion:** can load a real URL end-to-end (network → parse → style
-→ layout → paint) for a simple static site.
+### A10. XML & XSLT
+Standalone XML document parsing (distinct error-handling model from HTML —
+XML is not permissive), `<?xml-stylesheet?>`, and — the one nobody wants to
+build — an XSLT 1.0 processor, still present in both engines for legacy
+compat.
+**Exit:** can parse/serialize well-formed XML per spec; XSLT marked
+explicitly optional/deferred if scope needs trimming (this is the single
+most-often-dropped subsystem in real "shrink the engine" discussions inside
+both Google and Mozilla).
 
 ---
 
-## Phase 9 — Security & process model
+## Track B — Layout & Graphics
 
-- Origin model, same-origin policy enforcement across every subsystem
-  touched so far (DOM access, cookies, fetch, storage).
-- Sandboxing / process isolation — this is where Chromium's actual security
-  reputation comes from (site isolation), and it's an architectural decision
-  that's very expensive to retrofit late, so at minimum design for it here
-  even if full multi-process comes later.
-- CSP enforcement.
+### B1. Box tree generation
+Style tree → box tree: anonymous box generation, `display` computation
+(including `display: contents`, `display: table` internal box types),
+list-item markers, `::before`/`::after` generated content.
+**Exit:** WPT `css/css-display` ≥80%.
 
-**Exit criterion:** a documented threat model plus enforcement tests for
-same-origin violations across DOM/net/storage.
+### B2. Block & inline formatting contexts
+Classic block layout, inline layout with line boxes, `float`/`clear`,
+margin collapsing (an infamous, precisely-specified, easy-to-get-subtly-
+wrong algorithm), BFC establishment rules.
+**Exit:** WPT `css/css-box`, `css/CSS2/normal-flow`, `css/CSS2/floats` ≥80%.
+
+### B3. Table layout
+CSS 2 table layout algorithm (distinct model from block/inline): row/column
+sizing passes, `border-collapse`, spanning cells, `<table>` HTML-vs-CSS
+interaction quirks.
+**Exit:** WPT `css/CSS2/tables` ≥75%.
+
+### B4. Flexbox
+[CSS Flexible Box Layout](https://www.w3.org/TR/css-flexbox-1/) in full:
+main/cross axis resolution, flex-basis/grow/shrink distribution algorithm,
+wrapping, alignment (`justify-content`/`align-items`/`align-self`).
+**Exit:** WPT `css/css-flexbox` ≥80%.
+
+### B5. Grid
+[CSS Grid Layout](https://www.w3.org/TR/css-grid-1/): track sizing
+algorithm (the hardest single algorithm in CSS layout — multiple resolution
+passes over `fr` units, intrinsic sizing, and auto-placement), named lines/
+areas, subgrid.
+**Exit:** WPT `css/css-grid` ≥75%.
+
+### B6. Positioning & stacking
+`position: relative/absolute/fixed/sticky`, containing-block resolution
+rules, stacking contexts, `z-index`, paint order per spec.
+**Exit:** WPT `css/css-position`, `css/CSS2/zindex` ≥80%.
+
+### B7. Fragmentation
+Multi-column layout (`column-count`/`column-width`), fragmentation for
+print/pagination (`break-before`/`break-after`/`break-inside`) — the
+subsystem most engines get wrong or skip; genuine parity requires it.
+**Exit:** WPT `css/css-multicol`, `css/css-break` ≥60%.
+
+### B8. Writing modes & internationalized layout
+Vertical writing modes (`writing-mode: vertical-rl`), logical properties
+(`margin-inline-start` etc. instead of physical `left`/`right`), full
+Unicode Bidirectional Algorithm (UAX #9) for RTL/LTR mixed text.
+**Exit:** WPT `css/css-writing-modes`, `css/css-logical` ≥65%; bidi
+conformance against the Unicode BidiTest data files.
+
+### B9. Fragment tree & display list
+Replace any toy "list of boxes" with a real intermediate representation:
+a **fragment tree** (layout's actual output — positioned, sized boxes
+referencing their originating DOM/style nodes) lowered to a **display
+list** (paint's input — an ordered list of drawing commands: fill rect,
+draw text run, push clip, push transform). This is the real architectural
+seam that lets everything downstream (compositing, hit-testing, incremental
+layout, `getBoundingClientRect()`) work without re-deriving geometry ad hoc.
+**Exit:** hit-testing (`elementFromPoint`) and `getBoundingClientRect`
+implemented purely by querying the fragment tree; display list snapshot
+tests for a corpus of pages.
+
+### B10. Text shaping & fonts
+Real shaping (a HarfBuzz binding or equivalent from-scratch shaper):
+ligatures, kerning, complex scripts (Arabic joining, Indic reordering),
+combined with the bidi algorithm from B8. Font matching/fallback chains,
+`@font-face` loading (WOFF2 parsing), variable fonts.
+**Exit:** WPT `css/css-text`, `css/css-fonts` ≥70%; visual diff tests
+against reference shaping output for a multilingual test corpus.
+
+### B11. Painting & rasterization
+Software rasterizer as the baseline (correctness first, matches how both
+engines actually bootstrap new platforms), then a GPU path (wgpu, given the
+Rust choice) mirroring what Skia (Blink) / WebRender (Gecko) do: batch draw
+calls, cache rasterized glyphs/tiles, avoid re-painting unchanged regions.
+**Exit:** pixel-diff reftests (WPT's reftest methodology) passing against a
+reference corpus within tolerance; a documented perf budget (ms per frame)
+on a fixed benchmark page set.
+
+### B12. Compositing
+Layer promotion (`transform`/`opacity`/`will-change`), a compositor thread
+independent of the main thread — this is *the* thing that makes scrolling
+and animations feel smooth in real browsers and is routinely the difference
+between "demo" and "usable." Threaded scrolling, async transform animations.
+**Exit:** scroll/animate a layered page at a sustained 60fps target on a
+benchmark corpus; compositor operates without blocking on main-thread JS.
+
+### B13. Canvas 2D & WebGL/WebGPU
+`<canvas>` 2D context API (path filling/stroking, `ImageData`, compositing
+operations) — its own spec surface distinct from CSS painting. WebGL
+(bindings to an existing GL/Vulkan abstraction — nobody hand-writes a GPU
+driver) and WebGPU for the modern API surface.
+**Exit:** WPT `html/canvas` ≥60%; a handful of real-world WebGL demos (e.g.
+three.js samples) rendering correctly.
 
 ---
 
-## Phase 10 — DevTools & extensibility
+## Track C — Script & Runtime
 
-- An inspector protocol (own or compatible with Chrome DevTools Protocol /
-  Firefox's Remote Debugging Protocol) so the DOM/CSSOM/console are
-  externally introspectable — genuinely useful dogfood target, and a much
-  more scoped, finishable subproject than the rest.
-- Console API bindings once JS exists.
+### C1. DOM Level tree API
+The actual addressable DOM (`Node`, `Element`, live `NodeList`/
+`HTMLCollection`, mutation algorithms per the DOM spec, not just an
+internal tree) — this has to exist as a real spec-shaped API before JS
+Track work is meaningful, since JS mostly *is* DOM manipulation in practice.
+**Exit:** WPT `dom/nodes` ≥75%.
 
-**Exit criterion:** can attach an external inspector UI (even a basic one)
-and see live DOM tree + computed styles.
+### C2. Event loop & event dispatch
+Task queues/microtask queue ordering per the HTML spec (this ordering is
+subtle and web-observable — get it wrong and real sites break in confusing
+ways), `requestAnimationFrame` tied to the rendering pipeline, event
+capture/target/bubble dispatch with proper default-action handling.
+**Exit:** WPT `html/webappapis`, `dom/events` ≥70%.
+
+### C3. ECMAScript parser & AST
+Full ES2015+ grammar (this alone is bigger than most people expect: ASI
+rules, destructuring, template literals, generators/async syntax, classes,
+modules). State explicitly here whether the "one-on-one replica" intent
+means writing this yourself vs. embedding V8/SpiderMonkey — it changes
+every phase after this one (see "The JS engine question" below).
+**Exit:** parses the full Test262 corpus's syntax without embedding-engine
+help (if going purist), or bindings compile/run against an embedded engine
+(if going pragmatic).
+
+### C4. Interpreter (bytecode VM, tree-walk first)
+A correctness-first tree-walking or simple bytecode interpreter — no JIT
+yet. Scoping (`var`/`let`/`const` semantics, closures, `this` binding
+rules), prototype chains, the full object model.
+**Exit:** Test262 language-syntax + basic built-ins pass rate tracked as
+the headline metric from here on.
+
+### C5. Standard library / built-ins
+`Object`/`Array`/`String`/`Map`/`Set`/`Promise`/`RegExp`/`Intl` — `Intl` in
+particular is its own ICU-backed subsystem (locale-aware formatting,
+collation) that's easy to underscope.
+**Exit:** Test262 built-ins suite ≥70%.
+
+### C6. Garbage collector
+A real GC (generational, ideally — matches how both V8 and SpiderMonkey
+are shaped, because short-lived object churn dominates real JS workloads),
+integrated with DOM object lifetime (this cross-language GC-to-native-tree
+integration, "wrapper tracing," is a notoriously hard correctness problem —
+both engines have had serious security bugs here).
+**Exit:** no leaks/no use-after-free across a stress-test corpus running
+under a sanitizer (ASan/MSan-equivalent for Rust: Miri + fuzzing).
+
+### C7. JIT tiers (optional, high-difficulty)
+If going purist: an interpreter → baseline JIT → optimizing JIT pipeline
+with deoptimization, matching the tiered architecture both V8 (Ignition/
+Sparkplug/Maglev/TurboFan) and SpiderMonkey (Baseline/Ion) use. This is
+realistically a **separate multi-year project** on its own; most from-
+scratch browser efforts (including Ladybird) run an interpreter-only JS
+engine for years before JIT work starts.
+**Exit:** explicitly flagged as a stretch phase; interpreter-only C4/C5/C6
+is a legitimate, shippable stopping point.
+
+### C8. DOM↔JS bindings & Web IDL
+The binding layer connecting the C1 DOM tree to the C3-C7 JS runtime,
+generated from Web IDL definitions (as both engines do — hand-writing
+thousands of bindings by hand doesn't scale and is where wrapper-lifetime
+bugs live).
+**Exit:** a real webpage using `document.querySelector`, `addEventListener`,
+and basic DOM mutation from script runs correctly.
+
+### C9. WebAssembly
+A Wasm interpreter/compiler (binary format parsing, validation, execution)
+— its own runtime, sharing some infrastructure with C6's GC/memory model
+but a genuinely separate spec surface.
+**Exit:** a Wasm conformance test suite (the official `testsuite` repo)
+passing at a meaningful rate; a real compiled Wasm module (e.g. from
+Rust/AssemblyScript) running.
+
+### C10. Workers
+Web Workers (separate JS global + event loop, `postMessage` structured
+clone), Service Workers (install/activate lifecycle, fetch interception —
+this is the foundation PWAs depend on and touches Track D's networking
+directly).
+**Exit:** WPT `workers/`, `service-workers/` core suites ≥50%.
 
 ---
 
-## Phase 11 — Standards compliance & hardening as an ongoing practice
+## Track D — Platform & Storage
 
-Not a final phase so much as the mode you're in forever after Phase 4: track
-WPT pass rate as the top-line metric (this is literally the metric
-Chromium/Firefox/WebKit teams publish and compete on at
-wpt.fyi), fix regressions before adding features, fuzz the parser/CSS/layout
-code continuously (this is how most real engine security bugs get found).
+### D1. URL parsing
+The [WHATWG URL spec](https://url.spec.whatwg.org/) precisely — this is
+deceptively subtle (userinfo, IDNA/punycode for internationalized domains,
+special-scheme handling) and a common source of security bugs (URL parsing
+mismatches between browser and server are a real SSRF/auth-bypass vector).
+**Exit:** WPT `url/` ≥90%.
+
+### D2. Networking core
+HTTP/1.1 client → HTTP/2 → HTTP/3(QUIC). TLS via an existing, audited crate
+(rustls) — reimplementing TLS from scratch is a security liability, not an
+engine feature, and no serious project does it. Connection pooling, caching
+per HTTP cache-control semantics, redirect handling, cookie jar.
+**Exit:** loads real HTTPS URLs end-to-end; HTTP caching semantics unit
+tested against RFC 9111 conformance cases.
+
+### D3. Resource loading pipeline
+Preload scanner (speculative parsing to kick off fetches before the main
+parser reaches a tag — a real, measurable performance feature both engines
+have), priority scheduling, `fetch()`/`XMLHttpRequest`/Streams API bindings
+once Track C exists.
+**Exit:** WPT `fetch/`, `streams/` ≥60%; preload scanner measurably reduces
+load time on an image/script-heavy benchmark page.
+
+### D4. Storage APIs
+`localStorage`/`sessionStorage`, IndexedDB (a full transactional
+object-store database with its own spec), Cache API (Service Worker
+backing store), Cookie Store API.
+**Exit:** WPT `IndexedDB/`, `webstorage/` ≥60%.
+
+### D5. Images & media containers
+Image codecs (JPEG/PNG/GIF/WebP/AVIF — bind existing audited decoders,
+don't hand-roll codecs, that's its own huge and security-sensitive
+subsystem), `<img>`/`<picture>`/responsive images (`srcset`/`sizes`).
+**Exit:** WPT `html/semantics/embedded-content` image suites ≥70%.
+
+### D6. Audio/video playback
+`<video>`/`<audio>` element behavior, Media Source Extensions (adaptive
+streaming used by every major video site), codec integration (bind
+existing decoders: h264/vp9/av1/opus/aac). Encrypted Media Extensions
+(DRM/Widevine-equivalent) explicitly flagged as its own licensing-gated
+subsystem real engines treat separately from the open-source core.
+**Exit:** WPT `media/` core playback suites ≥50%; MSE-based playback works
+against a real adaptive-streaming test stream.
+
+### D7. WebRTC
+Peer connection, ICE/STUN/TURN negotiation, media transport — a large,
+mostly self-contained subsystem both engines source from a shared-ish
+lineage (libwebrtc) rather than maintaining fully independently; a
+pragmatic replica likely binds an existing implementation here rather than
+rewriting the ICE/SRTP stack from scratch.
+**Exit:** two instances of the engine can establish a peer connection and
+exchange media/data in a controlled test.
+
+### D8. Device & platform APIs
+Geolocation, Web Bluetooth/USB/Serial, File System Access API, Clipboard
+API, drag-and-drop, Notifications/Push API, Web Authentication (WebAuthn/
+passkeys) — each individually small-to-medium, collectively a long tail
+that's a large fraction of "why does site X not work" in practice.
+**Exit:** WPT suites for each API tracked individually; prioritize by
+real-world usage data rather than trying to do all of them at once.
+
+### D9. Forms & autofill
+Form validation (`:valid`/`:invalid`, constraint validation API), the
+autofill heuristics (guessing field purpose from name/autocomplete
+attributes) and password manager integration — genuinely its own ML/
+heuristics-adjacent subsystem in real browsers, easy to underscope as
+"just fill in a text box."
+**Exit:** WPT `html/semantics/forms` ≥70%; autofill correctly identifies
+field purpose on a corpus of real-world signup/login forms.
+
+---
+
+## Track E — Security & Privacy
+
+### E1. Origin model & same-origin policy
+Formal origin representation, same-origin-policy enforcement checked
+consistently across *every* subsystem touched in A-D (DOM access across
+frames, cookies, fetch/CORS, storage partitioning) — this needs to be
+designed early and threaded through everything, not bolted on later; that's
+precisely how real cross-origin security bugs happen in practice.
+**Exit:** WPT `cors/`, `html/browsers/origin` ≥70%; a documented origin
+model doc that every later subsystem is checked against in review.
+
+### E2. Content Security Policy & mixed content
+CSP directive parsing/enforcement, mixed-content blocking (HTTPS pages
+loading HTTP subresources), Trusted Types.
+**Exit:** WPT `content-security-policy/` ≥60%.
+
+### E3. Sandboxing & process model
+Multi-process architecture: separate renderer/browser/GPU/network
+processes with IPC between them (this is *the* headline security feature
+both Chromium's and Firefox's sandbox designs are built around), OS-level
+sandboxing primitives (seccomp-bpf on Linux, the Windows sandbox APIs, the
+macOS Seatbelt/App Sandbox), and **site isolation** — a renderer process
+per origin so a compromised renderer can't read another site's data. This
+is architecturally expensive to retrofit, so the IPC boundary should exist
+conceptually from early on even before full multi-process lands.
+**Exit:** a compromised/fuzzed renderer process cannot read another
+origin's data or escape to touch the filesystem in a controlled test.
+
+### E4. Fuzzing & continuous security testing
+Structured fuzzing harnesses for the HTML/CSS/JS parsers and the image/
+media codec bindings — this is genuinely how most real browser security
+bugs get found before shipping (Chromium's ClusterFuzz, Mozilla's
+oss-fuzz integration), not a nice-to-have.
+**Exit:** fuzzers running continuously in CI against every parser/codec
+boundary; a triage process for crashes.
+
+### E5. Safe Browsing / malware & phishing protection
+Reputation-list checking against known-malicious URLs, download scanning
+integration — explicitly a "consumes an external threat-intel feed" feature
+rather than something to build the intelligence for from scratch.
+**Exit:** blocks a test corpus of known-bad URLs from a public phishing
+test list.
+
+### E6. Certificate transparency & transport security
+HSTS enforcement, Certificate Transparency log checking, certificate
+pinning infrastructure.
+**Exit:** correctly rejects a test corpus of invalid/revoked/CT-violating
+certificates.
+
+### E7. Privacy features
+Tracking protection / third-party cookie partitioning, fingerprinting
+mitigation, private browsing mode data isolation — an area where Blink and
+Gecko have historically diverged significantly in philosophy (Chromium's
+Privacy Sandbox proposals vs. Firefox's Enhanced Tracking Protection), so
+"replica" here means picking a stance, not just copying one engine.
+**Exit:** documented privacy model; private-mode session leaves no
+persistent state after close, verified by filesystem/storage inspection.
+
+---
+
+## Track F — Product & Ops
+
+### F1. DevTools protocol & inspector
+An inspector protocol (own, or compatible with Chrome DevTools Protocol /
+Firefox Remote Protocol) exposing the DOM tree, computed styles, console,
+network requests, and — once Track C JIT/runtime work exists — a JS
+debugger (breakpoints, step execution, call stack inspection).
+**Exit:** an external DevTools-style UI can attach and show live DOM +
+styles + console + network waterfall.
+
+### F2. Accessibility tree
+A parallel accessibility tree derived from the DOM/style/layout trees
+(ARIA role/state computation per the [AccName](https://www.w3.org/TR/accname-1.2/)
+and [Core-AAM](https://www.w3.org/TR/core-aam-1.2/) specs), bridged to each
+target OS's native accessibility API (UIA on Windows, AX API on macOS,
+AT-SPI on Linux) — this is a full subsystem in real engines, not a
+metadata afterthought, and is required for the browser to be usable with a
+screen reader at all.
+**Exit:** WPT accessibility test suites tracked; a real screen reader
+(NVDA/VoiceOver/Orca) can navigate a rendered page correctly.
+
+### F3. Extension platform
+An extension API surface (manifest format, background scripts/service
+workers, content scripts with isolated worlds, `declarativeNetRequest`-
+style request modification) — its own significant API surface layered on
+top of everything else.
+**Exit:** a simple real-world extension (e.g. an ad-blocker or a DOM
+inspector bookmarklet-equivalent) runs correctly.
+
+### F4. Printing & PDF
+Print layout (CSS `@page`, print-specific fragmentation from B7), a PDF
+rendering path (either a bundled PDF renderer or binding an existing one)
+for viewing PDFs directly in the browser — both engines ship this as a
+first-class feature, not an afterthought handed to a plugin.
+**Exit:** print-preview output matches a reference PDF within tolerance for
+a benchmark page set.
+
+### F5. Sync & profiles
+Multi-profile support, an account-backed sync backend for bookmarks/
+history/passwords/settings across devices — explicitly a "you need backend
+infrastructure, not just client code" phase; scope/timeline depends
+entirely on whether a server component is in scope at all.
+**Exit:** two client instances converge on the same bookmark/history state
+after syncing through a test backend.
+
+### F6. Telemetry, crash reporting & update channel
+Crash reporting infrastructure (symbolication, minidumps — Chromium's
+Crashpad / Mozilla's Socorro are the real precedents), opt-in usage
+telemetry, and a staged release channel model (canary/beta/stable) with an
+auto-update mechanism.
+**Exit:** a crash in a test build produces a symbolicated, actionable
+report; an update rollout can be staged to a subset of a test fleet.
+
+### F7. Browser UI shell
+Everything `chrome-engine.html`'s toy UI faked — tabs, omnibox with search/
+navigation suggestions, bookmarks, history, settings, profile switching —
+rebuilt against the real engine underneath instead of hardcoded demo pages.
+**Exit:** the shell drives the real D2/D3 networking + A-B rendering
+pipeline for arbitrary real URLs, not a fixed demo set.
+
+---
+
+## The JS engine question — decide this explicitly before Track C
+
+This is the single biggest fork in the whole roadmap, so it's called out on
+its own rather than buried in C3:
+
+- **Pragmatic path:** embed an existing, battle-tested engine (`rusty_v8`
+  bindings to V8, or `mozjs` bindings to SpiderMonkey) and put all original
+  effort into the DOM/layout/binding layers around it. This is what nearly
+  every "build your own browser" project that actually ships chooses,
+  because a from-scratch JIT-compiled JS engine is realistically its own
+  multi-year, dedicated-team project — writing one is *harder* than
+  everything in Tracks A+B combined.
+- **Purist path ("truly one-on-one, nothing borrowed"):** write the parser,
+  interpreter, GC, and eventually JIT tiers from scratch (C3-C7 as written
+  above, including the explicitly-flagged-as-hard C7). This is the only way
+  to hit "replica built entirely from scratch" as a *literal* claim, and it
+  roughly doubles the total project's realistic timeline.
+
+Neither answer is wrong — but the rest of the roadmap's shape (especially
+how much of Track C is "phases" vs. "one integration phase") depends on
+picking one before C3 starts.
+
+---
+
+## Language & repo shape
+
+- **Rust workspace**, one crate per major subsystem, mirroring how Servo
+  and Ladybird are structured: `html`, `css`, `dom`, `layout`, `paint`,
+  `js` (or `js-bindings` if embedding), `net`, `media`, `a11y`, `devtools`,
+  `shell`. Crate boundaries double as the ownership boundaries a real team
+  would staff along.
+- Pull in reference implementations to **test against**, not depend on
+  directly, wherever the goal is "recreate" rather than "wrap" — e.g. run
+  your own HTML tokenizer's output against html5ever's as a correctness
+  oracle in CI, without shipping html5ever itself.
+- TLS (rustls), image/media codecs, and ICU/Unicode data are the standing
+  exceptions: bind existing audited libraries for these always. They are
+  security-critical, spec-external (codecs aren't web specs, they're
+  separate standards bodies' formats), and reimplementing them buys
+  security risk with no engine-architecture learning in return.
+
+---
+
+## Milestone checkpoints (what "done enough to call it X" looks like)
+
+- **"Renders a real static webpage correctly"** → A1-A7, B1-B11 done. No JS,
+  no network beyond a basic fetch, but a saved real-world HTML/CSS page
+  (e.g. a Wikipedia article) renders pixel-comparably to Firefox/Chrome.
+- **"A usable minimal browser"** → adds D1-D3 (networking), C1-C2/C8 (DOM +
+  bindings) + a JS engine (embedded or C3-C6), E1 (origin model). Can
+  actually browse the interactive web, unsandboxed, single-process.
+- **"Security-credible"** → adds E3 (real sandboxing/process isolation),
+  E4 (fuzzing in CI), E6 (transport security). The point where "would I
+  personally browse the untrusted web with this" becomes a fair question.
+- **"Feature-parity replica"** → the rest of Tracks B/C/D (grid, workers,
+  Wasm, media, device APIs) plus all of Track F. This is the "one-on-one"
+  bar, and realistically the multi-year-team-effort end state the intro
+  section is honest about.
 
 ---
 
 ## What to actually do next
 
-Phases 0-3 are realistically the only ones tractable as "a project you and I
-iterate on together" without a team — that already gets you a real,
-independently-useful HTML+CSS rendering library with spec-level HTML parsing
-and a real cascade, which is genuinely more than most "toy browser engine"
-projects on GitHub achieve. Phases 4+ are where scope needs a team or a
-multi-year personal-project commitment; flagging that now rather than
-pretending otherwise.
+Given everything above, the highest-leverage starting point is unchanged
+from before: **A1** (project foundation) immediately followed by **A2-A3**
+(spec-real HTML parsing) and **A4-A7** (spec-real CSS). That slice is
+tractable as an ongoing project between us without a team, produces a
+genuinely useful standalone HTML+CSS engine faster than any other path
+through this document, and every later track (B especially) depends on it
+existing first regardless of which fork you take on the JS engine question.
 
-**Immediate next step, if you want to start today:** Phase 1 — stand up the
-Rust workspace and WPT harness. Say the word and I'll scaffold it.
+Say the word and I'll scaffold the Rust workspace for A1.
