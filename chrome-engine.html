@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>DeChromed Engine</title>
+<style>
+  :root{
+    --chrome-bg:#dee1e6; --chrome-bg2:#f1f3f4; --tab-active:#ffffff;
+    --tab-inactive:#dee1e6; --border:#c7c9cc; --accent:#1a73e8; --text:#202124;
+    --muted:#5f6368;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;height:100%;font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;background:#525659;overflow:hidden;}
+  #browser{display:flex;flex-direction:column;height:100vh;}
+
+  /* ---------- Tab strip ---------- */
+  #tabstrip{display:flex;align-items:flex-end;background:var(--chrome-bg);padding:6px 6px 0 6px;gap:2px;flex-shrink:0;}
+  .tab{display:flex;align-items:center;gap:6px;background:var(--tab-inactive);color:var(--muted);
+       padding:8px 10px;border-radius:8px 8px 0 0;max-width:200px;min-width:110px;cursor:pointer;
+       font-size:12.5px;position:relative;transition:background .1s;}
+  .tab.active{background:var(--tab-active);color:var(--text);}
+  .tab .favicon{width:9px;height:9px;border-radius:50%;background:var(--accent);flex-shrink:0;}
+  .tab .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;}
+  .tab .close{opacity:0;width:16px;height:16px;border-radius:50%;text-align:center;line-height:16px;flex-shrink:0;}
+  .tab:hover .close{opacity:.6;}
+  .tab .close:hover{opacity:1;background:#00000022;}
+  #newtab{color:var(--muted);padding:8px 10px;cursor:pointer;font-size:16px;line-height:1;border-radius:6px;}
+  #newtab:hover{background:#00000011;}
+
+  /* ---------- Toolbar ---------- */
+  #toolbar{display:flex;align-items:center;gap:8px;background:var(--tab-active);padding:8px 10px;border-bottom:1px solid var(--border);flex-shrink:0;}
+  .navbtn{width:28px;height:28px;border:none;background:transparent;border-radius:50%;cursor:pointer;
+          display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:15px;flex-shrink:0;}
+  .navbtn:hover:not(:disabled){background:#00000011;}
+  .navbtn:disabled{opacity:.3;cursor:default;}
+  #addressbar{flex:1;display:flex;align-items:center;background:var(--chrome-bg2);border-radius:16px;
+              padding:6px 14px;gap:8px;border:1px solid transparent;}
+  #addressbar:focus-within{border-color:var(--accent);background:#fff;}
+  #url{flex:1;border:none;background:transparent;outline:none;font-size:13px;color:var(--text);min-width:0;}
+  .lock{color:var(--muted);font-size:12px;}
+  #gobtn{background:var(--accent);color:#fff;border:none;border-radius:14px;padding:5px 14px;font-size:12.5px;cursor:pointer;flex-shrink:0;}
+  #gobtn:hover{background:#1765cc;}
+  #devtoolsBtn{background:transparent;border:1px solid var(--border);border-radius:14px;padding:5px 10px;font-size:12px;cursor:pointer;color:var(--muted);flex-shrink:0;}
+  #devtoolsBtn.on{background:var(--text);color:#fff;border-color:var(--text);}
+
+  /* ---------- Bookmarks bar ---------- */
+  #bookmarks{display:flex;gap:4px;background:var(--tab-active);padding:4px 10px 6px;border-bottom:1px solid var(--border);flex-shrink:0;overflow-x:auto;}
+  .bm{font-size:11.5px;color:var(--text);background:var(--chrome-bg2);padding:4px 10px;border-radius:12px;cursor:pointer;white-space:nowrap;}
+  .bm:hover{background:#e2e4e6;}
+
+  /* ---------- Content area ---------- */
+  #contentwrap{flex:1;display:flex;min-height:0;background:#3c4043;}
+  #viewport{flex:1;overflow:auto;background:#fff;position:relative;}
+  #page{display:block;}
+  #devtools{width:420px;flex-shrink:0;background:#202124;color:#e8eaed;display:none;flex-direction:column;font-family:'SF Mono',Consolas,monospace;font-size:11.5px;border-left:1px solid #111;}
+  #devtools.open{display:flex;}
+  #dtTabs{display:flex;background:#292a2d;flex-shrink:0;}
+  #dtTabs div{padding:8px 12px;cursor:pointer;color:#9aa0a6;border-bottom:2px solid transparent;}
+  #dtTabs div.active{color:#fff;border-color:var(--accent);}
+  #dtBody{flex:1;overflow:auto;padding:10px;white-space:pre-wrap;word-break:break-word;line-height:1.5;}
+  #dtBody .tree{margin:0;}
+  .node-tag{color:#e8964f;}
+  .node-attr{color:#7ed0f7;}
+  .node-str{color:#9fce6f;}
+  .node-text{color:#9aa0a6;font-style:italic;}
+  #dtTiming{padding:8px 12px;border-top:1px solid #333;color:#9aa0a6;flex-shrink:0;display:flex;gap:14px;flex-wrap:wrap;}
+  #dtTiming b{color:#e8eaed;}
+
+  /* ---------- Status bar ---------- */
+  #statusbar{height:20px;background:var(--chrome-bg2);border-top:1px solid var(--border);font-size:11px;
+             color:var(--muted);display:flex;align-items:center;padding:0 10px;flex-shrink:0;}
+</style>
+</head>
+<body>
+<div id="browser">
+
+  <div id="tabstrip"></div>
+
+  <div id="toolbar">
+    <button class="navbtn" id="backBtn" title="Back">&#8592;</button>
+    <button class="navbtn" id="fwdBtn" title="Forward">&#8594;</button>
+    <button class="navbtn" id="reloadBtn" title="Reload">&#8635;</button>
+    <div id="addressbar">
+      <span class="lock">&#128274;</span>
+      <input id="url" spellcheck="false" placeholder="Search or type a URL / paste raw HTML" />
+      <button id="gobtn">Go</button>
+    </div>
+    <button id="devtoolsBtn" title="Toggle engine internals">&lt;/&gt; Engine</button>
+  </div>
+
+  <div id="bookmarks"></div>
+
+  <div id="contentwrap">
+    <div id="viewport"><canvas id="page"></canvas></div>
+    <div id="devtools">
+      <div id="dtTabs">
+        <div data-p="dom" class="active">DOM Tree</div>
+        <div data-p="cssom">CSSOM</div>
+        <div data-p="render">Render Tree</div>
+        <div data-p="source">Source</div>
+      </div>
+      <div id="dtBody"></div>
+      <div id="dtTiming"></div>
+    </div>
+  </div>
+
+  <div id="statusbar">Ready</div>
+</div>
+
+<script>
+/* =====================================================================
+   DeChromed Engine — a from-scratch, single-file toy browser.
+   Pipeline: HTML -> tokens -> DOM -> CSSOM -> styled tree -> layout -> paint
+   ===================================================================== */
+
+/* ----------------------------- 1. TOKENIZER ----------------------------- */
+const VOID_TAGS = new Set(['br','img','hr','meta','link','input','area','col','embed','source','track','wbr']);
+
+function tokenizeHTML(html){
+  const tokens = [];
+  let i = 0, n = html.length;
+  while(i < n){
+    if(html[i] === '<'){
+      if(html.startsWith('<!--', i)){
+        const end = html.indexOf('-->', i+4);
+        i = end === -1 ? n : end+3;
+        continue;
+      }
+      if(html[i+1] === '!'){ // doctype etc
+        const end = html.indexOf('>', i);
+        i = end === -1 ? n : end+1;
+        continue;
+      }
+      const close = html[i+1] === '/';
+      const end = html.indexOf('>', i);
+      if(end === -1) break;
+      let raw = html.slice(i + (close?2:1), end).trim();
+      let selfClose = raw.endsWith('/');
+      if(selfClose) raw = raw.slice(0,-1).trim();
+      const m = raw.match(/^([a-zA-Z0-9\-]+)([\s\S]*)$/);
+      if(m){
+        const tag = m[1].toLowerCase();
+        const attrs = {};
+        const attrStr = m[2];
+        const attrRe = /([a-zA-Z\-]+)\s*(?:=\s*("([^"]*)"|'([^']*)'|[^\s"'>]+))?/g;
+        let am;
+        while((am = attrRe.exec(attrStr))){
+          const name = am[1].toLowerCase();
+          const val = am[3] !== undefined ? am[3] : am[4] !== undefined ? am[4] : (am[2] || '');
+          attrs[name] = val;
+        }
+        if(close) tokens.push({type:'close', tag});
+        else tokens.push({type:'open', tag, attrs, selfClose: selfClose || VOID_TAGS.has(tag)});
+        // raw text elements: style / script
+        if(!close && (tag === 'style' || tag === 'script') && !VOID_TAGS.has(tag)){
+          const closeTag = '</' + tag;
+          const ci = html.toLowerCase().indexOf(closeTag, end+1);
+          const textEnd = ci === -1 ? n : ci;
+          const raw2 = html.slice(end+1, textEnd);
+          if(raw2.trim()) tokens.push({type:'text', text: raw2});
+          i = ci === -1 ? n : html.indexOf('>', ci) + 1;
+          tokens.push({type:'close', tag});
+          continue;
+        }
+      }
+      i = end + 1;
+    } else {
+      let next = html.indexOf('<', i);
+      if(next === -1) next = n;
+      const text = html.slice(i, next);
+      if(text.trim().length) tokens.push({type:'text', text});
+      i = next;
+    }
+  }
+  return tokens;
+}
+
+const NAMED_ENTITIES = {amp:'&',lt:'<',gt:'>',quot:'"',apos:"'",nbsp:' ',mdash:'—',ndash:'–',larr:'←',rarr:'→',hellip:'…',copy:'©',bull:'•'};
+function decodeEntities(s){
+  return s.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);/g, (m,e)=>{
+    if(e[0]==='#'){
+      const code = e[1]==='x' ? parseInt(e.slice(2),16) : parseInt(e.slice(1),10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : m;
+    }
+    return NAMED_ENTITIES[e] !== undefined ? NAMED_ENTITIES[e] : m;
+  });
+}
+
+/* ------------------------------- 2. DOM --------------------------------- */
+function makeNode(type, tag){ return {type, tag, attrs:{}, children:[], parent:null, text:''}; }
+
+function parseHTML(html){
+  const tokens = tokenizeHTML(html);
+  const root = makeNode('element','#document');
+  const stack = [root];
+  const INLINE_AUTOCLOSE = {li:['li'], p:['p']};
+  for(const t of tokens){
+    const top = () => stack[stack.length-1];
+    if(t.type === 'open'){
+      if(INLINE_AUTOCLOSE[t.tag] && top().tag && INLINE_AUTOCLOSE[t.tag].includes(top().tag)) stack.pop();
+      const node = makeNode('element', t.tag);
+      node.attrs = t.attrs;
+      node.parent = top();
+      top().children.push(node);
+      if(!t.selfClose) stack.push(node);
+    } else if(t.type === 'close'){
+      for(let k = stack.length-1; k >= 1; k--){
+        if(stack[k].tag === t.tag){ stack.length = k; break; }
+      }
+    } else if(t.type === 'text'){
+      const node = makeNode('text', null);
+      node.text = decodeEntities(t.text.replace(/\s+/g,' '));
+      node.parent = top();
+      top().children.push(node);
+    }
+  }
+  return root;
+}
+
+function findAll(node, tag, out=[]){
+  if(node.type==='element' && node.tag===tag) out.push(node);
+  for(const c of node.children) findAll(c, tag, out);
+  return out;
+}
+
+/* ------------------------------- 3. CSS ---------------------------------- */
+function parseCSS(css){
+  const rules = [];
+  const re = /([^{}]+)\{([^{}]*)\}/g;
+  let m;
+  while((m = re.exec(css))){
+    const selectors = m[1].split(',').map(s=>s.trim()).filter(Boolean);
+    const decls = {};
+    m[2].split(';').forEach(d=>{
+      const idx = d.indexOf(':');
+      if(idx === -1) return;
+      const prop = d.slice(0,idx).trim().toLowerCase();
+      const val = d.slice(idx+1).trim();
+      if(prop) decls[prop] = val;
+    });
+    for(const sel of selectors) rules.push({selector: sel, decls, specificity: specificityOf(sel)});
+  }
+  return rules;
+}
+
+function specificityOf(sel){
+  const idCount = (sel.match(/#/g)||[]).length;
+  const classCount = (sel.match(/\./g)||[]).length;
+  const tagMatch = sel.replace(/[.#][a-zA-Z0-9\-_]+/g,'').trim();
+  const tagCount = tagMatch && tagMatch !== '*' ? 1 : 0;
+  return idCount*100 + classCount*10 + tagCount;
+}
+
+function parseSimpleSelector(sel){
+  const idM = sel.match(/#([a-zA-Z0-9\-_]+)/);
+  const classM = [...sel.matchAll(/\.([a-zA-Z0-9\-_]+)/g)].map(m=>m[1]);
+  const tagM = sel.replace(/[.#][a-zA-Z0-9\-_]+/g,'').trim();
+  return {tag: tagM && tagM !== '*' ? tagM : null, id: idM ? idM[1] : null, classes: classM};
+}
+
+function matches(node, sel){
+  if(node.type !== 'element') return false;
+  const s = parseSimpleSelector(sel);
+  if(s.tag && s.tag !== node.tag) return false;
+  if(s.id && node.attrs.id !== s.id) return false;
+  if(s.classes.length){
+    const nodeClasses = (node.attrs.class||'').split(/\s+/).filter(Boolean);
+    if(!s.classes.every(c=>nodeClasses.includes(c))) return false;
+  }
+  return true;
+}
+
+const UA_STYLESHEET = parseCSS(`
+  html,body{display:block;font-size:16px;color:#111;background:#ffffff;}
+  h1{display:block;font-size:30px;font-weight:bold;margin:14px 0;}
+  h2{display:block;font-size:23px;font-weight:bold;margin:12px 0;}
+  h3{display:block;font-size:19px;font-weight:bold;margin:10px 0;}
+  h4{display:block;font-size:16px;font-weight:bold;margin:8px 0;}
+  p{display:block;font-size:16px;margin:8px 0;}
+  div,section,header,footer,main,article,nav{display:block;}
+  ul,ol{display:block;margin:8px 0;}
+  li{display:block;margin:2px 0;}
+  a{color:#1a73e8;text-decoration:underline;}
+  b,strong{font-weight:bold;}
+  i,em{font-style:italic;}
+  code{font-weight:normal;background:#f1f3f4;color:#c7254e;}
+  hr{display:block;margin:12px 0;border-top:1px solid #ccc;}
+  button{display:inline-block;background:#f1f3f4;border:1px solid #c7c9cc;padding:5px 12px;}
+  input{display:inline-block;background:#fff;border:1px solid #999;padding:4px 6px;}
+  blockquote{display:block;margin:10px 0;padding:2px 12px;border-left:3px solid #ccc;color:#555;}
+  small{font-size:12px;}
+  span{display:inline;}
+  style,script{display:none;}
+`);
+
+const INLINE_TAGS = new Set(['a','b','i','em','strong','span','code','small','#text']);
+
+function computeStyle(node, sheet){
+  const applicable = [];
+  for(const rule of sheet){
+    if(matches(node, rule.selector)) applicable.push(rule);
+  }
+  applicable.sort((a,b)=>a.specificity-b.specificity);
+  const style = {};
+  // inherited defaults come from parent
+  const parentStyle = node.parent && node.parent.computedStyle ? node.parent.computedStyle : {
+    color:'#111', fontSize:16, fontWeight:'normal', fontStyle:'normal', textAlign:'left'
+  };
+  style.color = parentStyle.color;
+  style.fontSize = parentStyle.fontSize;
+  style.fontWeight = parentStyle.fontWeight;
+  style.fontStyle = parentStyle.fontStyle;
+  style.textAlign = parentStyle.textAlign;
+  style.background = 'transparent';
+  style.display = INLINE_TAGS.has(node.tag) ? 'inline' : 'block';
+  style.margin = 0;
+  style.padding = 0;
+  style.border = null;
+
+  for(const rule of applicable){
+    const d = rule.decls;
+    if(d.color) style.color = d.color;
+    if(d.background || d['background-color']) style.background = d.background || d['background-color'];
+    if(d['font-size']) style.fontSize = parseFloat(d['font-size']) || style.fontSize;
+    if(d['font-weight']) style.fontWeight = d['font-weight'];
+    if(d['font-style']) style.fontStyle = d['font-style'];
+    if(d['text-align']) style.textAlign = d['text-align'];
+    if(d.display) style.display = d.display;
+    if(d.margin) style.margin = parseFloat(d.margin) || 0;
+    if(d.padding) style.padding = parseFloat(d.padding) || 0;
+    if(d.border) style.border = d.border;
+  }
+  // explicit inline style="" attr wins
+  if(node.attrs && node.attrs.style){
+    const inlineDecls = {};
+    node.attrs.style.split(';').forEach(dd=>{
+      const idx = dd.indexOf(':'); if(idx===-1) return;
+      inlineDecls[dd.slice(0,idx).trim().toLowerCase()] = dd.slice(idx+1).trim();
+    });
+    if(inlineDecls.color) style.color = inlineDecls.color;
+    if(inlineDecls.background) style.background = inlineDecls.background;
+    if(inlineDecls['font-size']) style.fontSize = parseFloat(inlineDecls['font-size']) || style.fontSize;
+    if(inlineDecls['font-weight']) style.fontWeight = inlineDecls['font-weight'];
+    if(inlineDecls['font-style']) style.fontStyle = inlineDecls['font-style'];
+    if(inlineDecls['text-align']) style.textAlign = inlineDecls['text-align'];
+    if(inlineDecls.display) style.display = inlineDecls.display;
+    if(inlineDecls.margin) style.margin = parseFloat(inlineDecls.margin) || 0;
+    if(inlineDecls.padding) style.padding = parseFloat(inlineDecls.padding) || 0;
+    if(inlineDecls.border) style.border = inlineDecls.border;
+  }
+  node.computedStyle = style;
+  for(const c of node.children) computeStyle(c, sheet);
+}
+
+/* ----------------------------- 4. LAYOUT --------------------------------- */
+// Produces a flat list of layout boxes: {node, x,y,w,h, kind:'box'|'text', text, font}
+function layout(root, ctx, viewportWidth){
+  const boxes = [];
+  let cursorY = 10;
+  const PAGE_X = 16;
+  const contentWidth = viewportWidth - PAGE_X*2;
+
+  function fontStr(style){
+    return `${style.fontStyle==='italic'?'italic ':''}${style.fontWeight==='bold'?'bold ':''}${style.fontSize}px -apple-system,Arial,sans-serif`;
+  }
+
+  // inline layout state
+  let line = null;
+  function newLine(x, w, align){ line = {x, w, y: cursorY, items:[], maxH:0, align}; }
+  function flushLine(){
+    if(!line || !line.items.length){ line=null; return; }
+    let usedW = line.items.reduce((s,it)=>s+it.w,0);
+    let offset = 0;
+    if(line.align === 'center') offset = Math.max(0,(line.w - usedW)/2);
+    else if(line.align === 'right') offset = Math.max(0,(line.w - usedW));
+    let x = line.x + offset;
+    for(const it of line.items){
+      boxes.push({kind:'text', text:it.text, x, y: line.y, font: it.font, color: it.color, underline: it.underline, node: it.node});
+      x += it.w;
+    }
+    cursorY = line.y + line.maxH;
+    line = null;
+  }
+
+  function layoutInline(node, x, w, align, indent){
+    if(node.type === 'text'){
+      const words = node.text.split(/(\s+)/).filter(s=>s.length);
+      const style = node.parent.computedStyle;
+      ctx.font = fontStr(style);
+      const lh = style.fontSize * 1.4;
+      for(const word of words){
+        if(word.trim()==='' && (!line || !line.items.length)) continue;
+        const wpx = ctx.measureText(word).width;
+        if(!line) newLine(x, w, align);
+        if(line.items.reduce((s,it)=>s+it.w,0) + wpx > line.w && line.items.length){
+          flushLine();
+          newLine(x, w, align);
+        }
+        line.items.push({text: word, w: wpx, font: ctx.font, color: style.color, underline:false, node});
+        line.maxH = Math.max(line.maxH, lh);
+      }
+    } else if(node.type === 'element'){
+      const style = node.computedStyle;
+      if(style.display === 'none') return;
+      if(node.tag === 'br'){ flushLine(); cursorY += style.fontSize*1.2; return; }
+      for(const c of node.children) layoutInline(c, x, w, align, indent);
+    }
+  }
+
+  function layoutBlock(node, x, w, depth){
+    if(node.type === 'element'){
+      const style = node.computedStyle;
+      if(style.display === 'none' || node.tag==='style' || node.tag==='script') return;
+
+      if(style.display === 'block'){
+        flushLine();
+        cursorY += style.margin;
+        const boxTop = cursorY;
+        const pad = style.padding;
+        const innerX = x + pad + (node.tag==='li'? 14:0);
+        const innerW = w - pad*2 - (node.tag==='li'?14:0);
+        cursorY += pad;
+
+        if(node.tag === 'li'){
+          ctx.font = fontStr(style);
+          const bulletW = ctx.measureText('• ').width;
+          boxes.push({kind:'text', text:'•', x: x+pad, y: cursorY, font: fontStr(style), color: style.color});
+        }
+        if(node.tag === 'hr'){
+          boxes.push({kind:'rule', x, y: cursorY, w, color:'#ccc'});
+          cursorY += 8;
+        } else {
+          const hasBlockChild = node.children.some(c => c.type==='element' && c.computedStyle && c.computedStyle.display==='block');
+          if(hasBlockChild){
+            for(const c of node.children) layoutBlock(c, innerX, innerW, depth+1);
+            flushLine();
+          } else {
+            for(const c of node.children) layoutInline(c, innerX, innerW, style.textAlign, depth);
+            flushLine();
+          }
+        }
+        cursorY += pad;
+        const boxBottom = cursorY;
+        if(style.background && style.background !== 'transparent'){
+          boxes.unshift({kind:'rect', x, y: boxTop, w, h: boxBottom-boxTop, color: style.background});
+        }
+        if(style.border){
+          boxes.push({kind:'rectStroke', x, y: boxTop, w, h: boxBottom-boxTop, border: style.border});
+        }
+        cursorY += style.margin;
+      } else if(style.display === 'inline-block'){
+        layoutInline(node, x, w, style.textAlign, depth);
+      } else { // inline element hit at block level (rare) - just flow it
+        layoutInline(node, x, w, style.textAlign, depth);
+        flushLine();
+      }
+    } else if(node.type === '#document' || node.tag === '#document') {
+      for(const c of node.children) layoutBlock(c, x, w, depth);
+    }
+  }
+
+  // find body (or html) to start layout, else use document root
+  let start = null;
+  const htmlEls = findAll(root,'html');
+  const bodyEls = findAll(root,'body');
+  if(bodyEls.length) start = bodyEls[0];
+  else if(htmlEls.length) start = htmlEls[0];
+  else start = root;
+
+  if(!start.computedStyle) start.computedStyle = {display:'block', margin:0, padding:0};
+  layoutBlock(start, PAGE_X, contentWidth, 0);
+  flushLine();
+  cursorY += 16;
+  return {boxes, height: cursorY};
+}
+
+/* ------------------------------- 5. PAINT -------------------------------- */
+function paint(ctx, boxes, width, height, bg){
+  ctx.clearRect(0,0,width,height);
+  ctx.fillStyle = bg || '#fff';
+  ctx.fillRect(0,0,width,height);
+  for(const b of boxes){
+    if(b.kind === 'rect'){
+      ctx.fillStyle = b.color; ctx.fillRect(b.x,b.y,b.w,b.h);
+    } else if(b.kind === 'rectStroke'){
+      ctx.strokeStyle = '#999'; ctx.strokeRect(b.x,b.y,b.w,b.h);
+    } else if(b.kind === 'rule'){
+      ctx.strokeStyle = b.color; ctx.beginPath(); ctx.moveTo(b.x,b.y); ctx.lineTo(b.x+b.w,b.y); ctx.stroke();
+    } else if(b.kind === 'text'){
+      ctx.font = b.font; ctx.fillStyle = b.color || '#111'; ctx.textBaseline = 'top';
+      ctx.fillText(b.text, b.x, b.y);
+      if(b.node && b.node.parent && b.node.parent.tag === 'a'){
+        const w = ctx.measureText(b.text).width;
+        ctx.strokeStyle = b.color; ctx.beginPath();
+        const uy = b.y + (parseInt(b.font)||16) + 2;
+        ctx.moveTo(b.x, uy); ctx.lineTo(b.x+w, uy); ctx.stroke();
+      }
+    }
+  }
+}
+
+/* ========================= DEMO "SITES" (raw HTML) ====================== */
+const PAGES = {
+'about:home': `<html><body style="background:#fff">
+<h1 style="color:#1a73e8">DeChromed Engine</h1>
+<p>A tiny browser engine, built from scratch in one HTML file. No native DOM rendering is used for the page below &mdash; every pixel is drawn by a hand-written tokenizer &#8594; parser &#8594; CSSOM &#8594; layout &#8594; canvas paint pipeline.</p>
+<ul>
+<li><a href="about:demo/article">Read a sample article</a></li>
+<li><a href="about:demo/css">See CSS selectors &amp; specificity in action</a></li>
+<li><a href="about:demo/form">Inline &amp; block layout demo</a></li>
+<li><a href="about:engine">How this engine works</a></li>
+</ul>
+<p><small>Tip: paste raw HTML straight into the address bar and hit Go &mdash; the engine will parse and render it live. Click "&lt;/&gt; Engine" to see the DOM tree, CSSOM, and render tree.</small></p>
+</body></html>`,
+
+'about:demo/article': `<html><body>
+<h1>Why Build a Toy Engine?</h1>
+<p>Real browser engines like Blink parse HTML into a <b>DOM tree</b>, parse CSS into a <b>CSSOM</b>, combine them into a <i>render tree</i>, run <b>layout</b> to compute geometry, and finally <b>paint</b> pixels.</p>
+<h2>The Pipeline</h2>
+<p>This page itself is proof: it was tokenized character by character, turned into nested DOM nodes, styled against a small default stylesheet, laid out into boxes and line-wrapped text, then painted onto a &lt;canvas&gt;.</p>
+<blockquote>No iframe, no innerHTML, no native renderer &mdash; just arrays, objects, and canvas draw calls.</blockquote>
+<p><a href="about:home">&larr; Back home</a></p>
+</body></html>`,
+
+'about:demo/css': `<html><head><style>
+  .card{background:#eef4ff;padding:12px;margin:10px 0;border:1px solid #cddcf7;}
+  .warn{background:#fff4e5;color:#8a5300;padding:8px;}
+  #special{color:#c0166a;font-weight:bold;}
+  h2{color:#1a73e8;}
+</style></head>
+<body>
+<h1>CSSOM &amp; Specificity</h1>
+<p>This stylesheet is parsed by a hand-written CSS parser (selector list &#8594; declarations), then matched against the DOM using id &gt; class &gt; tag specificity, exactly like a real browser (minus combinators).</p>
+<div class="card">A <code>.card</code> styled block with background, padding, and a border.</div>
+<div class="card warn">A <code>.warn</code> box &mdash; two classes on one element.</div>
+<p id="special">This paragraph is targeted with #special and wins over any tag/class rule.</p>
+<h2>Centered heading via CSS</h2>
+<p style="text-align:center">Text-align, inline style="" overrides, and cascade order are all implemented.</p>
+<p><a href="about:home">&larr; Back home</a></p>
+</body></html>`,
+
+'about:demo/form': `<html><body>
+<h1>Inline vs Block Layout</h1>
+<p>Block elements (like this paragraph) stack vertically. <b>Bold</b>, <i>italic</i>, <a href="about:home">links</a>, and plain text are <span>inline</span> and wrap word-by-word inside line boxes, just like text reflow in a real engine.</p>
+<p>Buttons and inputs are laid out as inline-block: <button>Click me</button> <input value="text field" /></p>
+<hr/>
+<p>Resize the window and reload &mdash; the line-wrapping recalculates against the new viewport width.</p>
+<p><a href="about:home">&larr; Back home</a></p>
+</body></html>`,
+
+'about:engine': `<html><body>
+<h1>How DeChromed Engine Works</h1>
+<p>1. <b>Tokenizer</b> &mdash; walks the HTML string char-by-char, emitting open/close/text tokens.</p>
+<p>2. <b>DOM builder</b> &mdash; a stack-based parser turns tokens into a tree of element/text nodes.</p>
+<p>3. <b>CSS parser</b> &mdash; splits stylesheets into selector/declaration rules and computes specificity.</p>
+<p>4. <b>Style resolution</b> &mdash; cascades a default UA stylesheet, page &lt;style&gt; rules, and inline style="" per node, with inheritance for color/font.</p>
+<p>5. <b>Layout</b> &mdash; walks the styled tree, stacking block boxes vertically and flowing inline content into wrapped line boxes using real canvas text metrics.</p>
+<p>6. <b>Paint</b> &mdash; draws backgrounds, borders, rules, and text onto a &lt;canvas&gt; in tree order.</p>
+<p>Click "&lt;/&gt; Engine" in the toolbar to inspect the DOM tree, CSSOM rules, and render boxes for whatever page is open.</p>
+<p><a href="about:home">&larr; Back home</a></p>
+</body></html>`,
+
+'about:blank': `<html><body></body></html>`
+};
+
+const BOOKMARKS = [
+  {name:'Home', url:'about:home'},
+  {name:'Article demo', url:'about:demo/article'},
+  {name:'CSS demo', url:'about:demo/css'},
+  {name:'Layout demo', url:'about:demo/form'},
+  {name:'How it works', url:'about:engine'},
+];
+
+/* ============================ BROWSER SHELL ============================= */
+let tabs = [];
+let activeTabId = null;
+let tabCounter = 0;
+
+function titleFromHTML(html){
+  const m = html.match(/<title>([^<]*)<\/title>/i);
+  if(m) return m[1];
+  const h1 = html.match(/<h1[^>]*>([^<]*)<\/h1>/i);
+  return h1 ? h1[1] : 'New Tab';
+}
+
+function newTab(url){
+  const id = ++tabCounter;
+  const html = PAGES[url] || PAGES['about:home'];
+  const tab = {id, url, history:[url], historyIndex:0, source: html};
+  tabs.push(tab);
+  activeTabId = id;
+  renderTabStrip();
+  loadCurrent();
+}
+
+function closeTab(id, ev){
+  if(ev) ev.stopPropagation();
+  const idx = tabs.findIndex(t=>t.id===id);
+  if(idx === -1) return;
+  tabs.splice(idx,1);
+  if(tabs.length === 0){ newTab('about:home'); return; }
+  if(activeTabId === id){
+    activeTabId = tabs[Math.max(0, idx-1)].id;
+    renderTabStrip();
+    loadCurrent();
+  } else {
+    renderTabStrip();
+  }
+}
+
+function switchTab(id){
+  activeTabId = id;
+  renderTabStrip();
+  loadCurrent();
+}
+
+function currentTab(){ return tabs.find(t=>t.id===activeTabId); }
+
+function renderTabStrip(){
+  const strip = document.getElementById('tabstrip');
+  strip.innerHTML = '';
+  for(const t of tabs){
+    const el = document.createElement('div');
+    el.className = 'tab' + (t.id===activeTabId?' active':'');
+    el.onclick = () => switchTab(t.id);
+    const fav = document.createElement('div'); fav.className='favicon';
+    const title = document.createElement('div'); title.className='title'; title.textContent = titleFromHTML(t.source);
+    const close = document.createElement('div'); close.className='close'; close.textContent='×';
+    close.onclick = (e)=>closeTab(t.id, e);
+    el.append(fav, title, close);
+    strip.appendChild(el);
+  }
+  const nt = document.createElement('div');
+  nt.id = 'newtab'; nt.textContent = '+';
+  nt.onclick = () => newTab('about:home');
+  strip.appendChild(nt);
+}
+
+function renderBookmarks(){
+  const bar = document.getElementById('bookmarks');
+  bar.innerHTML = '';
+  for(const b of BOOKMARKS){
+    const el = document.createElement('div');
+    el.className = 'bm'; el.textContent = b.name;
+    el.onclick = () => navigate(b.url);
+    bar.appendChild(el);
+  }
+}
+
+function navigate(url, isRawHTML){
+  const tab = currentTab();
+  if(!tab) return;
+  const html = isRawHTML ? url : (PAGES[url] || null);
+  if(html === null && !isRawHTML){
+    // unknown url: try treating input as literal HTML/text
+    navigate(url, true);
+    return;
+  }
+  tab.history = tab.history.slice(0, tab.historyIndex+1);
+  tab.history.push(isRawHTML ? '(inline html)' : url);
+  tab.historyIndex++;
+  tab.url = isRawHTML ? '(inline html)' : url;
+  tab.source = html;
+  renderTabStrip();
+  loadCurrent();
+}
+
+function goBack(){
+  const tab = currentTab(); if(!tab || tab.historyIndex<=0) return;
+  tab.historyIndex--;
+  const url = tab.history[tab.historyIndex];
+  tab.url = url;
+  tab.source = PAGES[url] || tab.source;
+  loadCurrent();
+}
+function goForward(){
+  const tab = currentTab(); if(!tab || tab.historyIndex>=tab.history.length-1) return;
+  tab.historyIndex++;
+  const url = tab.history[tab.historyIndex];
+  tab.url = url;
+  tab.source = PAGES[url] || tab.source;
+  loadCurrent();
+}
+
+/* --------------------------- run the pipeline ---------------------------- */
+let lastRun = null; // {dom, cssRules, boxes}
+
+function loadCurrent(){
+  const tab = currentTab();
+  if(!tab) return;
+  document.getElementById('url').value = tab.url && PAGES[tab.url] ? tab.url : tab.source.slice(0,120).replace(/\s+/g,' ');
+  document.getElementById('backBtn').disabled = tab.historyIndex<=0;
+  document.getElementById('fwdBtn').disabled = tab.historyIndex>=tab.history.length-1;
+  document.getElementById('statusbar').textContent = 'Parsing...';
+  runPipeline(tab.source);
+  renderTabStrip();
+}
+
+function runPipeline(html){
+  const t0 = performance.now();
+  const dom = parseHTML(html);
+  const t1 = performance.now();
+
+  let cssText = '';
+  findAll(dom,'style').forEach(s=>{
+    for(const c of s.children) if(c.type==='text') cssText += c.text + '\n';
+  });
+  const pageRules = parseCSS(cssText);
+  const sheet = UA_STYLESHEET.concat(pageRules);
+  computeStyle(dom, sheet);
+  const t2 = performance.now();
+
+  const canvas = document.getElementById('page');
+  const viewport = document.getElementById('viewport');
+  const width = Math.max(320, viewport.clientWidth);
+  const ctx = canvas.getContext('2d');
+  canvas.width = width;
+
+  const {boxes, height} = layout(dom, ctx, width);
+  const t3 = performance.now();
+
+  canvas.height = Math.max(height, viewport.clientHeight);
+  const bodyEl = findAll(dom,'body')[0];
+  const bg = bodyEl && bodyEl.computedStyle ? bodyEl.computedStyle.background : '#fff';
+  paint(ctx, boxes, canvas.width, canvas.height, bg==='transparent'?'#fff':bg);
+  const t4 = performance.now();
+
+  lastRun = {dom, cssRules: pageRules, boxes, html, timing:{
+    parse:(t1-t0).toFixed(2), style:(t2-t1).toFixed(2), layout:(t3-t2).toFixed(2), paint:(t4-t3).toFixed(2)
+  }};
+
+  document.getElementById('statusbar').textContent =
+    `Done — ${boxes.length} boxes painted · parse ${lastRun.timing.parse}ms / style ${lastRun.timing.style}ms / layout ${lastRun.timing.layout}ms / paint ${lastRun.timing.paint}ms`;
+
+  canvas.onclick = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    for(const b of boxes){
+      if(b.kind !== 'text' || !b.node) continue;
+      const w = ctx.measureText ? measureBoxWidth(ctx,b) : 40;
+      if(x>=b.x && x<=b.x+w && y>=b.y && y<=b.y+ (parseInt(b.font)||16)+4){
+        const a = b.node.parent && b.node.parent.tag==='a' ? b.node.parent : null;
+        if(a && a.attrs.href){
+          const href = a.attrs.href;
+          if(PAGES[href]) navigate(href);
+          return;
+        }
+      }
+    }
+  };
+  canvas.style.cursor = 'default';
+  canvas.onmousemove = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    let overLink = false;
+    ctx.save();
+    for(const b of boxes){
+      if(b.kind !== 'text' || !b.node) continue;
+      ctx.font = b.font;
+      const w = ctx.measureText(b.text).width;
+      if(x>=b.x && x<=b.x+w && y>=b.y && y<=b.y+(parseInt(b.font)||16)+4){
+        if(b.node.parent && b.node.parent.tag==='a'){ overLink = true; break; }
+      }
+    }
+    ctx.restore();
+    canvas.style.cursor = overLink ? 'pointer' : 'default';
+  };
+
+  refreshDevtools();
+}
+
+function measureBoxWidth(ctx,b){ ctx.font=b.font; return ctx.measureText(b.text).width; }
+
+/* ------------------------------ devtools UI ------------------------------ */
+let dtPanel = 'dom';
+function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function domToHTML(node, depth){
+  const pad = '  '.repeat(depth);
+  if(node.type==='text'){
+    const t = node.text.trim();
+    return t ? `${pad}<span class="node-text">"${escapeHtml(t)}"</span>\n` : '';
+  }
+  if(node.tag === '#document'){
+    return node.children.map(c=>domToHTML(c,depth)).join('');
+  }
+  const attrs = Object.entries(node.attrs||{}).map(([k,v])=>` <span class="node-attr">${k}</span>=<span class="node-str">"${escapeHtml(v)}"</span>`).join('');
+  const hasChildren = node.children.length;
+  if(!hasChildren) return `${pad}&lt;<span class="node-tag">${node.tag}</span>${attrs}&gt;\n`;
+  let out = `${pad}&lt;<span class="node-tag">${node.tag}</span>${attrs}&gt;\n`;
+  out += node.children.map(c=>domToHTML(c,depth+1)).join('');
+  out += `${pad}&lt;/<span class="node-tag">${node.tag}</span>&gt;\n`;
+  return out;
+}
+
+function refreshDevtools(){
+  if(!document.getElementById('devtools').classList.contains('open') || !lastRun) return;
+  const body = document.getElementById('dtBody');
+  if(dtPanel === 'dom'){
+    body.innerHTML = `<div class="tree">${domToHTML(lastRun.dom,0)}</div>`;
+  } else if(dtPanel === 'cssom'){
+    if(!lastRun.cssRules.length){ body.textContent = '(no <style> rules on this page — using UA defaults only)'; }
+    else body.innerHTML = lastRun.cssRules.map(r=>
+      `<span class="node-tag">${escapeHtml(r.selector)}</span> <span class="node-text">/* specificity ${r.specificity} */</span> {\n` +
+      Object.entries(r.decls).map(([k,v])=>`  <span class="node-attr">${k}</span>: <span class="node-str">${escapeHtml(v)}</span>;`).join('\n') +
+      `\n}`
+    ).join('\n\n');
+  } else if(dtPanel === 'render'){
+    body.textContent = lastRun.boxes.map(b=>{
+      if(b.kind==='text') return `TEXT  "${b.text}"  x:${b.x.toFixed(0)} y:${b.y.toFixed(0)}  ${b.font}`;
+      if(b.kind==='rect') return `RECT  ${b.w.toFixed(0)}x${b.h.toFixed(0)} at (${b.x.toFixed(0)},${b.y.toFixed(0)})  bg:${b.color}`;
+      if(b.kind==='rule') return `RULE  y:${b.y.toFixed(0)} w:${b.w.toFixed(0)}`;
+      return b.kind;
+    }).join('\n');
+  } else if(dtPanel === 'source'){
+    body.textContent = lastRun.html;
+  }
+  document.getElementById('dtTiming').innerHTML =
+    `<span>parse <b>${lastRun.timing.parse}ms</b></span><span>style <b>${lastRun.timing.style}ms</b></span>` +
+    `<span>layout <b>${lastRun.timing.layout}ms</b></span><span>paint <b>${lastRun.timing.paint}ms</b></span>` +
+    `<span>boxes <b>${lastRun.boxes.length}</b></span>`;
+}
+
+document.querySelectorAll('#dtTabs div').forEach(el=>{
+  el.onclick = () => {
+    document.querySelectorAll('#dtTabs div').forEach(e=>e.classList.remove('active'));
+    el.classList.add('active');
+    dtPanel = el.dataset.p;
+    refreshDevtools();
+  };
+});
+
+document.getElementById('devtoolsBtn').onclick = () => {
+  const dt = document.getElementById('devtools');
+  dt.classList.toggle('open');
+  document.getElementById('devtoolsBtn').classList.toggle('on');
+  refreshDevtools();
+};
+
+/* ------------------------------- wiring ---------------------------------- */
+document.getElementById('backBtn').onclick = goBack;
+document.getElementById('fwdBtn').onclick = goForward;
+document.getElementById('reloadBtn').onclick = () => loadCurrent();
+document.getElementById('gobtn').onclick = () => {
+  const v = document.getElementById('url').value.trim();
+  if(!v) return;
+  if(PAGES[v]) navigate(v); else navigate(v, true);
+};
+document.getElementById('url').addEventListener('keydown', e=>{
+  if(e.key === 'Enter'){ document.getElementById('gobtn').click(); }
+});
+
+window.addEventListener('resize', () => { if(currentTab()) runPipeline(currentTab().source); });
+
+renderBookmarks();
+newTab('about:home');
+</script>
+</body>
+</html>
