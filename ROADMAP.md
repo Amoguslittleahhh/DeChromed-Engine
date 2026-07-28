@@ -569,6 +569,255 @@ picking one before C3 starts.
 
 ---
 
+## Reference architecture: what Blink and Gecko actually do
+
+Every phase above is written against the *spec*. Specs describe required
+behavior, not architecture — they don't tell you that a naive
+implementation will be too slow to use, or which subproblem turns out to be
+the load-bearing one in practice. This section is that missing layer:
+concrete precedent from the two production engines named in this project's
+goal, organized by phase, so each phase can be checked against "what did
+the people who already built this find out the hard way" before writing
+code, not after.
+
+**How to use this section:** it is a reference to read *at* each phase, not
+code to vendor in — see "Language & repo shape" above for why nothing gets
+copied wholesale. Where a source directory is named, treat it as "go read
+this when the phase's spec text is ambiguous," the same way the spec
+compliance tests (WPT, html5lib-tests, Test262) are used as an oracle, not
+a dependency.
+
+### Track A — Content & Style
+
+**HTML parsing (A2/A3).** Both engines learned the same lesson from
+opposite directions: don't run the real parser as a single blocking pass.
+Blink's `HTMLPreloadScanner` (`third_party/blink/renderer/core/html/parser/`)
+runs a cheap, deliberately non-spec-compliant shadow tokenizer ahead of the
+real `HTMLTreeBuilder` purely to fire off `<img>`/`<link>`/`<script src>`
+fetches early — a naive spec-only implementation misses this and loses
+real load-time performance. Gecko's `parser/html/` goes further: full
+tokenization and tree-building run on a **dedicated parser thread**, with
+**speculative parsing** past a blocking `<script>` tag that gets reconciled
+or discarded depending on whether the script called `document.write`. Both
+are optimizations layered *on top of* spec-correct A2/A3 — build spec
+correctness first, but plan the module boundary so an off-main-thread/
+speculative fast path can be added later without a rewrite.
+([Blink parser dir](https://chromium.googlesource.com/chromium/src/+/master/third_party/blink/renderer/core/html/parser/),
+[Gecko parser threading](https://udn.realityripple.com/docs/Mozilla/Gecko/HTML_parser_threading))
+
+**CSS cascade & invalidation (A6/A7) — the most important precedent in
+this whole document.** Gecko's *entire* modern style system was not built
+inside Gecko. It was written from scratch in Rust as part of **Servo**
+(Mozilla's separate research engine), using `rayon` for work-stealing
+parallel cascade computation across every CPU core, then transplanted
+wholesale into the C++ Gecko codebase in 2017 — replacing ~160k lines of
+old C++ style code with ~85k lines of Rust ("Stylo," shipped as part of
+Project Quantum, Firefox 57). Mozilla had tried to parallelize the old
+C++ style system **twice before and failed both times**; it took a
+memory-safe language's concurrency guarantees to make the parallel
+rewrite tractable at all. Separately, Blink's answer to "don't recompute
+style for the whole tree on every mutation" is `InvalidationSet`:
+selectors are precompiled once into `RuleFeatureSet`, extracting which
+DOM mutations *might* affect which elements, so a class/attribute change
+only walks a provably-bounded subtree — deliberately over-invalidating
+rather than chasing perfect minimality. **Takeaway for A6/A7:** treat the
+cascade/invalidation engine as its own module from day one, specifically
+because it's the one place both real engines found a straightforward
+single-threaded implementation to be a genuine dead end, not just slow.
+([Inside Quantum CSS](https://hacks.mozilla.org/2017/08/inside-a-super-fast-css-engine-quantum-css-aka-stylo/),
+[Fearless Concurrency in Firefox Quantum](https://blog.rust-lang.org/2017/11/14/Fearless-Concurrency-In-Firefox-Quantum/),
+[Blink style invalidation](https://chromium.googlesource.com/chromium/src/+/master/third_party/blink/renderer/core/css/style-invalidation.md))
+
+### Track B — Layout & Graphics
+
+**Fragment tree vs. frame tree (B1/B2/B9).** The two engines took opposite
+architectural bets here, and both are worth knowing before choosing one.
+Gecko's `layout/generic/` builds a **mutable frame tree** (`nsIFrame`
+objects, roughly one-or-more per DOM node) and lays out via **reflow**:
+dirty bits propagate down from reflow roots, each frame recomputes its own
+box in place. Blink deliberately moved away from this exact model —
+**LayoutNG** (now just "layout") produces an **immutable fragment tree**
+per layout pass instead of mutating persistent frame state, specifically
+because Blink's own old mutable-frame model (which was architecturally the
+same idea as Gecko's) caused a long tail of invalidation and fragmentation
+bugs that were hard to fix without this separation. This roadmap's B9
+("fragment tree & display list") is written already assuming the LayoutNG
+answer is the better one to start from — Gecko's design is the reason to
+know why, and the counterexample to reach for if the immutable-fragment
+approach hits a wall later.
+([Blink LayoutNG doc](https://developer.chrome.com/docs/chromium/layoutng),
+[Gecko Layout Overview](https://firefox-source-docs.mozilla.org/layout/LayoutOverview.html))
+
+**Flexbox & Grid (B4/B5).** Both engines implement Grid's track-sizing as
+a sibling of Flexbox's basis-resolution algorithm and **share the CSS Box
+Alignment code** (`align-items`/`justify-content`/etc.) between the two
+rather than reimplementing alignment per layout mode — worth mirroring:
+don't scope B4 and B5 as fully independent phases for the alignment
+subset, only for the sizing/placement algorithms that are genuinely
+different.
+([Igalia: CSS Grid on LayoutNG](https://blogs.igalia.com/jfernandez/2018/11/07/css-grid-on-layoutng-a-web-engines-hackfest-story/))
+
+**Compositing & GPU paint (B11/B12) — the second Servo transplant.**
+WebRender, Gecko's GPU renderer, has the *exact same origin story* as
+Stylo: a from-scratch Rust rewrite prototyped standalone inside Servo,
+merged into Gecko once it won on performance ("Quantum Render," also
+Firefox 57). It restricts all GPU-device access to a single dedicated
+render thread and pushes most rasterization/compositing/clipping work
+onto the GPU rather than the CPU. Blink's independent answer to "how do
+transforms/clips/scroll interact with compositing" is **property trees**
+(introduced in RenderingNG) — transform/clip/effect/scroll state is kept
+in its own tree, decoupled from a rigid layer hierarchy, so layerization
+(which paint chunks get promoted to their own GPU-texture-backed layer) is
+a separate, tunable decision made *after* painting rather than baked into
+style resolution. Both conclusions point the same direction for B9-B12:
+paint output (display list) and compositing decisions belong in clearly
+separate stages, and (per the Stylo/WebRender pattern) compositing is a
+second strong candidate — alongside the cascade — for prototyping in
+isolation before integrating.
+([WebRender](https://github.com/servo/webrender),
+[RenderingNG architecture](https://developer.chrome.com/docs/chromium/renderingng-architecture))
+
+### Track C — Script & Runtime
+
+**Tiered execution, if going the from-scratch JS path (C4/C7).**
+SpiderMonkey's real tiering ladder is Interpreter → **Baseline
+Interpreter** (a hybrid: still bytecode-driven, but attaches Inline Caches
+per call-site to speed up repeated ops without full compilation) →
+**Baseline JIT** (compiles whole functions to native code, reusing the
+same IC infrastructure) → **Warp** (the optimizing tier since Firefox 83,
+which builds its optimizations by directly reading recorded IC data from
+the lower tiers instead of running a separate profiling/recompilation
+pass, unlike its predecessor IonMonkey). The concrete lesson for C7 if the
+purist path is chosen: design the IC mechanism once, at the baseline tier,
+and have every higher tier consume the *same* IC data rather than
+re-deriving profile information independently per tier.
+([Warp: improved JS performance](https://hacks.mozilla.org/2020/11/warp-improved-js-performance-in-firefox-83/))
+
+**GC design (C6).** SpiderMonkey's GC is generational (separate nursery +
+tenured heap, since most objects die young), incremental (sliced across
+mutator execution so a GC pause doesn't stall the whole engine), and
+occasionally compacting (rare, non-incremental, purely for
+defragmentation) — a combination, not a single strategy. Blink's Oilpan
+takes a different but related approach to the *DOM-wrapper* half of the
+problem specifically: rather than refcounting across the JS/native
+boundary (a classic cross-language leak source for cycles spanning both
+heaps), Oilpan and V8 are **unified into one heap** with cross-component
+tracing, so a cycle that spans a JS object and a C++ DOM node is still
+collected correctly. If C8 (DOM↔JS bindings) is scoped with a boundary
+GC at all, Oilpan's unified-heap answer is the one to copy the *shape* of,
+even choosing a different concrete GC algorithm.
+([SpiderMonkey GC docs](https://firefox-source-docs.mozilla.org/js/gc.html),
+[Oilpan](https://v8.dev/blog/oilpan-library))
+
+**DOM↔JS bindings (C8).** Blink doesn't hand-write bindings: every DOM/Web
+API interface is declared in a **Web IDL** file, and a build-time code
+generator emits all the V8↔C++ glue. Doing the same — schema-driven
+codegen from IDL instead of hand-written bindings per interface — is what
+makes C8 tractable at the hundreds-of-interfaces scale real spec parity
+requires, instead of an ever-growing pile of one-off glue code.
+([Web IDL in Blink](https://www.chromium.org/blink/webidl/))
+
+### Track D — Platform & Storage
+
+**Resource scheduling (D3).** Chromium's network stack (`net/`, fronted by
+the sandboxed Network Service process) includes a **resource scheduler**
+that actively reprioritizes and throttles requests during page load (e.g.
+deferring low-priority requests, treating QUIC/HTTP2 streams differently
+from plain HTTP) — this is easy to under-scope as "just fetch things" but
+is a measurable, real performance feature worth its own attention in D3
+rather than folding into D2's basic client.
+([Network stack design doc](https://www.chromium.org/developers/design-documents/network-stack/))
+
+**Embedding hard subproblems as isolated modules (D2/D6/D7).** Gecko's
+HTTP/3 support runs through **neqo**, a separately-developed Rust QUIC
+implementation embedded into the C++-majority `netwerk/` stack — the same
+"isolated component, different language if it helps, integrate once
+proven" pattern as Stylo/WebRender, just for a narrower subproblem. Same
+logic applies to this roadmap's existing "bind, don't reimplement" stance
+on TLS/codecs/WebRTC: it's not just a security-risk avoidance move, it's
+the same architectural pattern the real engines use even for
+non-security-critical hard subproblems.
+([neqo](https://github.com/mozilla/neqo))
+
+### Track E — Security & Privacy
+
+**Process model (E3).** Firefox's evolution here is a useful staged
+template: ship a single shared content process first ("Electrolysis"/e10s,
+2016), then move to **Fission** (2021) — a separate OS process *per site*,
+not just per tab, partly in direct response to Spectre/Meltdown-class
+side-channel attacks making same-process cross-site data no longer safely
+isolable in principle. Firefox also defines discrete **numbered sandbox
+levels** (0 = least restrictive, increasing restriction per level) so
+platform-specific hardening (seccomp-BPF on Linux, job objects/
+AppContainer on Windows, Sandbox profiles on macOS) can roll out
+incrementally without an all-or-nothing cutover — directly reusable as
+E3's own rollout structure: ship unsandboxed, then ratchet up levels as
+each restriction is verified not to break real content.
+([Process Model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html),
+[Fission](https://hacks.mozilla.org/2021/05/introducing-firefox-new-site-isolation-security-architecture/),
+[Chromium Linux sandboxing](https://chromium.googlesource.com/chromium/src/+/0e94f26e8/docs/linux_sandboxing.md))
+
+### Track F — Product & Ops
+
+**DevTools protocol (F1).** There are two real, divergent precedents, and
+the choice matters beyond aesthetics. Chrome DevTools Protocol (CDP) is
+JSON-RPC-like, organized into versioned **domains** (DOM, Debugger,
+Network, Page, CSS...) with a stable subset plus an unstable
+"tip-of-tree," and has a huge existing tool ecosystem (Puppeteer,
+Playwright) that speaks it natively. Firefox's Remote Debugging Protocol
+(RDP) predates CDP and takes an **actor-model** approach instead — every
+debuggable object is an "actor" with its own protocol-defined request
+types, packet-based over a socket. Implementing a CDP-compatible protocol
+buys immediate compatibility with the existing automation-tool ecosystem;
+implementing something RDP-shaped buys a cleaner internal architecture
+with no external constraint. Decide explicitly rather than drifting into
+a bespoke third design.
+([CDP](https://chromedevtools.github.io/devtools-protocol/),
+[Firefox RDP](https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html))
+
+**Accessibility tree (F2).** Both engines maintain the a11y tree as a
+genuinely separate, incrementally-updated structure — not something
+computed on demand from DOM+layout at query time. Blink's `AXObject` tree
+is built via notification hooks threaded through DOM/layout/style code and
+serialized cross-process to the browser (which builds a second,
+platform-specific tree from it). Gecko's version is multi-process by
+construction: each content process builds its own local a11y tree from
+its DOM, and the parent process stitches all per-process local trees
+(including cross-process iframes) into one coherent remote tree for
+screen readers. **Directly relevant once E3's multi-process work lands:**
+F2 should be scoped from the start as "a tree that gets built once per
+process and stitched centrally," not retrofitted onto a single-process
+assumption.
+([Blink accessibility overview](https://chromium.googlesource.com/chromium/src/+/lkgr/docs/accessibility/overview.md),
+[Gecko accessibility architecture](https://firefox-source-docs.mozilla.org/accessible/Architecture.html))
+
+### The cross-cutting pattern worth internalizing before Track A even starts
+
+Two of the highest-leverage precedents above aren't phase-specific at all:
+
+1. **Multiple parallel trees, not one source of truth.** Real engines
+   maintain DOM tree, fragment/frame tree, paint/property trees,
+   compositor layer tree, and accessibility tree as independent,
+   incrementally-updated structures, each with its own invalidation logic
+   — never views recomputed on demand from a single tree. A toy engine
+   that tries to derive everything from the DOM at read time (as
+   `chrome-engine.html`, Phase A0, does) works at small scale and stops
+   working the moment invalidation/incremental-update phases (A7, B9,
+   F2) need to exist.
+2. **The Stylo/WebRender pattern: prototype in isolation, integrate once
+   proven.** Twice, Mozilla's answer to "this subsystem needs a
+   fundamentally different approach than incremental patching of the
+   existing C++ can achieve" was to build a clean-room rewrite as a
+   standalone component in a different, safety/parallelism-friendly
+   language, and only merge it in wholesale once it demonstrably beat the
+   incumbent. For this project, the cascade/invalidation engine (A6/A7)
+   and the compositor (B11/B12) are the two most likely candidates to hit
+   that same wall — worth deciding up front whether either gets built as
+   an isolated, swappable module for exactly that reason, rather than
+   inline with the rest of its track.
+
+---
+
 ## Milestone checkpoints (what "done enough to call it X" looks like)
 
 - **"Renders a real static webpage correctly"** → A1-A7, B1-B11 done. No JS,
