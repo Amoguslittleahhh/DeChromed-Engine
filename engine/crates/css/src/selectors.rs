@@ -671,7 +671,11 @@ pub fn matches(doc: &Document, id: NodeId, list: &SelectorList) -> bool {
     list.0.iter().any(|cs| matches_complex(doc, id, cs))
 }
 
-fn matches_complex(doc: &Document, id: NodeId, cs: &ComplexSelector) -> bool {
+/// `pub(crate)` (not private) because A6's cascade needs to know *which*
+/// complex selector in a comma-separated list matched, to compute that
+/// selector's specificity -- `matches()` above only answers yes/no for the
+/// whole list, which loses that information.
+pub(crate) fn matches_complex(doc: &Document, id: NodeId, cs: &ComplexSelector) -> bool {
     match_step(doc, id, &cs.steps, cs.steps.len() - 1)
 }
 

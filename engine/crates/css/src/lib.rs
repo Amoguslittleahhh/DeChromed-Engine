@@ -1,5 +1,6 @@
-//! Roadmap phase: Track A4 (CSS tokenizer/parser, done) through A7 (CSSOM &
-//! style invalidation, still ahead).
+//! Roadmap phase: Track A4-A7 (CSS tokenizer/parser through CSSOM & style
+//! invalidation) -- all done, see each module's own doc comment for what
+//! "done" means and its documented gaps.
 //!
 //! `tokenizer.rs` and `parser.rs` implement the real CSS Syntax Module
 //! Level 3 algorithms. `parse_stylesheet()` here is the public entry point
@@ -9,11 +10,18 @@
 //! (a documented simplification, not a correctness claim) -- into a flat
 //! rule list, and separately records other at-rules' raw name/prelude/block
 //! text for whichever later phase needs them (e.g. `@font-face`, `@import`).
+//! `selectors.rs` (A5) matches that against a DOM tree. `cascade.rs` (A6)
+//! resolves competing declarations and computes styles. `cssom.rs`/
+//! `style_engine.rs` (A7) wrap all of the above in a mutable object graph
+//! with incremental, invalidation-set-driven restyling.
 //!
 //! Reference: <https://www.w3.org/TR/css-syntax-3/>
 
+pub mod cascade;
+pub mod cssom;
 pub mod parser;
 pub mod selectors;
+pub mod style_engine;
 pub mod tokenizer;
 
 use parser::{ComponentValue, Parser, Rule as ParsedRule};

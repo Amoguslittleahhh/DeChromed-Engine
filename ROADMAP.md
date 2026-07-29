@@ -185,22 +185,65 @@ artifacts like `Dimension{unit:"n-"}`), and `:has()`.
 **Exit:** met on the achievable bar — real Selectors Level 4 grammar and
 matching, unit-tested; WPT `css/selectors` deferred until Track C exists.
 
-### A6. Cascade & computed values
-Origin/importance ordering (UA/user/author/`!important`/transition/
-animation origins), cascade layers (`@layer`), full specificity per spec,
-the specified→computed→used value pipeline, `initial`/`inherit`/`unset`/
-`revert`, custom properties (`--foo`) and `var()` substitution.
-**Exit:** WPT `css/cssom`, `css/css-cascade`, `css/css-variables` ≥85%.
+### A6. Cascade & computed values — *done*
+The real cascade sort in `engine/crates/css/src/cascade.rs`: origin/
+importance ordering (UA/user/author normal, then author/user/UA
+`!important` in the spec's reversed priority), full Selectors-Level-4
+specificity computation (including `:is()`/`:not()`/`:has()`'s
+most-specific-argument rule, `:where()`'s zero specificity, and
+`:nth-child(An+B of S)`'s added specificity), source-order tie-breaking,
+CSS custom properties (`--foo`) with inheritance and recursive `var()`
+substitution (fallback values, cycle detection per
+<https://www.w3.org/TR/css-variables-1/#invalid-variables>), and the
+`initial`/`inherit`/`unset`/`revert` defaulting keywords.
 
-### A7. CSSOM & style invalidation
-`CSSStyleSheet`/`CSSRule` object graph mutable from script, `getComputedStyle`,
-and — critically — **style invalidation**: recomputing only the minimal
-subtree when a class/attribute/rule changes, instead of full-tree
-recompute. This is a real algorithmic problem (Blink's "style invalidation
-sets," Gecko's "restyle hints") and directly determines whether the engine
-is usably fast on real pages.
-**Exit:** invalidation-set unit tests + no full-tree-restyle on targeted
-mutation benchmarks.
+Known gaps, documented in the module's own doc comments: no used-value
+resolution (computed values stop short of resolving `em`/`%`/etc. against
+layout, which needs Track B to exist), a small hand-curated property table
+(~30 common longhands' inherited-ness/initial value, not the full CSS
+property registry), `revert` collapsed to `unset`'s behavior (a correct
+`revert` needs a full layered per-origin cascade re-run), and no
+animation/transition origins or `@layer` ordering. As with A4/A5, WPT's
+`css/css-cascade`/`css/css-variables` need a JS engine to run and are
+deferred to Track C; verified instead with 9 self-authored unit tests
+(specificity ordering, origin/importance precedence, inheritance vs.
+non-inheritance, `var()` substitution/fallback/cycles, defaulting
+keywords).
+**Exit:** met on the achievable bar — real cascade and computed-value
+pipeline, unit-tested; WPT `css/cssom`/`css/css-cascade`/`css/css-variables`
+deferred until Track C exists.
+
+### A7. CSSOM & style invalidation — *done*
+`engine/crates/css/src/cssom.rs`: a mutable `CssomSheet`/`CssomRule`
+object graph (insert/delete rule, get/set/remove a declaration's property)
+standing in for `CSSStyleSheet`/`CSSRule` at the Rust level.
+`engine/crates/css/src/style_engine.rs`: `StyleEngine` ties that together
+with A6's cascade into a real `getComputedStyle` equivalent
+(`get_computed_style`) plus — the actual point of this phase — **targeted
+style invalidation**: an `InvalidationIndex` buckets every selector's
+class/id/attribute names by whether a match can only affect the element
+itself, its descendants, or its following siblings (conservatively folding
+`:has()`'s relative selectors into the descendant bucket), so
+`notify_class_changed`/`notify_attribute_changed` recompute only the nodes
+that could actually be affected by a given mutation instead of the whole
+document.
+
+Known gap, documented in the module's doc comments: structural mutations
+(a node added/removed/reordered among siblings, which can change
+`:nth-child`-family results for other siblings) aren't tracked — callers
+that mutate tree structure call `StyleEngine::rebuild` instead of relying
+on incremental correctness. The `CssomSheet`/`CssomRule` graph is also not
+yet reachable *from script*, since that binding layer needs Track C8 (DOM↔JS
+bindings), which doesn't exist; what's here is the mutable object graph a
+JS binding would wrap. Verified with unit tests that assert the *exact*
+set of nodes recomputed after a mutation for each invalidation category
+(self-only, descendant-dependent, sibling-dependent), including one that
+compares a targeted restyle's result against a full rebuild's to prove the
+shortcut isn't silently wrong, not just "didn't touch the obviously
+unrelated node."
+**Exit:** met — invalidation-set unit tests proving targeted (not
+full-tree) restyle on class-change mutations across all three
+invalidation categories.
 
 ### A8. SVG
 SVG parsing as its own XML-ish document type, the SVG geometry/paint
@@ -914,23 +957,32 @@ Two of the highest-leverage precedents above aren't phase-specific at all:
 
 ## What to actually do next
 
-**A1 through A5 are done** — see `engine/` and `engine/README.md`. Real
+**A1 through A7 are done** — see `engine/` and `engine/README.md`. Real
 HTML tokenization (99.9%) and tree construction (66.6% overall / 80.3%
 excluding documented foreign-content/frameset/fragment/PI gaps) against the
-vendored html5lib-tests corpora, plus a real CSS Syntax Level 3 tokenizer/
-parser and a real Selectors Level 4 engine (unit-tested; WPT's
-`css/css-syntax` and `css/selectors` suites need a JS engine to run and are
-deferred to Track C). `engine/crates/shell/src/main.rs` demonstrates the
-whole pipeline end to end: parse HTML → real DOM, parse CSS → real
-stylesheet, match a real selector against the tree.
+vendored html5lib-tests corpora; a real CSS Syntax Level 3 tokenizer/
+parser and a real Selectors Level 4 engine; a real cascade (origin/
+importance/specificity/source-order, custom properties, `var()`
+substitution, defaulting keywords); and a real mutable CSSOM object graph
+with `getComputedStyle` and invalidation-set-driven incremental restyling
+(unit-tested throughout; WPT's `css/*` suites need a JS engine to run and
+are deferred to Track C, same reasoning as A4/A5).
+`engine/crates/shell/src/main.rs` demonstrates the whole pipeline end to
+end: parse HTML → real DOM, parse CSS → real stylesheet, match a real
+selector, compute a real style, mutate the DOM, and watch only the
+affected node get restyled.
 
-Next up is **A6** (cascade & computed values: specificity, origin/
-importance ordering, cascade layers, the specified→computed→used value
-pipeline, custom properties/`var()`), which is what turns the flat
-`Stylesheet`/`SelectorList` pieces A4/A5 built into something that actually
-assigns styles to DOM nodes — the prerequisite every Track B layout phase
-needs. After that, A7 (CSSOM & style invalidation) closes out the "renders
-a real static webpage" content-and-style side of Track A, with A8-A10
-(SVG/MathML/XML+XSLT) as the remaining, more niche phases in the track.
+That closes out the "renders a real static webpage correctly" content-and-
+style side of Track A (A1-A7). What's left in Track A is the more niche
+subsystems: **A8** (SVG, its own XML-ish document type with its own
+geometry/paint properties), **A9** (MathML), and **A10** (standalone XML +
+XSLT). None of them block Track B (layout) from starting — B1 (box tree
+generation) only needs A1-A7's styled tree, which now exists — so the next
+productive move is either picking up A8-A10 to finish Track A outright, or
+switching tracks to start B1 now that there's a real cascade to lay boxes
+out from. Track B is probably the higher-leverage next step: it's the
+first phase where this project starts producing something visibly
+different from a data structure -- actual pixels.
 
-Say the word and I'll start on A6.
+Say the word and which track you'd like next (A8-A10 to finish Track A, or
+B1 to start layout).

@@ -9,3 +9,6 @@ workspace = true
 
 [dependencies]
 dom = { path = "../dom" }
+
+[dev-dependencies]
+html = { path = "../html" }

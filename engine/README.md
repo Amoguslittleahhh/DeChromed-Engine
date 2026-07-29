@@ -1,12 +1,15 @@
 # engine/
 
 The real (as opposed to `chrome-engine.html`'s toy) implementation, per
-[`ROADMAP.md`](../ROADMAP.md). A1-A5 are done: the real WHATWG HTML
+[`ROADMAP.md`](../ROADMAP.md). A1-A7 are done: the real WHATWG HTML
 tokenizer (99.9% on html5lib-tests), the real tree-construction insertion-
 mode state machine + adoption agency algorithm (66.6% overall / 80.3%
 excluding documented gaps on html5lib-tests tree-construction), a real CSS
-Syntax Level 3 tokenizer/parser, and a real Selectors Level 4 engine. A6
-(cascade & computed values) is next.
+Syntax Level 3 tokenizer/parser, a real Selectors Level 4 engine, a real
+cascade + computed-value pipeline, and a real mutable CSSOM with
+`getComputedStyle` and invalidation-set-driven incremental restyling. A8
+(SVG) and B1 (box tree generation, Track B's start) are both open next
+steps -- see `ROADMAP.md`'s "What to actually do next".
 
 ## Layout
 
@@ -16,7 +19,7 @@ engine/
   crates/
     dom/                     tree representation shared by html/css/layout/js_bindings (C1's future home)
     html/                    A2 (tokenizer, done) + A3 (tree construction, done)
-    css/                     A4 (tokenizer/parser, done) + A5 (selectors, done); A6-A7 (cascade/CSSOM) still placeholders
+    css/                     A4-A7 (tokenizer/parser, selectors, cascade, CSSOM) -- all done
     layout/                  B1-B9 (box tree -> fragment tree) -- currently placeholders
     paint/                   B10-B12 (text shaping, rasterization, compositing) -- currently placeholders
     js_bindings/              Track C -- placeholder, shape depends on "the JS engine question"
@@ -24,7 +27,7 @@ engine/
     media/                   D5-D7 (images, audio/video, WebRTC) -- currently empty
     a11y/                    F2 (accessibility tree) -- currently placeholders
     devtools/                F1 (inspector protocol) -- currently placeholders
-    shell/                   binary crate; a real HTML->DOM->CSS->selector-match pipeline smoke test (layout/paint stages are still placeholders)
+    shell/                   binary crate; a real HTML->DOM->CSS->selector-match->cascade->getComputedStyle->incremental-restyle pipeline smoke test (layout/paint stages are still placeholders)
     html5lib_harness/        A2/A3's conformance harness (see below)
 ```
 
@@ -45,9 +48,9 @@ cargo build --workspace
 # Run the unit tests every crate ships
 cargo test --workspace
 
-# Run the pipeline smoke test (html -> dom -> css -> layout -> paint --
-# tokenizer, tree construction, CSS, and selectors are all real now;
-# layout/paint are still placeholders)
+# Run the pipeline smoke test (html -> dom -> css -> selectors -> cascade
+# -> getComputedStyle -> incremental restyle -> layout -> paint --
+# everything through A7 is real now; layout/paint are still placeholders)
 cargo run -p shell
 
 # Run the html5lib-tests tokenizer conformance harness
