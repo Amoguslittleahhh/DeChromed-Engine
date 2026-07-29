@@ -4,6 +4,7 @@ members = [
     "crates/dom",
     "crates/html",
     "crates/css",
+    "crates/xml",
     "crates/layout",
     "crates/paint",
     "crates/js_bindings",

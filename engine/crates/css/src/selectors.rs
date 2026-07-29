@@ -962,13 +962,13 @@ mod tests {
     fn el(doc: &mut Document, parent: NodeId, tag: &str, attrs: &[(&str, &str)]) -> NodeId {
         doc.append(
             parent,
-            NodeData::Element(ElementData {
-                local_name: tag.to_string(),
-                attributes: attrs
+            NodeData::Element(ElementData::html(
+                tag,
+                attrs
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
-            }),
+            )),
         )
     }
 

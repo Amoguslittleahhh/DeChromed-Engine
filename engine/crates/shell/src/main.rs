@@ -1,10 +1,11 @@
 //! Roadmap phase: Track F7 (browser UI shell), but today this is just a
 //! CLI smoke test wiring every crate together end to end. A2 (tokenizer)
-//! through A7 (CSSOM & style invalidation) are real now -- this
-//! demonstrates parsing a real document, parsing a real stylesheet,
-//! matching a real selector, cascading/computing real styles, and
-//! incrementally restyling after a targeted DOM mutation. Layout/paint are
-//! still placeholders (Track B).
+//! through A10 (XML) are real now -- this demonstrates parsing a real
+//! document, parsing a real stylesheet, matching a real selector,
+//! cascading/computing real styles, incrementally restyling after a
+//! targeted DOM mutation, parsing inline SVG via foreign content (A8/A9),
+//! and parsing a standalone XML document (A10). Layout/paint are still
+//! placeholders (Track B).
 
 use css::cascade::Origin;
 use css::cssom::CssomSheet;
@@ -61,6 +62,20 @@ fn main() {
         engine.get_computed_style(p, "color"),
         touched.len()
     );
+
+    // A8/A9: inline <svg> inside HTML reaches real foreign content --
+    // the nested <path> gets the SVG namespace, not the HTML one.
+    let svg_doc = html::parse_document("<body><svg><path d=\"M0 0\"></path></svg></body>");
+    let svg_el = find_first(&svg_doc, "svg");
+    if let NodeData::Element(e) = svg_doc.data(svg_el) {
+        println!("inline <svg>'s namespace: {}", e.namespace);
+    }
+
+    // A10: a standalone XML document, parsed by a real (non-HTML,
+    // fail-fast-on-malformed) XML parser.
+    let xml_doc = xml::parse_document("<config><item id=\"1\">value</item></config>")
+        .expect("well-formed XML");
+    println!("standalone XML document:\n{}", xml::serialize(&xml_doc));
 
     println!("(layout/paint stages ran but are placeholders -- see ROADMAP.md Track B)");
 }

@@ -240,6 +240,20 @@ const PROPERTY_TABLE: &[(&str, bool, &str)] = &[
     ("background-color", false, "transparent"),
     ("opacity", false, "1"),
     ("z-index", false, "auto"),
+    // A8: a handful of SVG presentation properties (inherited per
+    // <https://www.w3.org/TR/SVG2/propidx.html>, unlike most CSS box
+    // properties) -- enough for these to cascade/inherit correctly onto
+    // `<svg>` subtree elements once a stylesheet matches them, though
+    // nothing consumes their values for painting yet (Track B/paint).
+    ("fill", true, "black"),
+    ("stroke", true, "none"),
+    ("stroke-width", true, "1"),
+    ("fill-opacity", true, "1"),
+    ("stroke-opacity", true, "1"),
+    ("stroke-linecap", true, "butt"),
+    ("stroke-linejoin", true, "miter"),
+    ("stop-color", false, "black"),
+    ("stop-opacity", false, "1"),
 ];
 
 pub struct PropertyMeta {

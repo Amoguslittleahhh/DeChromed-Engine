@@ -1,32 +1,41 @@
 //! A3: HTML tree construction -- the insertion-mode state machine, the
-//! adoption agency algorithm, implicit end-tag generation, and foster
-//! parenting for stray table content.
+//! adoption agency algorithm, implicit end-tag generation, foster
+//! parenting for stray table content, and the Noah's Ark clause
+//! (`apply_noahs_ark`) for the active formatting elements list.
 //!
-//! Reference: <https://html.spec.whatwg.org/multipage/parsing.html#tree-construction>
+//! A8/A9: foreign content -- SVG/MathML namespace switching, tag/attribute
+//! adjustment, breakout rules, and integration points. See
+//! `foreign_content.rs`'s module docs for the tables/predicates and
+//! `use_foreign_content_rules`/`foreign_content` below for how they're
+//! wired into the main dispatch.
+//!
+//! Reference: <https://html.spec.whatwg.org/multipage/parsing.html#tree-construction>,
+//! <https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inforeign>
 //!
 //! Implemented insertion modes: Initial, BeforeHtml, BeforeHead, InHead,
 //! AfterHead, InBody (the workhorse -- headings, `<p>` auto-close, list
-//! items, formatting elements + adoption agency, buttons), Text (RCDATA/
-//! RAWTEXT/script content), InTable/InTableText/InCaption/InColumnGroup/
-//! InTableBody/InRow/InCell (with foster parenting for content that
-//! doesn't belong in a table), InSelect, InTemplate (simplified), AfterBody,
-//! AfterAfterBody.
+//! items, formatting elements + adoption agency, buttons, `<svg>`/`<math>`
+//! entry points into foreign content), Text (RCDATA/RAWTEXT/script
+//! content), InTable/InTableText/InCaption/InColumnGroup/InTableBody/
+//! InRow/InCell (with foster parenting for content that doesn't belong in
+//! a table), InSelect, InTemplate (simplified), AfterBody, AfterAfterBody.
 //!
 //! Known gaps, same spirit as A2's documented ScriptData-escaping gap:
-//! - **No foreign content** (SVG/MathML namespace switching). `<svg>`/
-//!   `<math>` are parsed as ordinary unknown HTML elements. `svg.dat`,
-//!   `math.dat`, `namespace-sensitivity.dat`, `foreign-fragment.dat` are
-//!   expected to fail because of this.
 //! - **No fragment-context parsing** (`parseFragment`/innerHTML setter
 //!   algorithm) -- only full-document parsing. Test cases with a
 //!   `#document-fragment` context are skipped by the harness, not attempted.
+//!   This also means the "adjusted current node" simplifies to "current
+//!   node" throughout foreign content (they only differ during fragment
+//!   parsing).
 //! - **`<frameset>` documents** aren't handled (InFrameset/AfterFrameset/
 //!   AfterAfterFrameset modes don't exist) -- frameset content parses as
 //!   ordinary elements instead of switching modes.
-//! - The Noah's Ark clause (deduplicating the active formatting elements
-//!   list when 3+ identical entries pile up) isn't implemented -- a rare
-//!   edge case, not load-bearing for most real documents.
+//! - **`<template>` content isn't its own document fragment** -- `template`
+//!   is parsed as an ordinary element with the `InTemplate` mode delegating
+//!   most tokens to `InBody` rather than maintaining the spec's separate
+//!   template insertion-mode stack and content-document semantics.
 
+use crate::foreign_content;
 use crate::tokenizer::{Tokenizer, TokenizerState};
 use crate::Token;
 use dom::{DoctypeData, Document, ElementData, NodeData, NodeId};
@@ -104,6 +113,7 @@ const SPECIAL_TAGS: &[&str] = &[
     "plaintext",
     "pre",
     "script",
+    "search",
     "section",
     "select",
     "source",
@@ -233,6 +243,26 @@ impl TreeBuilder {
         self.tag_name(self.current_node())
     }
 
+    /// A8/A9: the current node's namespace, or [`dom::HTML_NS`] before
+    /// parsing has produced an open element yet. This stands in for the
+    /// spec's "adjusted current node," simplified by the same
+    /// no-fragment-parsing assumption as the rest of this module (the two
+    /// only differ during fragment/innerHTML parsing, which isn't
+    /// implemented -- see the crate module docs).
+    fn namespace_of(&self, id: NodeId) -> &str {
+        match self.doc.data(id) {
+            NodeData::Element(el) => el.namespace.as_str(),
+            _ => dom::HTML_NS,
+        }
+    }
+
+    fn current_namespace(&self) -> &str {
+        match self.open_elements.last() {
+            Some(&id) => self.namespace_of(id),
+            None => dom::HTML_NS,
+        }
+    }
+
     // ---- insertion location & basic insertion primitives ----
 
     fn appropriate_insertion_location(
@@ -270,21 +300,34 @@ impl TreeBuilder {
 
     fn insert_element_at(
         &mut self,
+        namespace: &str,
         name: &str,
         attrs: Vec<(String, String)>,
         location: (NodeId, Option<NodeId>),
     ) -> NodeId {
-        let data = NodeData::Element(ElementData {
-            local_name: name.to_string(),
-            attributes: attrs,
-        });
+        let data = NodeData::Element(ElementData::new(namespace, name, attrs));
         let (parent, before) = location;
         self.doc.insert_before(parent, before, data)
     }
 
     fn insert_html_element(&mut self, name: &str, attrs: Vec<(String, String)>) -> NodeId {
         let location = self.appropriate_insertion_location(None);
-        let id = self.insert_element_at(name, attrs, location);
+        let id = self.insert_element_at(dom::HTML_NS, name, attrs, location);
+        self.open_elements.push(id);
+        id
+    }
+
+    /// A8/A9: inserts an element in `namespace` (SVG or MathML) at the
+    /// current insertion location -- the foreign-content equivalent of
+    /// `insert_html_element`. See `foreign_content` module docs below.
+    fn insert_foreign_element(
+        &mut self,
+        namespace: &str,
+        name: &str,
+        attrs: Vec<(String, String)>,
+    ) -> NodeId {
+        let location = self.appropriate_insertion_location(None);
+        let id = self.insert_element_at(namespace, name, attrs, location);
         self.open_elements.push(id);
         id
     }
@@ -339,36 +382,53 @@ impl TreeBuilder {
 
     // ---- scope checks ----
 
-    fn scope_boundary(&self, tag: &str, scope: Scope) -> bool {
+    /// Per spec, the *default* scope's boundary list (and everything built
+    /// on it: list-item, button) also includes a handful of foreign
+    /// (SVG/MathML) elements -- see
+    /// [`foreign_content::is_scope_boundary_foreign_element`] -- since
+    /// those are exactly the HTML-integration-point/MathML-text-
+    /// integration-point elements a scope search shouldn't cross. Table
+    /// and select scope don't extend into foreign content at all in
+    /// practice (a `<table>`/`<select>` boundary is always reached first
+    /// walking up from real foreign content), so they're left tag-name-only.
+    fn scope_boundary(&self, id: NodeId, scope: Scope) -> bool {
+        let tag = self.tag_name(id);
+        let ns = self.namespace_of(id);
         match scope {
-            Scope::Default => matches!(
-                tag,
-                "applet"
-                    | "caption"
-                    | "html"
-                    | "table"
-                    | "td"
-                    | "th"
-                    | "marquee"
-                    | "object"
-                    | "template"
-            ),
-            Scope::ListItem => {
-                self.scope_boundary(tag, Scope::Default) || matches!(tag, "ol" | "ul")
+            Scope::Default => {
+                matches!(
+                    tag.as_str(),
+                    "applet"
+                        | "caption"
+                        | "html"
+                        | "table"
+                        | "td"
+                        | "th"
+                        | "marquee"
+                        | "object"
+                        | "template"
+                ) || foreign_content::is_scope_boundary_foreign_element(ns, &tag)
             }
-            Scope::Button => self.scope_boundary(tag, Scope::Default) || tag == "button",
-            Scope::Table => matches!(tag, "html" | "table" | "template"),
-            Scope::Select => !matches!(tag, "optgroup" | "option"),
+            Scope::ListItem => {
+                self.scope_boundary(id, Scope::Default) || matches!(tag.as_str(), "ol" | "ul")
+            }
+            Scope::Button => self.scope_boundary(id, Scope::Default) || tag == "button",
+            Scope::Table => matches!(tag.as_str(), "html" | "table" | "template"),
+            Scope::Select => !matches!(tag.as_str(), "optgroup" | "option"),
         }
     }
 
+    /// Per spec, the target match here is always "an HTML element with the
+    /// given tag name" -- a same-named SVG/MathML element (A8/A9) doesn't
+    /// count as a match, even though it's still walked over (and can still
+    /// be an opaque non-boundary node the search passes through) on the
+    /// way to find the real HTML-namespace one, if any.
     fn has_element_in_scope(&self, target_tag: &str, scope: Scope) -> bool {
         for &id in self.open_elements.iter().rev() {
-            let tag = self.tag_name(id);
-            if tag == target_tag {
+            if self.tag_name(id) == target_tag && self.namespace_of(id) == dom::HTML_NS {
                 return true;
             }
-            if self.scope_boundary(&tag, scope) {
+            if self.scope_boundary(id, scope) {
                 return false;
             }
         }
@@ -380,7 +440,7 @@ impl TreeBuilder {
             if id == target {
                 return true;
             }
-            if self.scope_boundary(&self.tag_name(id), scope) {
+            if self.scope_boundary(id, scope) {
                 return false;
             }
         }
@@ -530,8 +590,12 @@ impl TreeBuilder {
                     Afe::Element(_, n, a) => (n.clone(), a.clone()),
                     Afe::Marker => unreachable!(),
                 };
-                let new_node =
-                    self.insert_element_at(&name, attrs.clone(), (common_ancestor, None));
+                let new_node = self.insert_element_at(
+                    dom::HTML_NS,
+                    &name,
+                    attrs.clone(),
+                    (common_ancestor, None),
+                );
                 self.doc.detach(new_node);
                 self.afe[node_afe_pos] = Afe::Element(new_node, name, attrs);
                 self.open_elements[node_pos] = new_node;
@@ -555,8 +619,12 @@ impl TreeBuilder {
                 Afe::Element(_, n, a) => (n.clone(), a.clone()),
                 Afe::Marker => unreachable!(),
             };
-            let new_formatting =
-                self.insert_element_at(&fname, fattrs.clone(), (furthest_block, None));
+            let new_formatting = self.insert_element_at(
+                dom::HTML_NS,
+                &fname,
+                fattrs.clone(),
+                (furthest_block, None),
+            );
             let children: Vec<NodeId> = self.doc.children(furthest_block).to_vec();
             for child in children {
                 self.doc.append_existing(new_formatting, child);
@@ -588,22 +656,34 @@ impl TreeBuilder {
         for i in (0..self.open_elements.len()).rev() {
             let node = self.open_elements[i];
             let node_tag = self.tag_name(node);
-            if node_tag == tag {
+            if node_tag == tag && self.namespace_of(node) == dom::HTML_NS {
                 self.generate_implied_end_tags(Some(tag));
                 self.open_elements.truncate(i);
                 return;
             }
+            // `is_special`'s table only lists HTML-namespace special
+            // elements (a documented simplification -- the spec's real
+            // "special" category also includes a handful of SVG/MathML
+            // elements like `foreignObject`/`mi`, not modeled here), so
+            // this can under-stop inside foreign content in rare cases.
             if is_special(&node_tag) {
                 return;
             }
         }
     }
 
+    /// Pops through everything above (and including) the nearest
+    /// HTML-namespace element named `tag` -- same "HTML element with the
+    /// given tag name" matching rule as `has_element_in_scope`, so a
+    /// same-named A8/A9 foreign element on the way doesn't cause an early
+    /// stop, matching what the corresponding scope check already promised
+    /// exists further down.
     fn pop_until_including(&mut self, tag: &str) {
         while let Some(&id) = self.open_elements.last() {
             let t = self.tag_name(id);
+            let is_html_match = t == tag && self.namespace_of(id) == dom::HTML_NS;
             self.open_elements.pop();
-            if t == tag {
+            if is_html_match {
                 break;
             }
         }
@@ -627,6 +707,9 @@ pub fn parse_document(input: &str) -> Document {
         if tb.done {
             break;
         }
+        // A8/A9: `<![CDATA[` is only real CDATA content when the current
+        // node is foreign (SVG/MathML) -- see `Tokenizer::in_foreign_content`.
+        tokenizer.set_in_foreign_content(tb.current_namespace() != dom::HTML_NS);
         let token = tokenizer.next_token();
         let is_eof = matches!(token, Token::Eof);
         tb.process(token, &mut tokenizer);
@@ -676,6 +759,154 @@ impl TreeBuilder {
     }
 
     fn step(&mut self, token: &Token, tokenizer: &mut Tokenizer) -> Action {
+        if self.use_foreign_content_rules(token) {
+            return self.foreign_content(token, tokenizer);
+        }
+        self.dispatch_mode(token, tokenizer)
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/parsing.html#tree-construction>'s
+    /// "how to process a token" entry point: foreign content (A8/A9) if
+    /// the (simplified, non-fragment) adjusted current node calls for it,
+    /// otherwise the ordinary insertion-mode dispatch.
+    fn use_foreign_content_rules(&self, token: &Token) -> bool {
+        if matches!(token, Token::Eof) {
+            return false;
+        }
+        let Some(&node) = self.open_elements.last() else {
+            return false;
+        };
+        let (ns, local, attrs) = match self.doc.data(node) {
+            NodeData::Element(el) => (
+                el.namespace.as_str(),
+                el.local_name.as_str(),
+                el.attributes.as_slice(),
+            ),
+            _ => return false,
+        };
+        if ns == dom::HTML_NS {
+            return false;
+        }
+        if foreign_content::is_mathml_text_integration_point(ns, local) {
+            match token {
+                Token::StartTag { name, .. }
+                    if !matches!(name.as_str(), "mglyph" | "malignmark") =>
+                {
+                    return false
+                }
+                Token::Character(_) => return false,
+                _ => {}
+            }
+        }
+        if ns == dom::MATHML_NS && local == "annotation-xml" {
+            if let Token::StartTag { name, .. } = token {
+                if name == "svg" {
+                    return false;
+                }
+            }
+        }
+        if foreign_content::is_html_integration_point(ns, local, attrs)
+            && matches!(token, Token::StartTag { .. } | Token::Character(_))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inforeign>
+    fn foreign_content(&mut self, token: &Token, tokenizer: &mut Tokenizer) -> Action {
+        match token {
+            Token::Character('\0') => {
+                self.insert_character('\u{FFFD}');
+                Action::Continue
+            }
+            Token::Comment(text) => {
+                self.insert_comment(text);
+                Action::Continue
+            }
+            Token::Character(c) => {
+                self.insert_character(*c);
+                Action::Continue
+            }
+            Token::Doctype { .. } => Action::Continue, // parse error, ignore
+            Token::StartTag {
+                name, attributes, ..
+            } if foreign_content::is_breakout_start_tag(name, attributes) => {
+                // Pop back to HTML content (or an integration point), then
+                // reprocess the token under the current insertion mode.
+                while self.open_elements.len() > 1 {
+                    let node = self.current_node();
+                    let ns = self.namespace_of(node).to_string();
+                    if ns == dom::HTML_NS {
+                        break;
+                    }
+                    let local = self.tag_name(node);
+                    let attrs = match self.doc.data(node) {
+                        NodeData::Element(el) => el.attributes.clone(),
+                        _ => vec![],
+                    };
+                    if foreign_content::is_html_integration_point(&ns, &local, &attrs)
+                        || foreign_content::is_mathml_text_integration_point(&ns, &local)
+                    {
+                        break;
+                    }
+                    self.open_elements.pop();
+                }
+                Action::Reprocess
+            }
+            Token::StartTag {
+                name,
+                attributes,
+                self_closing,
+            } => {
+                let ns = self.current_namespace().to_string();
+                let (insert_name, attrs) = if ns == dom::SVG_NS {
+                    (
+                        foreign_content::adjust_svg_tag_name(name).to_string(),
+                        foreign_content::adjust_svg_attributes(attributes.clone()),
+                    )
+                } else {
+                    (name.clone(), attributes.clone())
+                };
+                self.insert_foreign_element(&ns, &insert_name, attrs);
+                if *self_closing {
+                    self.open_elements.pop();
+                }
+                Action::Continue
+            }
+            Token::EndTag { name }
+                if name == "script"
+                    && self.current_tag() == "script"
+                    && self.current_namespace() == dom::SVG_NS =>
+            {
+                self.open_elements.pop();
+                Action::Continue
+            }
+            Token::EndTag { name } => {
+                // "Any other end tag" in foreign content: search the stack
+                // top-down for a case-insensitive tag-name match, popping
+                // through it if found; if an HTML-namespace node is
+                // reached first, fall back to the current insertion mode's
+                // ordinary end-tag handling for this token instead.
+                let mut i = self.open_elements.len();
+                while i > 0 {
+                    i -= 1;
+                    let node = self.open_elements[i];
+                    if self.tag_name(node).eq_ignore_ascii_case(name) {
+                        self.open_elements.truncate(i);
+                        return Action::Continue;
+                    }
+                    if self.namespace_of(node) == dom::HTML_NS {
+                        break;
+                    }
+                }
+                self.dispatch_mode(token, tokenizer)
+            }
+            Token::Eof => unreachable!("EOF is never routed through foreign_content"),
+        }
+    }
+
+    fn dispatch_mode(&mut self, token: &Token, tokenizer: &mut Tokenizer) -> Action {
         use InsertionMode::*;
         match self.mode {
             Initial => self.in_initial(token),
@@ -762,10 +993,7 @@ impl TreeBuilder {
             } if name == "html" => {
                 let id = self.doc.append(
                     self.doc.root(),
-                    NodeData::Element(ElementData {
-                        local_name: "html".into(),
-                        attributes: attributes.clone(),
-                    }),
+                    NodeData::Element(ElementData::html("html", attributes.clone())),
                 );
                 self.open_elements.push(id);
                 self.mode = InsertionMode::BeforeHead;
@@ -777,10 +1005,7 @@ impl TreeBuilder {
             _ => {
                 let id = self.doc.append(
                     self.doc.root(),
-                    NodeData::Element(ElementData {
-                        local_name: "html".into(),
-                        attributes: vec![],
-                    }),
+                    NodeData::Element(ElementData::html("html", vec![])),
                 );
                 self.open_elements.push(id);
                 self.mode = InsertionMode::BeforeHead;
@@ -1127,6 +1352,7 @@ impl TreeBuilder {
                     | "nav"
                     | "ol"
                     | "p"
+                    | "search"
                     | "section"
                     | "summary"
                     | "ul"
@@ -1455,6 +1681,32 @@ impl TreeBuilder {
                 self.reconstruct_active_formatting_elements();
                 self.insert_html_element("br", vec![]);
                 self.open_elements.pop();
+                Action::Continue
+            }
+            Token::StartTag {
+                name,
+                attributes,
+                self_closing,
+            } if name == "svg" => {
+                self.reconstruct_active_formatting_elements();
+                let attrs = foreign_content::adjust_svg_attributes(attributes.clone());
+                self.insert_foreign_element(dom::SVG_NS, "svg", attrs);
+                if *self_closing {
+                    self.open_elements.pop();
+                }
+                Action::Continue
+            }
+            Token::StartTag {
+                name,
+                attributes,
+                self_closing,
+            } if name == "math" => {
+                self.reconstruct_active_formatting_elements();
+                let attrs = foreign_content::adjust_mathml_attributes(attributes.clone());
+                self.insert_foreign_element(dom::MATHML_NS, "math", attrs);
+                if *self_closing {
+                    self.open_elements.pop();
+                }
                 Action::Continue
             }
             Token::StartTag {
@@ -2147,6 +2399,33 @@ impl TreeBuilder {
                 }
                 Action::Reprocess
             }
+            // <svg>/<math> reach foreign content even from inside a
+            // <select> -- confirmed against the vendored corpus
+            // (tests9.dat/tests10.dat), not just spec-text inference.
+            Token::StartTag {
+                name,
+                attributes,
+                self_closing,
+            } if name == "svg" => {
+                let attrs = foreign_content::adjust_svg_attributes(attributes.clone());
+                self.insert_foreign_element(dom::SVG_NS, "svg", attrs);
+                if *self_closing {
+                    self.open_elements.pop();
+                }
+                Action::Continue
+            }
+            Token::StartTag {
+                name,
+                attributes,
+                self_closing,
+            } if name == "math" => {
+                let attrs = foreign_content::adjust_mathml_attributes(attributes.clone());
+                self.insert_foreign_element(dom::MATHML_NS, "math", attrs);
+                if *self_closing {
+                    self.open_elements.pop();
+                }
+                Action::Continue
+            }
             Token::Eof => Action::Continue,
             _ => Action::Continue,
         }
@@ -2278,5 +2557,99 @@ mod tests {
         // (the reparented clone inside the div), which is the hallmark of
         // adoption agency actually having run rather than being a no-op.
         assert_eq!(out.matches("<b>").count(), 2);
+    }
+
+    fn find_by_local_name(doc: &Document, name: &str) -> NodeId {
+        let mut found = None;
+        doc.walk(doc.root(), &mut |id, _| {
+            if found.is_none() {
+                if let NodeData::Element(el) = doc.data(id) {
+                    if el.local_name == name {
+                        found = Some(id);
+                    }
+                }
+            }
+        });
+        found.unwrap_or_else(|| panic!("no <{name}> in document"))
+    }
+
+    #[test]
+    fn svg_element_gets_svg_namespace() {
+        let doc = parse_document("<body><svg><path></path></svg></body>");
+        let svg = find_by_local_name(&doc, "svg");
+        if let NodeData::Element(el) = doc.data(svg) {
+            assert_eq!(el.namespace, dom::SVG_NS);
+        } else {
+            panic!("expected element");
+        }
+    }
+
+    #[test]
+    fn svg_foreign_object_tag_name_is_case_adjusted() {
+        let doc =
+            parse_document("<body><svg><foreignobject><p>hi</p></foreignobject></svg></body>");
+        let fo = find_by_local_name(&doc, "foreignObject");
+        if let NodeData::Element(el) = doc.data(fo) {
+            assert_eq!(el.namespace, dom::SVG_NS);
+        } else {
+            panic!("expected element");
+        }
+        // <p> is inside an HTML integration point, so it's parsed as an
+        // ordinary HTML element, not foreign content.
+        let p = find_by_local_name(&doc, "p");
+        if let NodeData::Element(el) = doc.data(p) {
+            assert_eq!(el.namespace, dom::HTML_NS);
+        } else {
+            panic!("expected element");
+        }
+    }
+
+    #[test]
+    fn breakout_tag_exits_foreign_content() {
+        // <div> is a breakout tag: it should end up as a sibling of <svg>,
+        // not nested inside it.
+        let doc = parse_document("<body><svg><path></path><div>out</div></svg></body>");
+        let svg = find_by_local_name(&doc, "svg");
+        let div = find_by_local_name(&doc, "div");
+        if let NodeData::Element(el) = doc.data(div) {
+            assert_eq!(el.namespace, dom::HTML_NS);
+        } else {
+            panic!("expected element");
+        }
+        assert_eq!(
+            doc.parent(div),
+            doc.parent(svg),
+            "div breaks out to be svg's sibling"
+        );
+    }
+
+    #[test]
+    fn math_element_gets_mathml_namespace() {
+        let doc = parse_document("<body><math><mi>x</mi></math></body>");
+        let math = find_by_local_name(&doc, "math");
+        if let NodeData::Element(el) = doc.data(math) {
+            assert_eq!(el.namespace, dom::MATHML_NS);
+        } else {
+            panic!("expected element");
+        }
+    }
+
+    #[test]
+    fn cdata_section_is_real_text_in_foreign_content_only() {
+        let doc = parse_document("<body><svg><![CDATA[hi]]></svg></body>");
+        let svg = find_by_local_name(&doc, "svg");
+        let text_child = doc.children(svg)[0];
+        match doc.data(text_child) {
+            NodeData::Text(t) => assert_eq!(t, "hi"),
+            other => panic!("expected CDATA to become a text node, got {other:?}"),
+        }
+
+        // Outside foreign content, the same syntax is a bogus comment.
+        let doc2 = parse_document("<body><![CDATA[hi]]></body>");
+        let body = find_by_local_name(&doc2, "body");
+        assert!(matches!(
+            doc2.data(doc2.children(body)[0]),
+            NodeData::Comment(_)
+        ));
     }
 }

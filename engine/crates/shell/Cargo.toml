@@ -18,3 +18,4 @@ css = { path = "../css" }
 layout = { path = "../layout" }
 paint = { path = "../paint" }
 net = { path = "../net" }
+xml = { path = "../xml" }

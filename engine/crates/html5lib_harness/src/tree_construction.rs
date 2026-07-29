@@ -120,8 +120,43 @@ fn write_node(doc: &dom::Document, id: dom::NodeId, depth: usize, out: &mut Stri
             }
         },
         NodeData::Element(el) => {
-            let _ = writeln!(out, "| {indent}<{}>", el.local_name);
-            let mut attrs = el.attributes.clone();
+            // html5lib's dump convention prefixes a foreign element's tag
+            // (and select attributes) with its namespace: `<svg svg>`,
+            // `xlink href="..."` instead of `xlink:href="..."` -- see
+            // `html::foreign_content`'s module docs for the source tables.
+            let ns_prefix = match el.namespace.as_str() {
+                dom::SVG_NS => Some("svg "),
+                dom::MATHML_NS => Some("math "),
+                _ => None,
+            };
+            let _ = writeln!(
+                out,
+                "| {indent}<{}{}>",
+                ns_prefix.unwrap_or(""),
+                el.local_name
+            );
+            // The foreign-attribute namespace adjustment only applies to
+            // attributes on a foreign (SVG/MathML) element itself -- the
+            // same `xlink:href` on an ordinary HTML element (e.g. `<body
+            // xlink:href=foo>`) is never namespace-adjusted and prints
+            // with its literal, un-split name.
+            let is_foreign = ns_prefix.is_some();
+            let mut attrs: Vec<(String, String)> = el
+                .attributes
+                .iter()
+                .map(|(k, v)| {
+                    let printed_key = if is_foreign {
+                        html::foreign_content::FOREIGN_ATTR_NAMESPACES
+                            .iter()
+                            .find(|(from, _, _)| from == k)
+                            .map(|(_, prefix, local)| format!("{prefix} {local}"))
+                            .unwrap_or_else(|| k.clone())
+                    } else {
+                        k.clone()
+                    };
+                    (printed_key, v.clone())
+                })
+                .collect();
             attrs.sort();
             for (k, v) in &attrs {
                 let _ = writeln!(out, "| {indent}  {k}=\"{v}\"");
@@ -133,6 +168,10 @@ fn write_node(doc: &dom::Document, id: dom::NodeId, depth: usize, out: &mut Stri
         NodeData::Comment(c) => {
             let _ = writeln!(out, "| {indent}<!-- {c} -->");
         }
+        // HTML tree construction never produces this variant (see its
+        // doc comment in `dom::NodeData`) -- included only so this match
+        // stays exhaustive as the enum gains A10's variant.
+        NodeData::ProcessingInstruction { .. } => {}
     }
     for &child in doc.children(id) {
         write_node(doc, child, depth + 1, out);
@@ -174,20 +213,19 @@ pub fn run() {
                 continue;
             }
         }
+        // A8/A9 (foreign content) closed most of the original SVG/MathML-
+        // related gaps here -- svg.dat/math.dat/namespace-sensitivity.dat
+        // dropped off this list (svg.dat/math.dat are 100% fragment-context
+        // cases anyway, already excluded by the separate fragment-skip
+        // counter below; namespace-sensitivity.dat now fully passes).
+        // What's left is genuinely out of A8/A9's scope: fragment parsing
+        // (foreign-fragment.dat), `<template>` content documents
+        // (template.dat), and the PI-node serialization convention
+        // (processing-instructions.dat) -- all pre-existing A3 gaps.
         if skip_known_gaps
             && matches!(
                 file_name.as_str(),
-                "svg.dat"
-                    | "math.dat"
-                    | "namespace-sensitivity.dat"
-                    | "foreign-fragment.dat"
-                    | "menuitem-element.dat"
-                    | "template.dat"
-                    | "tests9.dat"
-                    | "tests10.dat"
-                    | "tests11.dat"
-                    | "tests21.dat"
-                    | "processing-instructions.dat"
+                "foreign-fragment.dat" | "template.dat" | "processing-instructions.dat"
             )
         {
             continue;

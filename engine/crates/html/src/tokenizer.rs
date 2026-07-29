@@ -184,6 +184,14 @@ pub struct Tokenizer {
     char_ref_code: u32,
 
     last_start_tag_name: Option<String>,
+
+    /// A8/A9: whether `<![CDATA[` should really enter CDATA-section state
+    /// (true content, per spec, only when the tree builder's current node
+    /// is foreign -- SVG/MathML -- content) or be treated as a bogus
+    /// comment (ordinary HTML content). The tree builder updates this via
+    /// [`Self::set_in_foreign_content`] before each `next_token()` call,
+    /// since only it knows the current node's namespace.
+    in_foreign_content: bool,
 }
 
 /// Spec preprocessing step, applied before tokenization even starts:
@@ -228,6 +236,7 @@ impl Tokenizer {
             temp_buffer: String::new(),
             char_ref_code: 0,
             last_start_tag_name: None,
+            in_foreign_content: false,
         }
     }
 
@@ -398,6 +407,11 @@ impl Tokenizer {
     /// state" steps.
     pub fn set_state(&mut self, state: TokenizerState) {
         self.state = state;
+    }
+
+    /// See the `in_foreign_content` field docs.
+    pub fn set_in_foreign_content(&mut self, foreign: bool) {
+        self.in_foreign_content = foreign;
     }
 
     /// Sets the "last start tag emitted," used by RCDATA/RAWTEXT/ScriptData's
@@ -807,15 +821,17 @@ impl Tokenizer {
                     self.state = Doctype;
                 } else if self.starts_with_ignore_case("[CDATA[") {
                     // Spec: this only enters CDATA section state when the
-                    // current node is foreign (SVG/MathML) content: HTML
-                    // content treats `<![CDATA[` as a bogus comment whose
-                    // text starts with "[CDATA[". We have no tree builder
-                    // yet to know "current node", so default to the
-                    // ordinary-HTML-content behavior (bogus comment) --
-                    // the far more common case, and what a tokenizer-only
-                    // test run assumes absent other signal.
-                    self.comment.clear();
-                    self.state = BogusComment;
+                    // current node is foreign (SVG/MathML) content -- see
+                    // `in_foreign_content`'s docs, set by the tree builder
+                    // (A8/A9). Ordinary HTML content treats `<![CDATA[` as
+                    // a bogus comment whose text starts with "[CDATA[".
+                    if self.in_foreign_content {
+                        self.consume_n(7);
+                        self.state = CdataSection;
+                    } else {
+                        self.comment.clear();
+                        self.state = BogusComment;
+                    }
                 } else {
                     self.comment.clear();
                     self.state = BogusComment;

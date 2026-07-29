@@ -1,10 +1,12 @@
-//! Roadmap phase: Track A2 (tokenizer, done) / A3 (tree construction, done
-//! for the common HTML-content case; see `tree_builder.rs` module docs for
-//! documented gaps -- foreign content, fragment parsing, framesets).
+//! Roadmap phase: Track A2 (tokenizer, done), A3 (tree construction, done
+//! for the common HTML-content case), A8/A9 (SVG/MathML foreign content,
+//! done -- see `tree_builder.rs` and `foreign_content.rs` module docs for
+//! what's implemented and what's not).
 //!
 //! Reference: <https://html.spec.whatwg.org/multipage/parsing.html#tokenization>
 
 pub mod entities;
+pub mod foreign_content;
 pub mod token;
 pub mod tokenizer;
 pub mod tree_builder;

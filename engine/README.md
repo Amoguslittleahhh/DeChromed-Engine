@@ -1,15 +1,18 @@
 # engine/
 
 The real (as opposed to `chrome-engine.html`'s toy) implementation, per
-[`ROADMAP.md`](../ROADMAP.md). A1-A7 are done: the real WHATWG HTML
-tokenizer (99.9% on html5lib-tests), the real tree-construction insertion-
-mode state machine + adoption agency algorithm (66.6% overall / 80.3%
-excluding documented gaps on html5lib-tests tree-construction), a real CSS
-Syntax Level 3 tokenizer/parser, a real Selectors Level 4 engine, a real
-cascade + computed-value pipeline, and a real mutable CSSOM with
-`getComputedStyle` and invalidation-set-driven incremental restyling. A8
-(SVG) and B1 (box tree generation, Track B's start) are both open next
-steps -- see `ROADMAP.md`'s "What to actually do next".
+[`ROADMAP.md`](../ROADMAP.md). **Track A (A1-A10) is fully done**: the
+real WHATWG HTML tokenizer (99.9% on html5lib-tests), the real
+tree-construction insertion-mode state machine + adoption agency algorithm
++ SVG/MathML foreign content (77.5% overall / 86.9% excluding documented
+gaps on html5lib-tests tree-construction), a real CSS Syntax Level 3
+tokenizer/parser, a real Selectors Level 4 engine, a real cascade +
+computed-value pipeline, a real mutable CSSOM with `getComputedStyle` and
+invalidation-set-driven incremental restyling, and a real standalone XML
+1.0 parser (`crates/xml`) with namespace resolution (XSLT explicitly
+dropped, per `ROADMAP.md`'s own long-standing note on it). B1 (box tree
+generation, Track B's start) is the open next step -- see `ROADMAP.md`'s
+"What to actually do next".
 
 ## Layout
 
@@ -17,9 +20,10 @@ steps -- see `ROADMAP.md`'s "What to actually do next".
 engine/
   Cargo.toml                 workspace manifest
   crates/
-    dom/                     tree representation shared by html/css/layout/js_bindings (C1's future home)
-    html/                    A2 (tokenizer, done) + A3 (tree construction, done)
+    dom/                     tree representation shared by html/css/xml/layout/js_bindings (C1's future home)
+    html/                    A2 (tokenizer) + A3 (tree construction) + A8/A9 (SVG/MathML foreign content) -- all done
     css/                     A4-A7 (tokenizer/parser, selectors, cascade, CSSOM) -- all done
+    xml/                     A10 (standalone XML 1.0 parser + namespace resolution) -- done; also A8's standalone-SVG-document entry point
     layout/                  B1-B9 (box tree -> fragment tree) -- currently placeholders
     paint/                   B10-B12 (text shaping, rasterization, compositing) -- currently placeholders
     js_bindings/              Track C -- placeholder, shape depends on "the JS engine question"
@@ -27,8 +31,8 @@ engine/
     media/                   D5-D7 (images, audio/video, WebRTC) -- currently empty
     a11y/                    F2 (accessibility tree) -- currently placeholders
     devtools/                F1 (inspector protocol) -- currently placeholders
-    shell/                   binary crate; a real HTML->DOM->CSS->selector-match->cascade->getComputedStyle->incremental-restyle pipeline smoke test (layout/paint stages are still placeholders)
-    html5lib_harness/        A2/A3's conformance harness (see below)
+    shell/                   binary crate; a real HTML->DOM->CSS->selector-match->cascade->getComputedStyle->incremental-restyle->foreign-content->XML pipeline smoke test (layout/paint stages are still placeholders)
+    html5lib_harness/        A2/A3/A8/A9's conformance harness (see below)
 ```
 
 Every placeholder crate's `lib.rs` doc comment says which roadmap phase
@@ -49,8 +53,9 @@ cargo build --workspace
 cargo test --workspace
 
 # Run the pipeline smoke test (html -> dom -> css -> selectors -> cascade
-# -> getComputedStyle -> incremental restyle -> layout -> paint --
-# everything through A7 is real now; layout/paint are still placeholders)
+# -> getComputedStyle -> incremental restyle -> SVG foreign content ->
+# standalone XML -> layout -> paint -- everything through A10 is real now;
+# layout/paint are still placeholders)
 cargo run -p shell
 
 # Run the html5lib-tests tokenizer conformance harness
@@ -89,25 +94,40 @@ the default Data state) and `lastStartTag` (primes the "appropriate end
 tag" check for RCDATA/RAWTEXT/ScriptData), both used by
 `html::tokenize_with()`.
 
-**Tree construction: 66.6% (1154/1734) overall, 80.3% (1093/1361) excluding
-known-gap files**, against A3's exit criterion. The gaps are foreign
-content (SVG/MathML), `<frameset>` documents, fragment-context parsing,
-and ProcessingInstruction-node convention -- all documented in
+**Tree construction: 77.5% (1344/1734) overall, 86.9% (1303/1499) excluding
+known-gap files**, against A3/A8/A9's exit criteria (A8/A9's real
+foreign-content implementation moved this from 66.2% overall when A3 alone
+handled it). The remaining gaps are `<frameset>` documents, fragment-
+context parsing (`foreign-fragment.dat`), `<template>` content documents
+(`template.dat`), and the ProcessingInstruction-node serialization
+convention (`processing-instructions.dat`) -- all documented in
 `tree_builder.rs`'s module docs. The `tree_construction_harness` binary
 (`crates/html5lib_harness/src/tree_construction.rs`) is controlled by
 env vars:
 
 - `HARNESS_DEBUG=1` -- print per-file and per-test-case progress to stderr
 - `HARNESS_MAX_FAILURES=N` -- stop after N failures (default: no limit)
-- `HARNESS_SKIP_KNOWN_GAPS=1` -- skip the known-gap `.dat` files (svg.dat,
-  math.dat, namespace-sensitivity.dat, foreign-fragment.dat,
-  menuitem-element.dat, template.dat, tests9/10/11/21.dat,
-  processing-instructions.dat) for a cleaner in-scope signal
+- `HARNESS_SKIP_KNOWN_GAPS=1` -- skip the known-gap `.dat` files
+  (`foreign-fragment.dat`, `template.dat`, `processing-instructions.dat`)
+  for a cleaner in-scope signal
 - `HARNESS_ONLY_FILE=name.dat` -- run just one vendored file
 - `HARNESS_PER_FILE=1` -- print a pass/fail breakdown per file
 
 Each test case runs under `catch_unwind` (with a silenced panic hook) so
 one bad case can't hide the aggregate pass rate.
+
+## The XML crate
+
+`crates/xml` (A10) is a real, non-validating XML 1.0 parser used two ways:
+directly (`xml::parse_document`) for standalone XML documents, and via
+`xml::svg::parse_svg_document` (A8) for standalone `.svg` files, which
+defaults any element left with no resolved namespace to SVG's. It has no
+vendored conformance corpus (WPT doesn't ship a standalone bare-XML-parsing
+test suite the way it does for HTML/CSS) -- verified with 11 self-authored
+unit tests instead, covering the well-formedness fatal-error cases XML's
+parsing model requires (mismatched tags, duplicate attributes, undeclared
+entities, multiple root elements) alongside the ordinary parsing/namespace-
+resolution/round-trip-serialization cases.
 
 ## Why placeholders instead of nothing
 

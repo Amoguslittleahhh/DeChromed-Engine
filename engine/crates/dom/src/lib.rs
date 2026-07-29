@@ -1,18 +1,32 @@
 //! Roadmap phase: Track A (tree shape) / Track C1 (addressable DOM API).
 //!
-//! This crate holds the tree representation shared by the HTML parser (A2/A3),
-//! the CSS engine (A4-A7), and eventually the JS bindings (C1/C8). It starts as
-//! a plain arena-backed tree with no spec-mandated API surface (no live
-//! `NodeList`, no mutation algorithms) -- that's C1's job once Track C starts.
-//! For now it only needs to be shaped correctly enough for the HTML tree
-//! construction algorithm (A3) to build against, including the handful of
-//! primitives A3's insertion-mode algorithms actually need: inserting before
-//! an arbitrary reference node (for foster parenting), detaching/reattaching
-//! an existing node (for the adoption agency algorithm's reparenting), and
-//! merging adjacent character insertions into one text node (matching how
-//! html5lib-tests' expected tree dumps coalesce consecutive characters).
+//! This crate holds the tree representation shared by the HTML parser
+//! (A2/A3), foreign content (A8 SVG/A9 MathML), the standalone XML parser
+//! (A10), the CSS engine (A4-A7), and eventually the JS bindings (C1/C8).
+//! It starts as a plain arena-backed tree with no spec-mandated API
+//! surface (no live `NodeList`, no mutation algorithms) -- that's C1's job
+//! once Track C starts. For now it only needs to be shaped correctly
+//! enough for the HTML tree construction algorithm (A3) to build against,
+//! including the handful of primitives A3's insertion-mode algorithms
+//! actually need: inserting before an arbitrary reference node (for foster
+//! parenting), detaching/reattaching an existing node (for the adoption
+//! agency algorithm's reparenting), and merging adjacent character
+//! insertions into one text node (matching how html5lib-tests' expected
+//! tree dumps coalesce consecutive characters). `ElementData::namespace`
+//! (see [`HTML_NS`]/[`SVG_NS`]/[`MATHML_NS`]) is what A8/A9's foreign
+//! content and A10's XML parser need beyond that.
 
 use std::fmt;
+
+/// The three namespaces A3/A8/A9's tree construction actually switches
+/// between. Real DOM has more (XLink, XML, XMLNS as attribute namespaces),
+/// but those only matter for the small set of foreign attributes the HTML
+/// parsing spec namespace-adjusts (`xlink:href` and friends) -- see
+/// `html::tree_builder`'s foreign-content module docs -- not for element
+/// namespaces, which is all this crate models.
+pub const HTML_NS: &str = "http://www.w3.org/1999/xhtml";
+pub const SVG_NS: &str = "http://www.w3.org/2000/svg";
+pub const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 
 /// Index into a [`Document`]'s node arena. Nodes never move once inserted,
 /// so a `NodeId` stays valid for the document's lifetime.
@@ -45,6 +59,15 @@ pub enum NodeData {
     Element(ElementData),
     Text(String),
     Comment(String),
+    /// A10: `<?target data?>`. Never produced by the HTML tokenizer (which
+    /// tokenizes `<?...>` as a bogus comment per the HTML parsing spec --
+    /// that's a documented A3 gap, not a bug this variant "fixes"); this
+    /// exists for A10's standalone XML parser, where processing
+    /// instructions are real nodes.
+    ProcessingInstruction {
+        target: String,
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,21 +77,36 @@ pub struct DoctypeData {
     pub system_id: Option<String>,
 }
 
-/// An element's tag name and attributes.
-///
-/// `local_name` is kept separate from a future `namespace` field on purpose:
-/// full foreign-content handling (SVG/MathML embedded in HTML) needs
-/// namespace-qualified names, and retrofitting that onto a bare `String` tag
-/// name later would touch every call site. Better to leave the seam visible
-/// now even though namespaces aren't implemented yet (a documented A3 gap --
-/// see `tree_builder.rs`).
+/// An element's namespace, tag name, and attributes. `namespace` is one of
+/// [`HTML_NS`]/[`SVG_NS`]/[`MATHML_NS`] (A8/A9's foreign-content switching
+/// in `html::tree_builder`) or an arbitrary URI (A10's standalone XML
+/// parser, which doesn't restrict namespaces to those three).
 #[derive(Debug, Clone)]
 pub struct ElementData {
+    pub namespace: String,
     pub local_name: String,
     pub attributes: Vec<(String, String)>,
 }
 
 impl ElementData {
+    pub fn new(
+        namespace: impl Into<String>,
+        local_name: impl Into<String>,
+        attributes: Vec<(String, String)>,
+    ) -> Self {
+        ElementData {
+            namespace: namespace.into(),
+            local_name: local_name.into(),
+            attributes,
+        }
+    }
+
+    /// Shorthand for the overwhelmingly common case: an ordinary HTML
+    /// element, not one reached through A8/A9's foreign-content switching.
+    pub fn html(local_name: impl Into<String>, attributes: Vec<(String, String)>) -> Self {
+        ElementData::new(HTML_NS, local_name, attributes)
+    }
+
     pub fn attr(&self, name: &str) -> Option<&str> {
         self.attributes
             .iter()
@@ -284,6 +322,9 @@ impl fmt::Display for Document {
                     }
                     NodeData::Text(t) => writeln!(f, "{indent}\"{t}\"")?,
                     NodeData::Comment(c) => writeln!(f, "{indent}<!-- {c} -->")?,
+                    NodeData::ProcessingInstruction { target, data } => {
+                        writeln!(f, "{indent}<?{target} {data}?>")?
+                    }
                 }
                 Ok(())
             })();
@@ -308,18 +349,9 @@ mod tests {
         let mut doc = Document::new();
         let html = doc.append(
             doc.root(),
-            NodeData::Element(ElementData {
-                local_name: "html".into(),
-                attributes: vec![],
-            }),
+            NodeData::Element(ElementData::html("html", vec![])),
         );
-        let body = doc.append(
-            html,
-            NodeData::Element(ElementData {
-                local_name: "body".into(),
-                attributes: vec![],
-            }),
-        );
+        let body = doc.append(html, NodeData::Element(ElementData::html("body", vec![])));
         doc.append(body, NodeData::Text("hi".into()));
 
         assert_eq!(doc.parent(body), Some(html));
@@ -335,10 +367,7 @@ mod tests {
         let mut doc = Document::new();
         let body = doc.append(
             doc.root(),
-            NodeData::Element(ElementData {
-                local_name: "body".into(),
-                attributes: vec![],
-            }),
+            NodeData::Element(ElementData::html("body", vec![])),
         );
         doc.append_char(body, 'a');
         doc.append_char(body, 'b');
@@ -355,17 +384,11 @@ mod tests {
         let mut doc = Document::new();
         let a = doc.append(
             doc.root(),
-            NodeData::Element(ElementData {
-                local_name: "a".into(),
-                attributes: vec![],
-            }),
+            NodeData::Element(ElementData::html("a", vec![])),
         );
         let b = doc.append(
             doc.root(),
-            NodeData::Element(ElementData {
-                local_name: "b".into(),
-                attributes: vec![],
-            }),
+            NodeData::Element(ElementData::html("b", vec![])),
         );
         let child = doc.append(a, NodeData::Text("x".into()));
         doc.append_existing(b, child);
