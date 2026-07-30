@@ -324,6 +324,72 @@ suite exists for bare XML parsing (WPT's XML coverage lives inside
 `html/` and other test suites, not a standalone `xml/` directory), so
 there's no external corpus to additionally measure against here.
 
+### Track A hardening pass: stress testing and crash fixes
+
+After A1-A10 were all functionally complete, a dedicated stress-testing
+pass (conformance-blind: it doesn't check *correctness* against an
+expected answer, only that every parser returns *something* instead of
+crashing or hanging) found and fixed six real bugs across the track,
+plus added a permanent fuzzing tool
+(`engine/crates/html5lib_harness/src/bin/stress_test.rs`) so this keeps
+getting checked, not just checked once:
+
+- **Three stack-overflow crashes** (process aborts, uncatchable by
+  `catch_unwind`) from unbounded recursion on pathologically deep input:
+  A10's `xml::parse_document` on deeply nested elements, A4's
+  `css::parser` on deeply nested blocks/functions, and A5's
+  `css::selectors` parser on deeply nested `:not()`/`:is()`/`:has()`.
+  Fixed with depth guards (512/256/128 respectively) -- for XML and
+  selectors, exceeding the guard is a well-formedness/parse error (both
+  are already fail-fast parsers); for CSS's permissive parser, exceeding
+  it falls back to flat, unstructured token consumption instead of
+  further recursion, so the sheet still parses *something* rather than
+  erroring where the spec expects tolerance.
+- **A quadratic (`O(depth²)`) blowup** in A3's tree builder: scope-
+  checking algorithms (`has_element_in_scope` and friends) scan from the
+  top of the open-elements stack down to the nearest boundary tag, and on
+  markup that's deeply nested without ever hitting one (plain nested
+  `<div>`s with nothing else), that scan is `O(depth)` per token --
+  20,000 nested `<div>`s alone took over 10 seconds, and 50,000 didn't
+  finish in a minute. Fixed with the same style of depth cap (512 open
+  elements), matching real precedent (both Blink and Gecko impose a
+  similar nesting-depth safeguard) -- past the cap, further start tags
+  still produce real DOM nodes but stop nesting deeper, becoming flat
+  siblings instead. This also transitively fixes a stack-overflow risk in
+  every *downstream* recursive tree-walker (`dom::Document::walk`,
+  `Display`, A6's cascade, the html5lib serializer, A10's XML
+  serializer) that itself never chose to recurse unboundedly.
+- **A stale-index panic in the adoption agency algorithm** (A3): the
+  formatting element's position in the active-formatting-elements list
+  was captured once before the algorithm's inner reparenting loop, but
+  that loop can remove *other* list entries at earlier positions,
+  shifting every later index down -- reusing the stale position afterward
+  could read the wrong entry or index out of bounds entirely. Found by a
+  targeted fuzzer generating randomly-misnested `<a>`/`<b>`/`<div>` soup
+  (the specific shape this algorithm exists for), fixed by re-looking up
+  the position fresh by identity instead of trusting the earlier one.
+- **An integer overflow panic in `An+B` parsing** (A5): a large-magnitude
+  negative `B` value (e.g. `:nth-child(3n- -999...999)`) casts to
+  `i32::MIN`, and negating `i32::MIN` directly overflows `i32` (its
+  magnitude has no positive `i32` representation) -- a debug-build panic
+  Rust's release-mode wrapping arithmetic would have silently hidden.
+  Fixed with `saturating_neg()`.
+- **A UTF-8 char-boundary panic in `var()` substitution** (A6): the
+  substitution loop read plain text a raw *byte* at a time (`bytes[i] as
+  char`) instead of decoding real Unicode scalar values, silently
+  corrupting -- and desynchronizing the byte index of -- any multi-byte
+  UTF-8 character, which then panicked on the next string slice. Fixed by
+  properly decoding the character at each position instead of casting a
+  lone byte.
+
+All six are permanent regression tests now (one per bug, in the relevant
+crate's own test module), and `stress_test` itself runs clean (zero
+distinct failures) across 13 different seeds and roughly 700,000+ total
+fuzzed inputs as of this pass -- see the binary's own doc comment for what
+it covers (truncation fuzzing, mutation fuzzing, random-byte-soup fuzzing,
+a targeted adoption-agency generator, and end-to-end HTML+CSS→cascade
+fuzzing) and `engine/README.md` for how to run it.
+
 ---
 
 ## Track B — Layout & Graphics

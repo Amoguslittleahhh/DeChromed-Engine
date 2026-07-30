@@ -300,7 +300,6 @@ fn substitute_var_inner(
         return Some(value.to_string());
     }
     let mut out = String::new();
-    let bytes = value.as_bytes();
     let mut i = 0;
     while i < value.len() {
         if value[i..].starts_with("var(") {
@@ -329,7 +328,17 @@ fn substitute_var_inner(
             }
             i = close + 1;
         } else {
-            let ch = bytes[i] as char;
+            // Found by fuzzing with multi-byte UTF-8 input: this used to
+            // read `bytes[i] as char`, which reinterprets a single raw
+            // UTF-8 *byte* as if it were already a full Unicode scalar
+            // value -- wrong for anything outside ASCII, and it then
+            // advances `i` by that bogus char's `len_utf8()` (not the real
+            // character's), desynchronizing `i` from the string's actual
+            // char boundaries. A later slice at the now-invalid `i` panics
+            // with "byte index N is not a char boundary". Decoding the
+            // real character at `i` (guaranteed to be a valid boundary
+            // here) and advancing by its real length is always correct.
+            let ch = value[i..].chars().next().expect("i < value.len()");
             out.push(ch);
             i += ch.len_utf8();
         }
@@ -631,5 +640,19 @@ mod tests {
         let styles = compute_document_styles(&doc, &sources);
         let p = find_first(&doc, "p");
         assert_eq!(styles[&p]["color"], "orange");
+    }
+
+    #[test]
+    fn substitute_var_handles_multi_byte_utf8_around_the_reference() {
+        // Found by fuzzing: `substitute_var_inner` used to read plain
+        // ASCII-only chars a byte at a time outside `var(...)` spans,
+        // desynchronizing its byte index on any multi-byte UTF-8 character
+        // and panicking with "byte index N is not a char boundary" on the
+        // next slice. Text with non-ASCII content both before and after a
+        // `var()` reference exercises exactly that path.
+        let mut custom_props = HashMap::new();
+        custom_props.insert("--x".to_string(), "blue".to_string());
+        let result = substitute_var("日本語 var(--x) \u{0BEF} 中文", &custom_props);
+        assert_eq!(result.as_deref(), Some("日本語 blue \u{0BEF} 中文"));
     }
 }

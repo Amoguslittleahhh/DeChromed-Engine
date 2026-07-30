@@ -127,9 +127,23 @@ pub fn parse_selector_list(input: &str) -> Result<SelectorList, SelectorParseErr
     p.parse_selector_list()
 }
 
+/// How many levels deep `:not()`/`:is()`/`:where()`/`:has()`/`:nth-child(of
+/// S)` may nest before [`SelectorParser::parse_selector_list`]/
+/// [`SelectorParser::parse_relative_selector_list`] refuse to recurse
+/// further. Found necessary by stress-testing with `:not(:not(:not(...)))`
+/// nested tens of thousands deep, which overflowed the Rust call stack and
+/// aborted the whole process -- unlike CSS's own permissive-parser
+/// fallback (see `parser.rs`'s nesting guard), a selector is either
+/// well-formed or a parse error, so simply erroring out past this depth is
+/// both correct and simple. 128 is far beyond any real selector (even
+/// generated/minified CSS rarely nests logical pseudo-classes more than a
+/// handful of levels).
+const MAX_SELECTOR_NESTING_DEPTH: usize = 128;
+
 struct SelectorParser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 impl SelectorParser {
@@ -151,7 +165,11 @@ impl SelectorParser {
         while tokens.len() > 1 && matches!(tokens.first(), Some(Token::Whitespace)) {
             tokens.remove(0);
         }
-        SelectorParser { tokens, pos: 0 }
+        SelectorParser {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -176,7 +194,16 @@ impl SelectorParser {
         SelectorParseError(format!("{msg} at token {:?}", self.peek()))
     }
 
+    /// Depth isn't decremented on the error paths here (`?` aborts the
+    /// whole parse immediately) -- harmless, since hitting
+    /// [`MAX_SELECTOR_NESTING_DEPTH`] only ever happens once per
+    /// `SelectorParser`, which is a fresh instance per top-level
+    /// [`parse_selector_list`] call and gets dropped either way.
     fn parse_selector_list(&mut self) -> Result<SelectorList, SelectorParseError> {
+        if self.depth >= MAX_SELECTOR_NESTING_DEPTH {
+            return Err(self.err("selector nesting too deep"));
+        }
+        self.depth += 1;
         let mut list = vec![self.parse_complex_selector()?];
         loop {
             self.skip_whitespace();
@@ -188,6 +215,7 @@ impl SelectorParser {
                 break;
             }
         }
+        self.depth -= 1;
         Ok(SelectorList(list))
     }
 
@@ -473,6 +501,10 @@ impl SelectorParser {
     /// is allowed to be empty (matching "any descendant"), then matching
     /// treats `first` specially when it's the wildcard placeholder.
     fn parse_relative_selector_list(&mut self) -> Result<SelectorList, SelectorParseError> {
+        if self.depth >= MAX_SELECTOR_NESTING_DEPTH {
+            return Err(self.err("selector nesting too deep"));
+        }
+        self.depth += 1;
         self.skip_whitespace();
         let mut list = Vec::new();
         loop {
@@ -514,6 +546,7 @@ impl SelectorParser {
                 break;
             }
         }
+        self.depth -= 1;
         Ok(SelectorList(list))
     }
 
@@ -557,7 +590,12 @@ impl SelectorParser {
                 self.skip_whitespace();
                 if let Token::Number { value, .. } = self.peek().clone() {
                     self.advance();
-                    b = -(value as i32);
+                    // `.saturating_neg()`, not bare `-`: `value as i32`
+                    // saturates to `i32::MIN` for large-magnitude negative
+                    // input, and negating `i32::MIN` directly overflows i32
+                    // (its magnitude has no positive i32 representation) --
+                    // found by fuzzing with `:nth-child(3n- -999...999)`.
+                    b = (value as i32).saturating_neg();
                     self.skip_whitespace();
                     return Ok(AnB { a, b });
                 }
@@ -610,7 +648,8 @@ impl SelectorParser {
                     self.advance();
                     self.skip_whitespace();
                     if let Token::Number { value, .. } = self.advance() {
-                        b = -(value as i32);
+                        // See the matching `saturating_neg()` note above.
+                        b = (value as i32).saturating_neg();
                     } else {
                         return Err(self.err("expected integer after '-' in An+B"));
                     }
@@ -1109,6 +1148,21 @@ mod tests {
             li2,
             &parse_selector_list("li:nth-child(2n)").unwrap()
         ));
+    }
+
+    #[test]
+    fn anb_extreme_negative_b_does_not_panic() {
+        // Found by fuzzing: a large-magnitude negative B value in either
+        // `An-B` (e.g. "3n- -999...") or `An - B` (with a negative B after
+        // the `-`) casts to `i32::MIN`, and negating `i32::MIN` directly
+        // overflows i32 -- see `parse_anb`'s `saturating_neg()` fix.
+        for selector in [
+            ":nth-child(3n- -999999999999999999999)",
+            ":nth-child(3n - -999999999999999999999)",
+            ":nth-child(n - -999999999999999999999)",
+        ] {
+            parse_selector_list(selector).expect("should parse without panicking");
+        }
     }
 
     #[test]

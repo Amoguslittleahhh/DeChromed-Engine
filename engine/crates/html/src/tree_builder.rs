@@ -190,6 +190,36 @@ impl Afe {
     }
 }
 
+/// A defensive cap on how deeply elements may nest (the stack of open
+/// elements' length), matching a real, well-precedented browser-engine
+/// safeguard (both Blink and Gecko impose a similar limit) rather than
+/// being something unique to this implementation. Two independent
+/// problems, both found by stress-testing pathologically deep input
+/// (`"<div>".repeat(N)`), motivate it:
+/// - Several scope-checking algorithms (`has_element_in_scope` and
+///   friends) scan from the top of `open_elements` down to the nearest
+///   boundary tag; on markup that's deeply nested *without* ever hitting
+///   one (plain nested `<div>`s, with no enclosing `<table>`/`<template>`/
+///   etc.), each scan walks the *entire* stack, and since one such scan
+///   runs per nested start tag, total work is quadratic in nesting depth --
+///   20,000 nested `<div>`s alone took over 10 seconds.
+/// - Every recursive tree-walking consumer downstream of tree construction
+///   (`dom::Document::walk`, `Display` serialization, A6's cascade, A10's
+///   XML serializer, ...) recurses once per tree level, so an unbounded
+///   depth here is also a transitive Rust-call-stack-overflow risk in code
+///   that never itself chose to recurse unboundedly.
+///
+/// Once the cap is hit, further start tags still get a real DOM node (see
+/// `insert_html_element`/`insert_foreign_element`) but it isn't pushed
+/// onto `open_elements` -- content past this point stops nesting deeper
+/// and instead becomes a flat run of siblings under the deepest element
+/// that was allowed to open, and a later end tag for one of these
+/// never-opened elements is simply ignored (the same outcome as any other
+/// end tag with no matching open element). 512 is far beyond any
+/// legitimate document's nesting (even deeply-templated real pages rarely
+/// exceed a few dozen levels).
+const MAX_OPEN_ELEMENTS_DEPTH: usize = 512;
+
 pub struct TreeBuilder {
     doc: Document,
     open_elements: Vec<NodeId>,
@@ -313,7 +343,9 @@ impl TreeBuilder {
     fn insert_html_element(&mut self, name: &str, attrs: Vec<(String, String)>) -> NodeId {
         let location = self.appropriate_insertion_location(None);
         let id = self.insert_element_at(dom::HTML_NS, name, attrs, location);
-        self.open_elements.push(id);
+        if self.open_elements.len() < MAX_OPEN_ELEMENTS_DEPTH {
+            self.open_elements.push(id);
+        }
         id
     }
 
@@ -328,7 +360,9 @@ impl TreeBuilder {
     ) -> NodeId {
         let location = self.appropriate_insertion_location(None);
         let id = self.insert_element_at(namespace, name, attrs, location);
-        self.open_elements.push(id);
+        if self.open_elements.len() < MAX_OPEN_ELEMENTS_DEPTH {
+            self.open_elements.push(id);
+        }
         id
     }
 
@@ -615,6 +649,22 @@ impl TreeBuilder {
                 (parent, None) => self.doc.append_existing(parent, last_node),
             }
 
+            // `fpos` was captured before the inner loop above, but that
+            // loop can remove *other* entries from `self.afe` (the
+            // `inner > 3` cleanup) at positions before `fpos`, shifting
+            // every later index down -- unlike `bookmark`, which the loop
+            // already keeps in sync on each such removal, `fpos` was never
+            // adjusted, so re-using it here could read the wrong entry or
+            // index out of bounds entirely (found by stress-testing with
+            // randomly misnested `<a>`/`<b>`/`<div>` soup). `formatting_node`
+            // is never itself removed by the inner loop (it breaks as soon
+            // as it reaches that node, before any removal), so a fresh
+            // lookup by identity is always safe here.
+            let fpos = self
+                .afe
+                .iter()
+                .position(|e| e.node_id() == Some(formatting_node))
+                .expect("formatting element's own AFE entry is never removed by the inner loop");
             let (fname, fattrs) = match &self.afe[fpos] {
                 Afe::Element(_, n, a) => (n.clone(), a.clone()),
                 Afe::Marker => unreachable!(),
@@ -2557,6 +2607,22 @@ mod tests {
         // (the reparented clone inside the div), which is the hallmark of
         // adoption agency actually having run rather than being a no-op.
         assert_eq!(out.matches("<b>").count(), 2);
+    }
+
+    #[test]
+    fn adoption_agency_stale_afe_index_does_not_panic() {
+        // Found by stress-testing with randomly-misnested formatting/block
+        // elements: `adoption_agency`'s inner reparenting loop can remove
+        // *other* active-formatting-element entries at positions before
+        // the subject's own captured index, leaving that captured index
+        // stale (pointing at the wrong entry, or out of bounds) by the
+        // time it's reused afterward -- this exact input panicked with
+        // "index out of bounds" before the fix that re-looks-up the
+        // subject's position fresh instead of reusing the stale one.
+        let input = "<span><b><span></span><p><div></span><div><i><span><span><p><span></span>\
+                      <div></div><div></div><span><div></b><div></div><p></i></span></p></p>\
+                      </div><a><a></div></div></a><b></span>";
+        let _ = dump(input); // must not panic
     }
 
     fn find_by_local_name(doc: &Document, name: &str) -> NodeId {

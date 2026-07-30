@@ -16,11 +16,17 @@ path = "src/main.rs"
 name = "tree_construction_harness"
 path = "src/bin/tree_construction_harness.rs"
 
+[[bin]]
+name = "stress_test"
+path = "src/bin/stress_test.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
 dom = { path = "../dom" }
 html = { path = "../html" }
+css = { path = "../css" }
+xml = { path = "../xml" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

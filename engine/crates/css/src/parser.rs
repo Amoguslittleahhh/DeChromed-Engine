@@ -12,8 +12,28 @@
 //! input (that's the spec's whole point), and this parser does recover
 //! rather than fail outright, just not always identically to the letter of
 //! every edge case.
+//!
+//! **Nesting depth guard:** `consume_component_value`/`consume_simple_block`/
+//! `consume_function_args` are mutually recursive by block/function nesting
+//! depth, matching the spec's own recursive grammar -- but that means
+//! pathologically deep input (`a{color:` + a million `(` + a million `)` +
+//! `}`, found by stress-testing this crate) recurses the Rust call stack
+//! deep enough to overflow it and abort the whole process, an unrecoverable
+//! crash no `catch_unwind` can stop. [`MAX_NESTING_DEPTH`] caps recursion:
+//! past it, a block's contents are consumed as a flat, unstructured token
+//! run (see [`Parser::skip_balanced_flat`]) instead of recursing further.
+//! Real content never nests anywhere close to this deep, so this only
+//! changes behavior on the kind of adversarial input a real browser's own
+//! (typically similar-order-of-magnitude) internal limits also exist to
+//! defend against.
 
 use crate::tokenizer::{Token, Tokenizer};
+
+/// See the module docs' "Nesting depth guard" note. 256 is generously
+/// above anything real (even heavily-nested preprocessor output rarely
+/// exceeds a few dozen levels) while staying comfortably within a debug
+/// build's default stack size.
+const MAX_NESTING_DEPTH: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComponentValue {
@@ -57,6 +77,7 @@ pub enum Rule {
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
@@ -71,7 +92,11 @@ impl Parser {
                 break;
             }
         }
-        Parser { tokens, pos: 0 }
+        Parser {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -196,6 +221,10 @@ impl Parser {
             BlockKind::Square => Token::RightSquare,
             BlockKind::Paren => Token::RightParen,
         };
+        if self.depth >= MAX_NESTING_DEPTH {
+            return self.skip_balanced_flat(&closing);
+        }
+        self.depth += 1;
         let mut contents = Vec::new();
         loop {
             match self.peek() {
@@ -207,10 +236,15 @@ impl Parser {
                 _ => contents.push(self.consume_component_value()),
             }
         }
+        self.depth -= 1;
         contents
     }
 
     fn consume_function_args(&mut self) -> Vec<ComponentValue> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return self.skip_balanced_flat(&Token::RightParen);
+        }
+        self.depth += 1;
         let mut contents = Vec::new();
         loop {
             match self.peek() {
@@ -220,6 +254,51 @@ impl Parser {
                 }
                 Token::Eof => break,
                 _ => contents.push(self.consume_component_value()),
+            }
+        }
+        self.depth -= 1;
+        contents
+    }
+
+    /// Non-recursive fallback once [`MAX_NESTING_DEPTH`] is hit: consumes
+    /// tokens as flat, unstructured `ComponentValue::Token`s (no nested
+    /// `Block`/`Function` values) until `closing` is seen with no
+    /// still-open bracket/function between it and here, or EOF. `nested`
+    /// counts *any* opening token seen (regardless of kind) against *any*
+    /// closing token, rather than exactly pairing bracket kinds -- exact
+    /// pairing would itself need unbounded state to replicate what
+    /// recursion normally tracks on the call stack. That's a fidelity
+    /// trade only observable on already-pathological, deliberately-
+    /// adversarial input (this path is otherwise unreachable): it never
+    /// panics or infinite-loops, which is the actual property this guard
+    /// exists for.
+    fn skip_balanced_flat(&mut self, closing: &Token) -> Vec<ComponentValue> {
+        let mut contents = Vec::new();
+        let mut nested = 0u32;
+        loop {
+            match self.peek().clone() {
+                Token::Eof => break,
+                t if nested == 0 && t == *closing => {
+                    self.advance();
+                    break;
+                }
+                t @ (Token::LeftCurly
+                | Token::LeftSquare
+                | Token::LeftParen
+                | Token::Function(_)) => {
+                    nested += 1;
+                    self.advance();
+                    contents.push(ComponentValue::Token(t));
+                }
+                t @ (Token::RightCurly | Token::RightSquare | Token::RightParen) => {
+                    nested = nested.saturating_sub(1);
+                    self.advance();
+                    contents.push(ComponentValue::Token(t));
+                }
+                other => {
+                    self.advance();
+                    contents.push(ComponentValue::Token(other));
+                }
             }
         }
         contents

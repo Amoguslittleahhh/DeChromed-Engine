@@ -40,10 +40,12 @@ dependencies = [
 name = "html5lib_harness"
 version = "0.0.0"
 dependencies = [
+ "css",
  "dom",
  "html",
  "serde",
  "serde_json",
+ "xml",
 ]
 
 [[package]]

@@ -73,7 +73,20 @@ struct Parser {
     pos: usize,
     doc: Document,
     ns_stack: Vec<NsScope>,
+    depth: usize,
 }
+
+/// `parse_element` recurses once per nesting level, matching the grammar's
+/// own recursive `element := ... content ...` production -- but stress-
+/// testing with a few hundred thousand levels of `<a><a><a>...` overflowed
+/// the Rust call stack and aborted the process before this guard existed.
+/// Returning a well-formedness error past this depth is the correct XML
+/// behavior anyway (this parser is meant to fail fast, not recover -- see
+/// module docs), so the fix is just enforcing it explicitly rather than
+/// letting the stack do it uncontrolled. 512 is far beyond any real
+/// document's nesting (even deeply-nested generated XML like SOAP
+/// envelopes or nested `<div>`-equivalents rarely exceeds a few dozen).
+const MAX_ELEMENT_NESTING_DEPTH: usize = 512;
 
 const PREDEFINED_ENTITIES: &[(&str, char)] = &[
     ("amp", '&'),
@@ -96,6 +109,7 @@ impl Parser {
                     "http://www.w3.org/XML/1998/namespace".to_string(),
                 )],
             }],
+            depth: 0,
         }
     }
 
@@ -322,6 +336,10 @@ impl Parser {
     /// element := EmptyElemTag | STag content ETag. `parent` is where the
     /// new element (and, recursively, everything under it) gets attached.
     fn parse_element(&mut self, parent: NodeId) -> Result<(), XmlError> {
+        if self.depth >= MAX_ELEMENT_NESTING_DEPTH {
+            return Err(self.err("element nesting too deep"));
+        }
+        self.depth += 1;
         self.consume_str("<")?;
         let qname = self.parse_name()?;
         let mut attrs: Vec<(String, String)> = Vec::new();
@@ -370,6 +388,7 @@ impl Parser {
         if self.starts_with("/>") {
             self.pos += 2;
             self.ns_stack.pop();
+            self.depth -= 1;
             return Ok(());
         }
         self.consume_str(">")?;
@@ -419,6 +438,7 @@ impl Parser {
         self.skip_whitespace();
         self.consume_str(">")?;
         self.ns_stack.pop();
+        self.depth -= 1;
         Ok(())
     }
 

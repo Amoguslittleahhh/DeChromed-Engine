@@ -63,6 +63,9 @@ cargo run --release -p html5lib_harness
 
 # Run the html5lib-tests tree-construction conformance harness
 cargo run --release -p html5lib_harness --bin tree_construction_harness
+
+# Run the cross-crate crash/hang stress-test fuzzer (see below)
+cargo run --release -p html5lib_harness --bin stress_test
 ```
 
 ## The html5lib-tests harnesses
@@ -128,6 +131,42 @@ unit tests instead, covering the well-formedness fatal-error cases XML's
 parsing model requires (mismatched tags, duplicate attributes, undeclared
 entities, multiple root elements) alongside the ordinary parsing/namespace-
 resolution/round-trip-serialization cases.
+
+## The stress-test fuzzer
+
+`crates/html5lib_harness/src/bin/stress_test.rs` is a cross-crate,
+conformance-blind fuzzer for Track A (A1-A10): it doesn't check parser
+*output* against an expected answer (that's the tokenizer/tree-construction
+harnesses above), only that `html::parse_document`, `css::parse_stylesheet`,
+`css::selectors::parse_selector_list`, `xml::parse_document`, and the
+cascade/computed-style pipeline all return *something* (or a graceful
+`Err`) instead of panicking, hanging, or aborting the process, across:
+
+- **Truncation fuzzing**: every prefix length of a handful of realistic
+  seed documents -- a surprisingly effective way to hit boundary
+  conditions (a tag cut off mid-attribute, a string cut off before its
+  closing quote, ...).
+- **Mutation fuzzing**: random insert/delete/replace edits applied
+  repeatedly to those same seeds.
+- **Random-byte-soup fuzzing**: fully random strings from an alphabet
+  biased toward each format's own syntactically load-bearing characters.
+- **A targeted adoption-agency generator**: randomly-misnested
+  `<a>`/`<b>`/`<div>`-style soup, the specific shape that exercises A3's
+  adoption agency algorithm (uniform random bytes rarely produce enough
+  of this shape by chance).
+- **End-to-end cascade fuzzing**: a mutated HTML seed parsed into a real
+  DOM, a mutated CSS seed parsed into a real stylesheet, then the full
+  cascade + computed-style pass run over every element.
+
+A deterministic seeded PRNG (splitmix64, no external `rand` dependency)
+makes every run reproducible from `STRESS_SEED` (default a fixed constant);
+`STRESS_ITERATIONS` controls how many mutation/random-fuzz iterations run
+per category (default 20,000). This tool found and helped fix 6 real bugs
+during Track A's post-completion hardening pass -- see `ROADMAP.md`'s
+"Track A hardening pass" section for what they were -- and now runs clean
+(0 distinct failures) across many seeds; run it yourself after any change
+to a Track A parser, especially anything touching recursion or index
+arithmetic.
 
 ## Why placeholders instead of nothing
 
