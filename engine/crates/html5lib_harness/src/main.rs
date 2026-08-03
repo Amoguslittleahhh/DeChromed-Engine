@@ -217,12 +217,12 @@ fn unescape_double_escaped(s: &str) -> String {
     while i < chars.len() {
         if chars[i] == '\\' && chars.get(i + 1) == Some(&'u') && i + 6 <= chars.len() {
             let hex: String = chars[i + 2..i + 6].iter().collect();
-            if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                if let Some(c) = char::from_u32(code) {
-                    out.push(c);
-                    i += 6;
-                    continue;
-                }
+            if let Ok(code) = u32::from_str_radix(&hex, 16)
+                && let Some(c) = char::from_u32(code)
+            {
+                out.push(c);
+                i += 6;
+                continue;
             }
         }
         out.push(chars[i]);

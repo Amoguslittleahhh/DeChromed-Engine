@@ -208,10 +208,10 @@ pub fn run() {
     for entry in &entries {
         let path = entry.path();
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
-        if let Some(only) = &only_file {
-            if &file_name != only {
-                continue;
-            }
+        if let Some(only) = &only_file
+            && &file_name != only
+        {
+            continue;
         }
         // A8/A9 (foreign content) closed most of the original SVG/MathML-
         // related gaps here -- svg.dat/math.dat/namespace-sensitivity.dat
@@ -220,13 +220,17 @@ pub fn run() {
         // counter below; namespace-sensitivity.dat now fully passes).
         // What's left is genuinely out of A8/A9's scope: fragment parsing
         // (foreign-fragment.dat), `<template>` content documents
-        // (template.dat), and the PI-node serialization convention
-        // (processing-instructions.dat) -- all pre-existing A3 gaps.
+        // (template.dat), the PI-node serialization convention
+        // (processing-instructions.dat), and the `scripted_*.dat` files
+        // (added upstream after this corpus was first vendored) -- those
+        // embed a `<script>` that mutates the DOM via `document.write`/
+        // `setAttribute` during parsing (`#script-on`), which needs an
+        // actual JS engine (Track C) to produce the expected tree at all.
         if skip_known_gaps
-            && matches!(
+            && (matches!(
                 file_name.as_str(),
                 "foreign-fragment.dat" | "template.dat" | "processing-instructions.dat"
-            )
+            ) || file_name.starts_with("scripted_"))
         {
             continue;
         }

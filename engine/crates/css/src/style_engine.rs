@@ -338,12 +338,11 @@ mod tests {
     fn find_by_id(doc: &Document, id_value: &str) -> NodeId {
         let mut found = None;
         doc.walk(doc.root(), &mut |id, _| {
-            if found.is_none() {
-                if let NodeData::Element(e) = doc.data(id) {
-                    if e.attr("id") == Some(id_value) {
-                        found = Some(id);
-                    }
-                }
+            if found.is_none()
+                && let NodeData::Element(e) = doc.data(id)
+                && e.attr("id") == Some(id_value)
+            {
+                found = Some(id);
             }
         });
         found.expect("id not found")

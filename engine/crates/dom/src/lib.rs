@@ -160,11 +160,11 @@ impl Document {
     /// character" algorithm, and how html5lib-tests' expected tree dumps
     /// coalesce runs of consecutive characters into one `"..."` string).
     pub fn append_char(&mut self, parent: NodeId, c: char) {
-        if let Some(&last) = self.nodes[parent.0 as usize].children.last() {
-            if let NodeData::Text(s) = &mut self.nodes[last.0 as usize].data {
-                s.push(c);
-                return;
-            }
+        if let Some(&last) = self.nodes[parent.0 as usize].children.last()
+            && let NodeData::Text(s) = &mut self.nodes[last.0 as usize].data
+        {
+            s.push(c);
+            return;
         }
         self.append(parent, NodeData::Text(c.to_string()));
     }
@@ -191,20 +191,17 @@ impl Document {
     pub fn insert_char_before(&mut self, parent: NodeId, before: Option<NodeId>, c: char) {
         let children = &self.nodes[parent.0 as usize].children;
         let prev = match before {
-            Some(b) => children.iter().position(|&c| c == b).and_then(|i| {
-                if i == 0 {
-                    None
-                } else {
-                    Some(children[i - 1])
-                }
-            }),
+            Some(b) => children
+                .iter()
+                .position(|&c| c == b)
+                .and_then(|i| if i == 0 { None } else { Some(children[i - 1]) }),
             None => children.last().copied(),
         };
-        if let Some(prev) = prev {
-            if let NodeData::Text(s) = &mut self.nodes[prev.0 as usize].data {
-                s.push(c);
-                return;
-            }
+        if let Some(prev) = prev
+            && let NodeData::Text(s) = &mut self.nodes[prev.0 as usize].data
+        {
+            s.push(c);
+            return;
         }
         self.insert_before(parent, before, NodeData::Text(c.to_string()));
     }

@@ -6,13 +6,19 @@ real WHATWG HTML tokenizer (99.9% on html5lib-tests), the real
 tree-construction insertion-mode state machine + adoption agency algorithm
 + SVG/MathML foreign content (77.5% overall / 86.9% excluding documented
 gaps on html5lib-tests tree-construction), a real CSS Syntax Level 3
-tokenizer/parser, a real Selectors Level 4 engine, a real cascade +
-computed-value pipeline, a real mutable CSSOM with `getComputedStyle` and
+tokenizer/parser (also implementing the [CSS Nesting Module](https://www.w3.org/TR/css-nesting-1/)),
+a real Selectors Level 4 engine (plus `:lang()`/`:dir()`), a real cascade +
+computed-value pipeline (with real [Cascade Layers](https://www.w3.org/TR/css-cascade-5/#layering)
+support), a real mutable CSSOM with `getComputedStyle` and
 invalidation-set-driven incremental restyling, and a real standalone XML
 1.0 parser (`crates/xml`) with namespace resolution (XSLT explicitly
 dropped, per `ROADMAP.md`'s own long-standing note on it). B1 (box tree
 generation, Track B's start) is the open next step -- see `ROADMAP.md`'s
 "What to actually do next".
+
+The workspace targets Rust **edition 2024** (`engine/Cargo.toml`), using
+stable let-chains (`if let X = y && let A = b { ... }`) where they read
+better than nested `if let`s.
 
 ## Layout
 
@@ -83,7 +89,13 @@ and `crates/html5lib_harness/vendor/tree-construction/` (fetched from
 [html5lib/html5lib-tests](https://github.com/html5lib/html5lib-tests) and
 the [WPT mirror](https://github.com/web-platform-tests/wpt) it moved to,
 respectively) so CI and local runs work offline and reproducibly, rather
-than depending on GitHub being reachable at test time.
+than depending on GitHub being reachable at test time. The vendored
+corpora were refreshed from upstream after A1-A10 landed; the only new
+files that matter for scoping are `scripted_*.dat` tree-construction
+files, which need live JS execution (`document.write`/`setAttribute`)
+during parsing to produce their expected trees -- out of scope without
+Track C, so `HARNESS_SKIP_KNOWN_GAPS=1` skips them alongside the
+pre-existing known-gap files.
 
 **Tokenizer: 99.9% (6708/6713) passing**, against A2's >=95% exit
 criterion. The 5 remaining failures are a documented gap (ScriptData's
@@ -111,8 +123,8 @@ env vars:
 - `HARNESS_DEBUG=1` -- print per-file and per-test-case progress to stderr
 - `HARNESS_MAX_FAILURES=N` -- stop after N failures (default: no limit)
 - `HARNESS_SKIP_KNOWN_GAPS=1` -- skip the known-gap `.dat` files
-  (`foreign-fragment.dat`, `template.dat`, `processing-instructions.dat`)
-  for a cleaner in-scope signal
+  (`foreign-fragment.dat`, `template.dat`, `processing-instructions.dat`,
+  and any `scripted_*.dat` file) for a cleaner in-scope signal
 - `HARNESS_ONLY_FILE=name.dat` -- run just one vendored file
 - `HARNESS_PER_FILE=1` -- print a pass/fail breakdown per file
 

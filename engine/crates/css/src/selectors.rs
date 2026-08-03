@@ -9,8 +9,13 @@
 //! `~`), structural pseudo-classes (`:first-child`, `:last-child`,
 //! `:only-child`, the `-of-type` family, `:nth-child`/`:nth-last-child`
 //! with full `An+B` parsing and the `of <selector>` extension, `:root`,
-//! `:empty`), and the logical pseudo-classes `:not()`, `:is()`, `:where()`,
-//! `:has()` (with nested selector lists, matched via real tree traversal).
+//! `:empty`), the logical pseudo-classes `:not()`, `:is()`, `:where()`,
+//! `:has()` (with nested selector lists, matched via real tree traversal),
+//! and the document/language-state pseudo-classes `:lang()` (BCP47
+//! extended-filtering-style range match against the nearest `lang`
+//! attribute, own or inherited) and `:dir()` (HTML's directionality
+//! algorithm, with a simplified first-strong-character heuristic for
+//! `dir=auto`/`<bdi>` -- see `directionality`'s doc comment).
 //!
 //! Not implemented: pseudo-*elements* (`::before`/`::after`/etc: parsed
 //! without erroring, but never match anything, since they don't correspond
@@ -19,7 +24,9 @@
 //! there's no interaction or form state modeled yet for these to reflect,
 //! so they parse successfully but always evaluate to "not matched" rather
 //! than erroring, which is the same "known gap, not silently wrong" spirit
-//! as A2/A3's documented gaps.
+//! as A2/A3's documented gaps. `:lang()` also doesn't consult
+//! out-of-band/protocol-level language (e.g. `Content-Language` headers or
+//! `<meta http-equiv>`), since it only sees the element tree.
 
 use crate::tokenizer::{Token, Tokenizer};
 use dom::{Document, NodeData, NodeId};
@@ -113,10 +120,23 @@ pub enum PseudoClass {
     Is(SelectorList),
     Where(SelectorList),
     Has(SelectorList),
+    /// `:lang(range, range, ...)` -- each `range` is matched per
+    /// <https://www.w3.org/TR/selectors-4/#lang-pseudo> (BCP47
+    /// extended-filtering-style prefix match, case-insensitive, `*`
+    /// wildcard component allowed); any range in the list matching wins.
+    Lang(Vec<String>),
+    /// `:dir(ltr)` / `:dir(rtl)`.
+    Dir(Directionality),
     /// Any other pseudo-class name (`:hover`, `:checked`, ...): parses
     /// successfully, but see module docs -- it never matches, since no
     /// interaction/form state is modeled to check it against.
     Unsupported(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Directionality {
+    Ltr,
+    Rtl,
 }
 
 #[derive(Debug)]
@@ -466,6 +486,46 @@ impl SelectorParser {
             }
             "nth-of-type" => Ok(PseudoClass::NthOfType(self.parse_anb()?)),
             "nth-last-of-type" => Ok(PseudoClass::NthLastOfType(self.parse_anb()?)),
+            "lang" => {
+                let mut ranges = Vec::new();
+                loop {
+                    self.skip_whitespace();
+                    let range = match self.advance() {
+                        Token::Ident(s) => s,
+                        Token::Str(s) => s,
+                        other => {
+                            return Err(
+                                self.err(&format!("expected language range, got {other:?}"))
+                            );
+                        }
+                    };
+                    ranges.push(range);
+                    self.skip_whitespace();
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.skip_whitespace();
+                if !matches!(self.peek(), Token::RightParen) {
+                    return Err(self.err("expected ')' to close :lang()"));
+                }
+                Ok(PseudoClass::Lang(ranges))
+            }
+            "dir" => {
+                self.skip_whitespace();
+                let dir = match self.advance() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("ltr") => Directionality::Ltr,
+                    Token::Ident(s) if s.eq_ignore_ascii_case("rtl") => Directionality::Rtl,
+                    other => return Err(self.err(&format!("expected ltr/rtl, got {other:?}"))),
+                };
+                self.skip_whitespace();
+                if !matches!(self.peek(), Token::RightParen) {
+                    return Err(self.err("expected ')' to close :dir()"));
+                }
+                Ok(PseudoClass::Dir(dir))
+            }
             _ => {
                 // Unsupported functional pseudo-class (:lang(), :dir(),
                 // ...): consume up to the matching ')' so the rest of the
@@ -618,12 +678,12 @@ impl SelectorParser {
             }
             Token::Delim('-') => {
                 self.advance();
-                if let Token::Ident(s) = self.peek().clone() {
-                    if s.eq_ignore_ascii_case("n") {
-                        a = -1;
-                        seen_n = true;
-                        self.advance();
-                    }
+                if let Token::Ident(s) = self.peek().clone()
+                    && s.eq_ignore_ascii_case("n")
+                {
+                    a = -1;
+                    seen_n = true;
+                    self.advance();
                 }
             }
             _ => return Err(self.err("expected An+B expression")),
@@ -922,8 +982,123 @@ fn matches_pseudo_class(doc: &Document, id: NodeId, pc: &PseudoClass) -> bool {
         PseudoClass::Not(list) => !matches(doc, id, list),
         PseudoClass::Is(list) | PseudoClass::Where(list) => matches(doc, id, list),
         PseudoClass::Has(list) => list.0.iter().any(|cs| has_matches_from(doc, id, cs)),
+        PseudoClass::Lang(ranges) => element_language(doc, id)
+            .is_some_and(|lang| ranges.iter().any(|range| lang_range_matches(range, &lang))),
+        PseudoClass::Dir(dir) => directionality(doc, id) == *dir,
         PseudoClass::Unsupported(_) => false,
     }
+}
+
+/// Walks `id` and its ancestors looking for the nearest `lang` attribute
+/// (own or inherited). Doesn't consult `<meta http-equiv=content-language>`
+/// or any out-of-band protocol-level language (e.g. an HTTP header) --
+/// those need document-level state this matcher, which only sees the
+/// element tree, doesn't have access to; a documented simplification, same
+/// spirit as the rest of this module's "known gap, not silently wrong"
+/// pseudo-classes.
+fn element_language(doc: &Document, id: NodeId) -> Option<String> {
+    let mut cur = Some(id);
+    while let Some(node) = cur {
+        if let NodeData::Element(el) = doc.data(node)
+            && let Some(lang) = el.attr("lang")
+            && !lang.is_empty()
+        {
+            return Some(lang.to_string());
+        }
+        cur = doc.parent(node);
+    }
+    None
+}
+
+/// <https://www.w3.org/TR/selectors-4/#lang-pseudo> -- BCP47
+/// extended-filtering-style match: `range` matches `lang` if, comparing
+/// hyphen-separated components case-insensitively, every component in
+/// `range` either equals the corresponding component in `lang` or is `*`,
+/// and `range` has no more components than `lang`.
+fn lang_range_matches(range: &str, lang: &str) -> bool {
+    if range == "*" {
+        return true;
+    }
+    let range_parts: Vec<&str> = range.split('-').collect();
+    let lang_parts: Vec<&str> = lang.split('-').collect();
+    if range_parts.len() > lang_parts.len() {
+        return false;
+    }
+    range_parts
+        .iter()
+        .zip(lang_parts.iter())
+        .all(|(r, l)| *r == "*" || r.eq_ignore_ascii_case(l))
+}
+
+/// HTML's directionality algorithm
+/// (<https://html.spec.whatwg.org/multipage/dom.html#the-directionality>),
+/// simplified: the first-strong-character heuristic for `dir=auto` (and for
+/// `<bdi>` with no `dir`) approximates UAX#9's bidi-class table with a
+/// handful of Unicode block ranges for common RTL scripts (Hebrew, Arabic
+/// and its Supplement/Extended-A) rather than a full BidiClass lookup --
+/// documented known-gap simplification, same spirit as the rest of this
+/// module.
+fn directionality(doc: &Document, id: NodeId) -> Directionality {
+    let el = match doc.data(id) {
+        NodeData::Element(el) => el,
+        _ => return Directionality::Ltr,
+    };
+    match el.attr("dir").map(str::to_ascii_lowercase).as_deref() {
+        Some("ltr") => return Directionality::Ltr,
+        Some("rtl") => return Directionality::Rtl,
+        Some("auto") => return first_strong_directionality(doc, id).unwrap_or(Directionality::Ltr),
+        _ => {
+            if el.local_name.eq_ignore_ascii_case("bdi") {
+                return first_strong_directionality(doc, id).unwrap_or(Directionality::Ltr);
+            }
+        }
+    }
+    match doc.parent(id) {
+        Some(parent) => directionality(doc, parent),
+        None => Directionality::Ltr,
+    }
+}
+
+/// First-strong-character heuristic: depth-first over descendant text
+/// nodes (skipping nested elements with their own `dir`, per spec), the
+/// first strongly-directional character found decides.
+fn first_strong_directionality(doc: &Document, id: NodeId) -> Option<Directionality> {
+    for &child in doc.children(id) {
+        match doc.data(child) {
+            NodeData::Text(text) => {
+                for ch in text.chars() {
+                    if is_rtl_char(ch) {
+                        return Some(Directionality::Rtl);
+                    }
+                    if is_ltr_char(ch) {
+                        return Some(Directionality::Ltr);
+                    }
+                }
+            }
+            NodeData::Element(el) if el.attr("dir").is_none() => {
+                if let Some(d) = first_strong_directionality(doc, child) {
+                    return Some(d);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_rtl_char(ch: char) -> bool {
+    matches!(ch as u32,
+        0x0591..=0x05F4   // Hebrew
+        | 0x0600..=0x06FF // Arabic
+        | 0x0750..=0x077F // Arabic Supplement
+        | 0x08A0..=0x08FF // Arabic Extended-A
+        | 0xFB1D..=0xFDFF // Hebrew/Arabic presentation forms
+        | 0xFE70..=0xFEFF
+    )
+}
+
+fn is_ltr_char(ch: char) -> bool {
+    ch.is_alphabetic() && !is_rtl_char(ch)
 }
 
 /// `:has()` support: `cs.first` is always the empty placeholder compound
@@ -1212,6 +1387,133 @@ mod tests {
             &doc,
             div,
             &parse_selector_list("div:has(> span)").unwrap()
+        ));
+    }
+
+    #[test]
+    fn lang_pseudo_class_matches_own_and_inherited_attribute() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html = el(&mut doc, root, "html", &[("lang", "en-US")]);
+        let p = el(&mut doc, html, "p", &[]);
+        let fr_span = el(&mut doc, html, "span", &[("lang", "fr")]);
+
+        // Inherited from ancestor.
+        assert!(matches(&doc, p, &parse_selector_list(":lang(en)").unwrap()));
+        assert!(matches(
+            &doc,
+            p,
+            &parse_selector_list(":lang(EN-us)").unwrap()
+        ));
+        assert!(!matches(
+            &doc,
+            p,
+            &parse_selector_list(":lang(fr)").unwrap()
+        ));
+
+        // Own attribute overrides inherited one.
+        assert!(matches(
+            &doc,
+            fr_span,
+            &parse_selector_list(":lang(fr)").unwrap()
+        ));
+        assert!(!matches(
+            &doc,
+            fr_span,
+            &parse_selector_list(":lang(en)").unwrap()
+        ));
+
+        // Comma-separated list: any range matching wins.
+        assert!(matches(
+            &doc,
+            fr_span,
+            &parse_selector_list(":lang(de, fr, es)").unwrap()
+        ));
+
+        // Range longer than the actual language doesn't match.
+        assert!(!matches(
+            &doc,
+            fr_span,
+            &parse_selector_list(":lang(fr-CA)").unwrap()
+        ));
+    }
+
+    #[test]
+    fn lang_pseudo_class_with_no_lang_anywhere_never_matches() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let div = el(&mut doc, root, "div", &[]);
+        assert!(!matches(
+            &doc,
+            div,
+            &parse_selector_list(":lang(en)").unwrap()
+        ));
+    }
+
+    #[test]
+    fn dir_pseudo_class_explicit_attribute() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let ltr_div = el(&mut doc, root, "div", &[("dir", "ltr")]);
+        let rtl_div = el(&mut doc, root, "div", &[("dir", "RTL")]);
+
+        assert!(matches(
+            &doc,
+            ltr_div,
+            &parse_selector_list(":dir(ltr)").unwrap()
+        ));
+        assert!(!matches(
+            &doc,
+            ltr_div,
+            &parse_selector_list(":dir(rtl)").unwrap()
+        ));
+        assert!(matches(
+            &doc,
+            rtl_div,
+            &parse_selector_list(":dir(rtl)").unwrap()
+        ));
+    }
+
+    #[test]
+    fn dir_pseudo_class_inherits_from_parent_and_defaults_ltr() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let rtl_div = el(&mut doc, root, "div", &[("dir", "rtl")]);
+        let span = el(&mut doc, rtl_div, "span", &[]);
+
+        assert!(matches(
+            &doc,
+            span,
+            &parse_selector_list(":dir(rtl)").unwrap()
+        ));
+
+        let ltr_root_div = el(&mut doc, root, "div", &[]);
+        assert!(matches(
+            &doc,
+            ltr_root_div,
+            &parse_selector_list(":dir(ltr)").unwrap()
+        ));
+    }
+
+    #[test]
+    fn dir_pseudo_class_auto_uses_first_strong_character_heuristic() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let auto_div = el(&mut doc, root, "div", &[("dir", "auto")]);
+        doc.append(auto_div, NodeData::Text("\u{05D0}rabic-ish".into()));
+
+        assert!(matches(
+            &doc,
+            auto_div,
+            &parse_selector_list(":dir(rtl)").unwrap()
+        ));
+
+        let auto_div2 = el(&mut doc, root, "div", &[("dir", "auto")]);
+        doc.append(auto_div2, NodeData::Text("hello".into()));
+        assert!(matches(
+            &doc,
+            auto_div2,
+            &parse_selector_list(":dir(ltr)").unwrap()
         ));
     }
 }

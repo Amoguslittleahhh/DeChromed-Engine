@@ -27,8 +27,8 @@
 //! and [`Tokenizer::set_state`] expose exactly that: pull one token at a
 //! time, and change state in between pulls.
 
-use crate::entities;
 use crate::Token;
+use crate::entities;
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

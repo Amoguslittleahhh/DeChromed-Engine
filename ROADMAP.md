@@ -147,21 +147,38 @@ with dimension/percentage suffixes, delimiters, CDO/CDC) and parser
 at-rules, simple blocks, declaration lists with `!important` handling).
 `engine/crates/css/src/lib.rs`'s `parse_stylesheet()` flattens qualified
 rules into a public `Stylesheet`, including ones nested inside conditional-
-group at-rules (`@media`/`@supports`/`@document`/`@layer` — condition not
+group at-rules (`@media`/`@supports`/`@document` — condition not
 evaluated, treated as always-true, a documented simplification not a
 correctness claim), and records other at-rules (`@import`, `@font-face`,
 etc.) as raw name/prelude/block text for later phases.
 
+Also implements the [CSS Nesting Module](https://www.w3.org/TR/css-nesting-1/):
+native `&`-relative nested style rules (`&` substitution via wrapping the
+parent selector in `:is()`, preserving both the match set and specificity-
+as-a-whole), implicit descendant nesting when no `&` is present, direct
+(no-space) combinator attachment (`> .b` under `.a` resolves to
+`.a> .b`), and nested at-rules mixing bare declarations (implicitly
+`& { ... }`) with further nested rules. `parse_style_block` (`parser.rs`)
+takes its `Vec<ComponentValue>` by value and moves (never clones) nested
+`Block` contents while walking — found necessary after an early by-
+reference version cloned each nested block's full remaining subtree once
+per recursion level, an O(N²) blowup on deeply-nested input (see the
+regression test `deeply_nested_at_rules_resolve_promptly_and_respect_the_
+depth_guard` in `lib.rs`).
+
 No vendored conformance corpus for this phase — WPT's `css/css-syntax`
 suite drives via `testharness.js`, which needs a JS engine (Track C, not
 built yet), consistent with the reasoning that led A1-A3 to use
-html5lib-tests instead of WPT directly. Verified instead with 13
-self-authored unit tests covering the spec algorithms and edge cases
-(string-newline reconsumption, malformed-rule recovery, `!important`
-detection, at-rule flattening).
+html5lib-tests instead of WPT directly. Verified instead with self-authored
+unit tests covering the spec algorithms and edge cases (string-newline
+reconsumption, malformed-rule recovery, `!important` detection, at-rule
+flattening, and 8 more for CSS Nesting's `&` substitution/implicit nesting/
+combinator attachment/nested at-rules), plus stress-test fuzzing (deeply
+nested `.a{.a{.a{...` inputs up to 1,000,000 levels complete in single-digit
+seconds without stack overflow, respecting the existing depth guard).
 **Exit:** met on the achievable bar given no JS engine — real tokenizer/
-parser implementing the full spec grammar, unit-tested; WPT `css/css-syntax`
-deferred until Track C exists.
+parser implementing the full spec grammar plus CSS Nesting, unit-tested;
+WPT `css/css-syntax`/`css/css-nesting` deferred until Track C exists.
 
 ### A5. Selectors — *done*
 Full [Selectors Level 4](https://www.w3.org/TR/selectors-4/) grammar in
@@ -174,16 +191,31 @@ plus the case-insensitivity flag), structural pseudo-classes (`:nth-child`/
 backward from the selector's rightmost (subject) compound against the
 queried DOM node, per how UA selector matching actually works.
 
+Also implements `:lang()` (BCP47 extended-filtering-style range match,
+case-insensitive, `*` wildcard components, comma-separated range lists,
+against the nearest `lang` attribute found walking up from the element)
+and `:dir()` (HTML's directionality algorithm: explicit `dir=ltr`/`rtl`,
+`dir=auto`/`<bdi>` via a first-strong-character heuristic, inheritance
+from the parent, defaulting to `ltr` at the root).
+
 Known gap: pseudo-elements (`::before` etc.) and interaction-state pseudo-
 classes (`:hover`, `:focus`, ...) aren't implemented — there's no layout/
 event state yet for either to attach to; both parse into a documented
 `PseudoClass::Unsupported` fallback rather than silently matching wrong.
-Same as A4, no vendored WPT `css/selectors` corpus is runnable without
-Track C; verified with 7 self-authored unit tests covering combinators,
-attribute matching, `An+B` parsing edge cases (including tokenizer
-artifacts like `Dimension{unit:"n-"}`), and `:has()`.
+`:lang()` doesn't consult out-of-band/protocol-level language (HTTP
+`Content-Language`, `<meta http-equiv>`), only the element tree; `:dir()`'s
+first-strong-character heuristic approximates UAX#9's BidiClass table with
+a handful of Unicode block ranges for common RTL scripts rather than a
+full bidi-class lookup. Same as A4, no vendored WPT `css/selectors` corpus
+is runnable without Track C; verified with self-authored unit tests
+covering combinators, attribute matching, `An+B` parsing edge cases
+(including tokenizer artifacts like `Dimension{unit:"n-"}`), `:has()`, and
+6 more for `:lang()`/`:dir()` (inheritance, own-attribute override,
+range-list matching, no-lang-anywhere, explicit dir, inherited dir,
+`dir=auto` heuristic).
 **Exit:** met on the achievable bar — real Selectors Level 4 grammar and
-matching, unit-tested; WPT `css/selectors` deferred until Track C exists.
+matching plus `:lang()`/`:dir()`, unit-tested; WPT `css/selectors` deferred
+until Track C exists.
 
 ### A6. Cascade & computed values — *done*
 The real cascade sort in `engine/crates/css/src/cascade.rs`: origin/
@@ -197,21 +229,46 @@ substitution (fallback values, cycle detection per
 <https://www.w3.org/TR/css-variables-1/#invalid-variables>), and the
 `initial`/`inherit`/`unset`/`revert` defaulting keywords.
 
+Also implements real [CSS Cascade Layers](https://www.w3.org/TR/css-cascade-5/#layering)
+(`@layer`): named/anonymous/nested layers, both the statement
+(`@layer a, b;`) and block forms, layer order tracked as first-declaration
+order in `Stylesheet::layer_order`, and correct cascade priority — layer
+priority overrides specificity entirely; unlayered beats every layer for
+normal-importance declarations but loses to every layer for `!important`
+(the one place `!important` inverts an ordering rather than just
+reprioritizing origins); later-declared layer wins among normal-importance
+layers, earlier-declared layer wins among `!important` layers. Nested
+`@layer` at-rules resolve through `parser::parse_style_block` against the
+already-parsed `ComponentValue` tree rather than re-serializing to text and
+re-parsing — an earlier version used a text-round-trip adapter that both
+cost O(remaining-length) extra work per nesting level (near-cubic blowup
+observed on deeply-nested input) and silently reset the parser's
+recursion-depth guard on every level (each fresh re-parse started a new
+`Parser` at `depth: 0`), defeating stack-overflow protection; fixed by
+processing the single top-level parse's tree directly, which respects the
+original depth-256 guard (verified: 200,000 requested nesting levels
+completes in under 0.5s, correctly capping at 258 layers).
+
 Known gaps, documented in the module's own doc comments: no used-value
 resolution (computed values stop short of resolving `em`/`%`/etc. against
 layout, which needs Track B to exist), a small hand-curated property table
 (~30 common longhands' inherited-ness/initial value, not the full CSS
 property registry), `revert` collapsed to `unset`'s behavior (a correct
-`revert` needs a full layered per-origin cascade re-run), and no
-animation/transition origins or `@layer` ordering. As with A4/A5, WPT's
-`css/css-cascade`/`css/css-variables` need a JS engine to run and are
-deferred to Track C; verified instead with 9 self-authored unit tests
-(specificity ordering, origin/importance precedence, inheritance vs.
+`revert` needs a full layered per-origin cascade re-run), no animation/
+transition origins, and `layer_order` isn't merged across multiple
+`StyleSource`s passed to one `cascade()` call (each source's own layer
+order is honored, but cross-source layer interleaving isn't modeled). As
+with A4/A5, WPT's `css/css-cascade`/`css/css-variables` need a JS engine to
+run and are deferred to Track C; verified instead with self-authored unit
+tests (specificity ordering, origin/importance precedence, inheritance vs.
 non-inheritance, `var()` substitution/fallback/cycles, defaulting
-keywords).
+keywords, plus 4 more for cascade layers: later-layer-wins, unlayered-
+beats-any-layer, `!important` layer-order inversion, and layer-statement
+order registration) and a perf/depth-guard regression test for deeply
+nested `@layer`.
 **Exit:** met on the achievable bar — real cascade and computed-value
-pipeline, unit-tested; WPT `css/cssom`/`css/css-cascade`/`css/css-variables`
-deferred until Track C exists.
+pipeline plus cascade layers, unit-tested; WPT `css/cssom`/`css/css-cascade`/
+`css/css-variables` deferred until Track C exists.
 
 ### A7. CSSOM & style invalidation — *done*
 `engine/crates/css/src/cssom.rs`: a mutable `CssomSheet`/`CssomRule`
@@ -389,6 +446,49 @@ fuzzed inputs as of this pass -- see the binary's own doc comment for what
 it covers (truncation fuzzing, mutation fuzzing, random-byte-soup fuzzing,
 a targeted adoption-agency generator, and end-to-end HTML+CSS→cascade
 fuzzing) and `engine/README.md` for how to run it.
+
+### Track A tech-currency pass: edition, dependencies, corpora, new web-platform features
+
+A follow-up pass bringing Track A's toolchain and CSS feature surface up to
+date, done in the same "implement -> stress-test with adversarial input ->
+fix real bugs -> permanent regression test" style as the hardening pass
+above:
+
+- **Rust edition 2021 -> 2024** (`engine/Cargo.toml`'s `[workspace.package]`;
+  every crate inherits it via `edition.workspace = true`). Enabled clippy's
+  newer `collapsible_if` lint, which prefers stable Rust's **let-chains**
+  syntax (`if let X = y && let A = b { ... }`) over nested `if let`s --
+  applied at ~12 call sites across `dom`, `html`, `css`, `xml`, and the
+  harness/shell binaries, all mechanical with no behavior change (verified
+  by the full test suite passing identically before/after).
+- **Vendored html5lib-tests corpus refresh**: re-fetched from upstream,
+  picking up a new tokenizer test file (`unicodeChars.test`) and three new
+  `#script-on` tree-construction files (`scripted_adoption01.dat`,
+  `scripted_ark.dat`, `scripted_webkit01.dat`). The `scripted_*.dat` files
+  need live JS execution during parsing (`document.write`/`setAttribute`
+  calls interleaved with tokenization) to produce their expected trees --
+  out of scope without Track C, same reasoning as the pre-existing
+  `foreign-fragment.dat`/`template.dat` gaps -- so the harness now skips
+  any `scripted_*.dat` file under `HARNESS_SKIP_KNOWN_GAPS=1`. Pass rates
+  unchanged from before the refresh: tokenizer 99.9% (7031/7036), tree
+  construction 77.3% (1344/1738) overall / 86.9% (1303/1499) excluding
+  known gaps.
+- **[CSS Nesting Module](https://www.w3.org/TR/css-nesting-1/)**: see A4
+  above.
+- **Real [CSS Cascade Layers](https://www.w3.org/TR/css-cascade-5/#layering)
+  (`@layer`)**: see A6 above.
+- **`:lang()` and `:dir()` pseudo-classes**: see A5 above.
+
+Two more bugs were found and fixed by the same stress-then-fix discipline
+while building the Nesting/Layers features (both documented in more detail
+in A4/A6 above): a self-introduced `O(N²)` clone-based blowup in
+`parse_style_block` on deeply-nested `{ }` blocks, and a pre-existing (not
+introduced by this pass, inherited from A4's original `@media` handling)
+much worse polynomial blowup *and* depth-guard defeat from a text-
+round-trip parsing adapter, found while stress-testing the new `@layer`
+nesting path. Both are now permanent regression tests. `serde`/`serde_json`
+were already pinned to their latest compatible `1`-series versions --
+`cargo update` found nothing to bump there.
 
 ---
 

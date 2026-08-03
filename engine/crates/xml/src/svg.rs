@@ -36,10 +36,10 @@ pub fn parse_svg_document(input: &str) -> Result<Document, XmlError> {
 
 fn default_unresolved_namespaces(doc: &mut Document, id: NodeId) {
     let children = doc.children(id).to_vec();
-    if let NodeData::Element(el) = doc.data_mut(id) {
-        if el.namespace.is_empty() {
-            el.namespace = dom::SVG_NS.to_string();
-        }
+    if let NodeData::Element(el) = doc.data_mut(id)
+        && el.namespace.is_empty()
+    {
+        el.namespace = dom::SVG_NS.to_string();
     }
     for child in children {
         default_unresolved_namespaces(doc, child);

@@ -316,6 +316,109 @@ impl Parser {
         }
         declarations
     }
+
+    /// Splits a style rule's block into its plain declarations and any
+    /// rules nested directly inside it (CSS Nesting Module), in source
+    /// order. Unlike [`Self::parse_declaration_list`] (which assumes every
+    /// semicolon-separated chunk is `prop: value`), nesting interleaves
+    /// declarations with nested qualified rules (`& .child { ... }`) and
+    /// nested at-rules (`@media (...) { ... }`) in the same block --
+    /// <https://www.w3.org/TR/css-nesting-1/#syntax>. A run of component
+    /// values is a nested rule if a `{`-block immediately follows it
+    /// (the run becomes that rule's prelude/selector); otherwise, once a
+    /// `;` or the block's end is reached, it's parsed as an ordinary
+    /// declaration. `css::collect_rules` resolves each nested qualified
+    /// rule's selector against its parent (substituting `&`) and recurses.
+    ///
+    /// Takes `block` *by value* (not `&[ComponentValue]`) deliberately: a
+    /// nested block's own `contents` need to become the child rule's owned
+    /// `block` field, and since `collect_rules` calls this once per
+    /// nesting level, cloning that (potentially-still-deeply-nested)
+    /// remainder at every level -- rather than moving it -- is quadratic
+    /// in nesting depth. Stress-testing with `.a{.a{.a{...` nested tens of
+    /// thousands deep (well past where the parser's own depth guard caps
+    /// *its* recursion, but not past where this function used to reprocess
+    /// the same leftover tokens over and over) took over 7 seconds at only
+    /// 20,000 levels before this was fixed to move instead of clone.
+    pub fn parse_style_block(block: Vec<ComponentValue>) -> (Vec<crate::Declaration>, Vec<Rule>) {
+        let mut declarations = Vec::new();
+        let mut nested = Vec::new();
+        let mut iter = block.into_iter();
+        while let Some(first) = iter.next() {
+            match first {
+                ComponentValue::Token(Token::Whitespace)
+                | ComponentValue::Token(Token::Semicolon) => {}
+                ComponentValue::Token(Token::AtKeyword(name)) => {
+                    let mut prelude = Vec::new();
+                    let mut at_block = None;
+                    for item in iter.by_ref() {
+                        match item {
+                            ComponentValue::Token(Token::Semicolon) => break,
+                            ComponentValue::Block {
+                                open: BlockKind::Curly,
+                                contents,
+                            } => {
+                                at_block = Some(contents);
+                                break;
+                            }
+                            other => prelude.push(other),
+                        }
+                    }
+                    nested.push(Rule::At(AtRule {
+                        name,
+                        prelude,
+                        block: at_block,
+                    }));
+                }
+                first_of_run => {
+                    let mut run = Vec::new();
+                    let mut found_block = None;
+                    for item in std::iter::once(first_of_run).chain(iter.by_ref()) {
+                        match item {
+                            ComponentValue::Token(Token::Semicolon) => break,
+                            ComponentValue::Block {
+                                open: BlockKind::Curly,
+                                contents,
+                            } => {
+                                found_block = Some(contents);
+                                break;
+                            }
+                            other => run.push(other),
+                        }
+                    }
+                    if let Some(contents) = found_block {
+                        nested.push(Rule::Qualified(QualifiedRule {
+                            prelude: run,
+                            block: contents,
+                        }));
+                    } else if let Some(decl) = parse_one_declaration(&run) {
+                        declarations.push(decl);
+                    }
+                }
+            }
+        }
+        (declarations, nested)
+    }
+}
+
+/// Splits a selector prelude on top-level commas -- safe to do directly on
+/// already-parsed `ComponentValue`s (unlike raw tokens) because anything
+/// inside parentheses/brackets is already grouped into its own nested
+/// `ComponentValue::Block`, so a `Comma` appearing in this flat slice is
+/// always a real selector-list separator, never one buried inside e.g.
+/// `:is(a, b)`.
+pub fn split_top_level_commas(values: &[ComponentValue]) -> Vec<Vec<ComponentValue>> {
+    let mut parts = Vec::new();
+    let mut current = Vec::new();
+    for v in values {
+        if matches!(v, ComponentValue::Token(Token::Comma)) {
+            parts.push(std::mem::take(&mut current));
+        } else {
+            current.push(v.clone());
+        }
+    }
+    parts.push(current);
+    parts
 }
 
 fn split_on_top_level_semicolons(values: &[ComponentValue]) -> Vec<Vec<ComponentValue>> {

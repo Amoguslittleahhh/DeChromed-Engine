@@ -83,12 +83,11 @@ fn main() {
 fn find_first(document: &dom::Document, tag: &str) -> dom::NodeId {
     let mut found = None;
     document.walk(document.root(), &mut |id, _depth| {
-        if found.is_none() {
-            if let NodeData::Element(e) = document.data(id) {
-                if e.local_name == tag {
-                    found = Some(id);
-                }
-            }
+        if found.is_none()
+            && let NodeData::Element(e) = document.data(id)
+            && e.local_name == tag
+        {
+            found = Some(id);
         }
     });
     found.expect("tag not found")

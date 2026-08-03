@@ -12,5 +12,5 @@ pub mod tokenizer;
 pub mod tree_builder;
 
 pub use token::Token;
-pub use tokenizer::{tokenize, tokenize_from, tokenize_with, Tokenizer, TokenizerState};
+pub use tokenizer::{Tokenizer, TokenizerState, tokenize, tokenize_from, tokenize_with};
 pub use tree_builder::{build_tree, parse_document};

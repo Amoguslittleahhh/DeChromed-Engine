@@ -151,6 +151,10 @@ const CSS_SEEDS: &[&str] = &[
     "@media screen { p.a, div#b[x~=y] { color: red !important; margin: 0 1px 2% auto; } }",
     "a { --x: var(--y, blue); color: var(--x); } .b::before { content: \"\\\"quoted\\\"\"; }",
     "@font-face { src: url(foo.woff) format(\"woff\"); } @import url(bar.css);",
+    // CSS Nesting Module: & substitution, implicit descendant nesting,
+    // comma-separated nested/parent selectors, nested @media.
+    ".a, .b { color: red; &:hover, & .c { color: blue; } @media (min-width: 1px) { color: green; &:focus { color: purple; } } }",
+    "@layer base { .a { color: red; & .b { color: blue; } } }",
 ];
 
 const SELECTOR_SEEDS: &[&str] = &[
@@ -161,6 +165,7 @@ const SELECTOR_SEEDS: &[&str] = &[
     // was a negation overflow when a huge negative B casts to `i32::MIN`.
     ":nth-child(3n- -999999999999999999999)",
     ":nth-last-child(-999999999999999999999n+999999999999999999999)",
+    ":lang(en-US, \"fr\", *-CA):dir(rtl)",
 ];
 
 const XML_SEEDS: &[&str] = &[

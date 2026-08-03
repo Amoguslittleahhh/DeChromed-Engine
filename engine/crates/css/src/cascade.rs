@@ -3,14 +3,25 @@
 //! Reference: <https://www.w3.org/TR/css-cascade-4/>,
 //! <https://www.w3.org/TR/css-variables-1/>.
 //!
-//! Implements the real cascade sort (origin, importance, specificity,
-//! source order per <https://www.w3.org/TR/css-cascade-4/#cascade-sort>),
-//! full Selectors-Level-4 specificity computation (including `:is()`/
-//! `:where()`/`:not()`/`:has()`'s special rules and `:nth-child(An+B of S)`),
-//! CSS custom properties (`--foo`) with inheritance and `var()`
-//! substitution (including fallback values and cycle detection per
+//! Implements the real cascade sort (origin, importance, layer, specificity,
+//! source order per <https://www.w3.org/TR/css-cascade-4/#cascade-sort> and
+//! <https://www.w3.org/TR/css-cascade-5/#layering>), full Selectors-Level-4
+//! specificity computation (including `:is()`/`:where()`/`:not()`/`:has()`'s
+//! special rules and `:nth-child(An+B of S)`), CSS custom properties
+//! (`--foo`) with inheritance and `var()` substitution (including fallback
+//! values and cycle detection per
 //! <https://www.w3.org/TR/css-variables-1/#invalid-variables>), and the
 //! `initial`/`inherit`/`unset`/`revert` defaulting keywords.
+//!
+//! **Cascade layers** (`@layer`, parsed in `lib.rs`): within the same
+//! origin and importance, [`layer_rank`] gives unlayered normal-importance
+//! declarations the highest priority, then layered ones ordered by
+//! [`Stylesheet::layer_order`][crate::Stylesheet::layer_order] (later-
+//! declared layer wins) -- and, for `!important` declarations, the exact
+//! reverse (earlier-declared layer wins, unlayered loses to every layer),
+//! which is the one place in the whole cascade where `!important` inverts
+//! rather than just reprioritizes origins. See `lib.rs`'s module docs for
+//! the nested-layer-ordering simplification this builds on.
 //!
 //! Known gaps, documented rather than silently wrong:
 //! - **No used-value resolution.** "Computed value" here stops short of
@@ -31,12 +42,12 @@
 //!   full layered-origin cascade result (revert to the next lower origin's
 //!   winning value), which requires re-running cascade per-origin; this
 //!   collapses that to the inherit-or-initial behavior of `unset` instead.
-//! - No animation/transition origins, no `@layer` ordering within a single
-//!   origin (parsed by A4 as ordinary nested rules -- see `lib.rs`, layers
-//!   aren't distinguished from unlayered styles at cascade time).
+//! - No animation/transition origins. Layer order is tracked per
+//!   `Stylesheet`, not globally across every `StyleSource` passed to one
+//!   cascade run -- see [`layer_rank`]'s docs.
 
-use crate::selectors::{self, SelectorList};
 use crate::Stylesheet;
+use crate::selectors::{self, SelectorList};
 use dom::{Document, NodeData, NodeId};
 use std::collections::{HashMap, HashSet};
 
@@ -89,9 +100,40 @@ fn priority_bucket(origin: Origin, important: bool) -> u8 {
 
 struct Candidate {
     bucket: u8,
+    layer_rank: u32,
     specificity: Specificity,
     order: u32,
     value: String,
+}
+
+/// A declaration's priority from its cascade layer, used as a tiebreaker
+/// among declarations that already share the same [`priority_bucket`]
+/// (same origin, same importance) -- higher wins, same as every other key
+/// in the sort tuple `cascade()` builds.
+///
+/// Per <https://www.w3.org/TR/css-cascade-5/#layer-ordering>: for
+/// *normal*-importance declarations, unlayered beats every layer, and
+/// among layers, the one declared *later* (further along
+/// [`Stylesheet::layer_order`][crate::Stylesheet::layer_order]) wins. For
+/// `!important` declarations this inverts: unlayered loses to every
+/// layer, and among layers the one declared *earlier* wins -- the single
+/// spot in the whole cascade where `!important` doesn't just reprioritize
+/// origins but flips a within-origin ordering too.
+///
+/// **Known gap:** `layer_order` is looked up on the declaration's own
+/// `Stylesheet`, not merged across every `StyleSource` in one `cascade()`
+/// call -- correct for the common case of one authored stylesheet (or
+/// several treated as logically independent), not for two separate
+/// `Stylesheet`s meant to interleave layers with each other.
+fn layer_rank(rule_layer: Option<&str>, layer_order: &[String], important: bool) -> u32 {
+    let layer_index = rule_layer.and_then(|name| layer_order.iter().position(|l| l == name));
+    let layer_count = layer_order.len() as u32;
+    match (layer_index, important) {
+        (None, false) => layer_count + 1, // unlayered normal: highest
+        (Some(i), false) => i as u32 + 1, // later-declared layer: higher
+        (Some(i), true) => layer_count - i as u32, // earlier-declared layer: higher
+        (None, true) => 0,                // unlayered important: lowest
+    }
 }
 
 /// Runs the cascade for a single element against `sources`, returning the
@@ -117,6 +159,11 @@ pub fn cascade(doc: &Document, node: NodeId, sources: &[StyleSource]) -> HashMap
                     .or_default()
                     .push(Candidate {
                         bucket: priority_bucket(source.origin, decl.important),
+                        layer_rank: layer_rank(
+                            rule.layer.as_deref(),
+                            &source.sheet.layer_order,
+                            decl.important,
+                        ),
                         specificity,
                         order,
                         value: decl.value.clone(),
@@ -127,7 +174,7 @@ pub fn cascade(doc: &Document, node: NodeId, sources: &[StyleSource]) -> HashMap
 
     let mut winners = HashMap::new();
     for (property, mut cands) in candidates {
-        cands.sort_by_key(|c| (c.bucket, c.specificity, c.order));
+        cands.sort_by_key(|c| (c.bucket, c.layer_rank, c.specificity, c.order));
         if let Some(winner) = cands.pop() {
             winners.insert(property, winner.value);
         }
@@ -491,12 +538,11 @@ mod tests {
     fn find_first(doc: &Document, tag: &str) -> NodeId {
         let mut found = None;
         doc.walk(doc.root(), &mut |id, _| {
-            if found.is_none() {
-                if let NodeData::Element(e) = doc.data(id) {
-                    if e.local_name == tag {
-                        found = Some(id);
-                    }
-                }
+            if found.is_none()
+                && let NodeData::Element(e) = doc.data(id)
+                && e.local_name == tag
+            {
+                found = Some(id);
             }
         });
         found.expect("tag not found")
@@ -568,6 +614,77 @@ mod tests {
         }];
         let cascaded = cascade(&doc, node, &sources);
         assert_eq!(cascaded.get("color").unwrap(), "green");
+    }
+
+    #[test]
+    fn later_declared_layer_wins_even_over_higher_specificity() {
+        // #id in the earlier-declared layer "a" should still lose to a
+        // bare type selector in the later-declared layer "b" -- layer
+        // priority overrides specificity entirely, the whole point of
+        // cascade layers.
+        let doc = build_doc("<html><body><p id=\"x\"></p></body></html>");
+        let sheet = parse_stylesheet(
+            "@layer a, b; @layer a { #x { color: red; } } @layer b { p { color: blue; } }",
+        );
+        let node = find_first(&doc, "p");
+        let sources = [StyleSource {
+            origin: Origin::Author,
+            sheet: &sheet,
+        }];
+        let cascaded = cascade(&doc, node, &sources);
+        assert_eq!(cascaded.get("color").unwrap(), "blue");
+    }
+
+    #[test]
+    fn unlayered_beats_any_layer_for_normal_importance() {
+        let doc = build_doc("<html><body><p></p></body></html>");
+        let sheet = parse_stylesheet("@layer a { p { color: red; } } p { color: green; }");
+        let node = find_first(&doc, "p");
+        let sources = [StyleSource {
+            origin: Origin::Author,
+            sheet: &sheet,
+        }];
+        let cascaded = cascade(&doc, node, &sources);
+        assert_eq!(cascaded.get("color").unwrap(), "green");
+    }
+
+    #[test]
+    fn important_inverts_layer_order_and_beats_unlayered() {
+        // !important flips the usual layer priority: the *earlier*-
+        // declared layer wins, and even that beats an unlayered
+        // !important declaration.
+        let doc = build_doc("<html><body><p></p></body></html>");
+        let sheet = parse_stylesheet(
+            "@layer a, b; \
+             @layer a { p { color: red !important; } } \
+             @layer b { p { color: blue !important; } } \
+             p { color: green !important; }",
+        );
+        let node = find_first(&doc, "p");
+        let sources = [StyleSource {
+            origin: Origin::Author,
+            sheet: &sheet,
+        }];
+        let cascaded = cascade(&doc, node, &sources);
+        assert_eq!(cascaded.get("color").unwrap(), "red");
+    }
+
+    #[test]
+    fn layer_statement_registers_order_before_any_rules() {
+        // `@layer b, a;` fixes b before a even though `a`'s rule block
+        // appears first in the source text.
+        let doc = build_doc("<html><body><p></p></body></html>");
+        let sheet = parse_stylesheet(
+            "@layer b, a; @layer a { p { color: red; } } @layer b { p { color: blue; } }",
+        );
+        let node = find_first(&doc, "p");
+        let sources = [StyleSource {
+            origin: Origin::Author,
+            sheet: &sheet,
+        }];
+        let cascaded = cascade(&doc, node, &sources);
+        // "a" was declared after "b" in the @layer statement, so it wins.
+        assert_eq!(cascaded.get("color").unwrap(), "red");
     }
 
     #[test]

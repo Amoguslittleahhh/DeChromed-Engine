@@ -18,7 +18,14 @@
 //! still flattened away rather than kept as live `CSSConditionRule`
 //! objects, inheriting A4's "condition not evaluated" simplification;
 //! other at-rules (`@font-face`, `@import`, ...) round-trip as opaque text
-//! via `AtRuleSummary`, same as `Stylesheet`.
+//! via `AtRuleSummary`, same as `Stylesheet`. `CssomStyleRule::layer`
+//! preserves each rule's cascade layer, but a `@layer name;` statement
+//! that registers a layer's order without giving it any rules doesn't
+//! survive the round-trip through this object graph -- `to_stylesheet()`
+//! reconstructs `Stylesheet::layer_order` from the layers that visibly
+//! have rules, in first-appearance order, which is a faithful
+//! reconstruction for every layer that actually matters to the cascade
+//! but can miss an empty layer's *position* if nothing else defines it.
 
 use crate::{AtRuleSummary, Declaration};
 
@@ -42,6 +49,7 @@ pub enum CssomRule {
 pub struct CssomStyleRule {
     pub selector_text: String,
     pub declarations: Vec<Declaration>,
+    pub layer: Option<String>,
 }
 
 impl CssomStyleRule {
@@ -114,6 +122,7 @@ impl CssomSheet {
                 CssomRule::Style(CssomStyleRule {
                     selector_text: r.selector,
                     declarations: r.declarations,
+                    layer: r.layer,
                 })
             })
             .collect();
@@ -135,6 +144,7 @@ impl CssomSheet {
             CssomRule::Style(CssomStyleRule {
                 selector_text: r.selector,
                 declarations: r.declarations,
+                layer: r.layer,
             })
         } else if let Some(at) = sheet.other_at_rules.into_iter().next() {
             CssomRule::At(at)
@@ -163,10 +173,18 @@ impl CssomSheet {
         let mut sheet = crate::Stylesheet::default();
         for rule in &self.rules {
             match rule {
-                CssomRule::Style(s) => sheet.rules.push(crate::Rule {
-                    selector: s.selector_text.clone(),
-                    declarations: s.declarations.clone(),
-                }),
+                CssomRule::Style(s) => {
+                    if let Some(layer) = &s.layer
+                        && !sheet.layer_order.iter().any(|l| l == layer)
+                    {
+                        sheet.layer_order.push(layer.clone());
+                    }
+                    sheet.rules.push(crate::Rule {
+                        selector: s.selector_text.clone(),
+                        declarations: s.declarations.clone(),
+                        layer: s.layer.clone(),
+                    });
+                }
                 CssomRule::At(a) => sheet.other_at_rules.push(a.clone()),
             }
         }

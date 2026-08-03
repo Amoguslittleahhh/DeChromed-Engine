@@ -35,9 +35,9 @@
 //!   most tokens to `InBody` rather than maintaining the spec's separate
 //!   template insertion-mode stack and content-document semantics.
 
+use crate::Token;
 use crate::foreign_content;
 use crate::tokenizer::{Tokenizer, TokenizerState};
-use crate::Token;
 use dom::{DoctypeData, Document, ElementData, NodeData, NodeId};
 
 /// Elements that establish a "formatting" context re-applied via the
@@ -381,10 +381,11 @@ impl TreeBuilder {
             .unwrap_or(0);
         let mut matches_found = Vec::new();
         for i in (last_marker..self.afe.len()).rev() {
-            if let Afe::Element(_, n, a) = &self.afe[i] {
-                if n == name && a == attrs {
-                    matches_found.push(i);
-                }
+            if let Afe::Element(_, n, a) = &self.afe[i]
+                && n == name
+                && a == attrs
+            {
+                matches_found.push(i);
             }
         }
         if matches_found.len() >= 3 {
@@ -604,12 +605,12 @@ impl TreeBuilder {
                     break;
                 }
                 let node_afe_pos = self.afe.iter().position(|e| e.node_id() == Some(node));
-                if inner > 3 {
-                    if let Some(p) = node_afe_pos {
-                        self.afe.remove(p);
-                        if p < bookmark {
-                            bookmark -= 1;
-                        }
+                if inner > 3
+                    && let Some(p) = node_afe_pos
+                {
+                    self.afe.remove(p);
+                    if p < bookmark {
+                        bookmark -= 1;
                     }
                 }
                 let Some(node_afe_pos) = self.afe.iter().position(|e| e.node_id() == Some(node))
@@ -842,18 +843,18 @@ impl TreeBuilder {
                 Token::StartTag { name, .. }
                     if !matches!(name.as_str(), "mglyph" | "malignmark") =>
                 {
-                    return false
+                    return false;
                 }
                 Token::Character(_) => return false,
                 _ => {}
             }
         }
-        if ns == dom::MATHML_NS && local == "annotation-xml" {
-            if let Token::StartTag { name, .. } = token {
-                if name == "svg" {
-                    return false;
-                }
-            }
+        if ns == dom::MATHML_NS
+            && local == "annotation-xml"
+            && let Token::StartTag { name, .. } = token
+            && name == "svg"
+        {
+            return false;
         }
         if foreign_content::is_html_integration_point(ns, local, attrs)
             && matches!(token, Token::StartTag { .. } | Token::Character(_))
@@ -1353,13 +1354,12 @@ impl TreeBuilder {
             Token::StartTag {
                 name, attributes, ..
             } if name == "body" => {
-                if let Some(&body) = self.open_elements.get(1) {
-                    if self.tag_name(body) == "body" {
-                        if let NodeData::Element(el) = self.doc.data_mut(body) {
-                            for (k, v) in attributes {
-                                el.set_if_absent(k, v);
-                            }
-                        }
+                if let Some(&body) = self.open_elements.get(1)
+                    && self.tag_name(body) == "body"
+                    && let NodeData::Element(el) = self.doc.data_mut(body)
+                {
+                    for (k, v) in attributes {
+                        el.set_if_absent(k, v);
                     }
                 }
                 Action::Continue
@@ -2628,12 +2628,11 @@ mod tests {
     fn find_by_local_name(doc: &Document, name: &str) -> NodeId {
         let mut found = None;
         doc.walk(doc.root(), &mut |id, _| {
-            if found.is_none() {
-                if let NodeData::Element(el) = doc.data(id) {
-                    if el.local_name == name {
-                        found = Some(id);
-                    }
-                }
+            if found.is_none()
+                && let NodeData::Element(el) = doc.data(id)
+                && el.local_name == name
+            {
+                found = Some(id);
             }
         });
         found.unwrap_or_else(|| panic!("no <{name}> in document"))
