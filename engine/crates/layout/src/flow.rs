@@ -131,10 +131,11 @@ fn get<'a>(style: Option<&'a ComputedStyle>, name: &str, default: &'a str) -> &'
 /// (unstyled) containing block `containing_width` pixels wide. This is the
 /// crate's top-level entry point.
 pub fn layout(root: &LayoutBox, styles: &StyleMap, containing_width: f64) -> Fragment {
-    let root_font_size = resolve_font_size(
+    let (root_font_size, root_font_size_raw) = resolve_font_size(
         root.node,
         styles,
         values::default_font_size_px(),
+        None,
         values::default_font_size_px(),
     );
     layout_box(
@@ -142,22 +143,51 @@ pub fn layout(root: &LayoutBox, styles: &StyleMap, containing_width: f64) -> Fra
         styles,
         containing_width,
         root_font_size,
+        root_font_size_raw.as_deref(),
         root_font_size,
     )
 }
 
+/// Resolves `node`'s `font-size`, returning both the resolved pixel value
+/// and the raw computed-style string that produced it (for the caller to
+/// pass back in as `parent_font_size_raw` when resolving *this* node's
+/// children).
+///
+/// `css::cascade` doesn't resolve `font-size`'s relative units (`%`/`em`)
+/// before inheriting it -- a documented A6/A7 "no used-value resolution"
+/// gap -- so when a node has no matching rule for `font-size`, cascade's
+/// inheritance just copies the parent's *unresolved* computed string
+/// through verbatim (see `PROPERTY_TABLE`'s `inherited_value()` in
+/// `css::cascade`). Without this check, re-resolving that copied-through
+/// string against the parent's already-resolved pixel size on every
+/// generation compounds a relative `font-size` (e.g. `150%`) once per
+/// descendant that doesn't redeclare it, instead of it being fixed once
+/// where actually declared. Comparing the node's own raw string against
+/// `parent_font_size_raw` detects "this is cascade's inheritance copy,
+/// not a fresh declaration" and reuses the parent's resolved size instead.
 fn resolve_font_size(
     node: Option<NodeId>,
     styles: &StyleMap,
     parent_font_size_px: f64,
+    parent_font_size_raw: Option<&str>,
     root_font_size_px: f64,
-) -> f64 {
-    match node
+) -> (f64, Option<String>) {
+    let own_raw = node
         .and_then(|n| styles.get(&n))
         .and_then(|s| s.get("font-size"))
-    {
-        Some(v) => values::resolve_font_size_px(v, parent_font_size_px, root_font_size_px),
-        None => parent_font_size_px,
+        .map(String::as_str);
+    match own_raw {
+        None => (
+            parent_font_size_px,
+            parent_font_size_raw.map(str::to_string),
+        ),
+        Some(raw) if Some(raw) == parent_font_size_raw => {
+            (parent_font_size_px, Some(raw.to_string()))
+        }
+        Some(raw) => (
+            values::resolve_font_size_px(raw, parent_font_size_px, root_font_size_px),
+            Some(raw.to_string()),
+        ),
     }
 }
 
@@ -191,23 +221,23 @@ fn resolve_box_model(
         bottom: resolve("margin-bottom"),
         left: resolve("margin-left"),
     };
-    let border_style_none = |side: &str| get(style, side, "none") == "none";
-    let border_width = |side: &str| {
-        if border_style_none(side) {
-            0.0
-        } else {
-            values::parse_border_width_px(
-                get(style, "border-width", "medium"),
-                font_size_px,
-                root_font_size_px,
-            )
-        }
+    // `css::cascade`'s property table only has a single (non-per-side)
+    // `border-width`/`border-style`, so all four sides always share one
+    // resolved value -- computed once here rather than re-parsed per side.
+    let border_width_px = if get(style, "border-style", "none") == "none" {
+        0.0
+    } else {
+        values::parse_border_width_px(
+            get(style, "border-width", "medium"),
+            font_size_px,
+            root_font_size_px,
+        )
     };
     let border = EdgeSizes {
-        top: border_width("border-style"),
-        right: border_width("border-style"),
-        bottom: border_width("border-style"),
-        left: border_width("border-style"),
+        top: border_width_px,
+        right: border_width_px,
+        bottom: border_width_px,
+        left: border_width_px,
     };
     let padding = EdgeSizes {
         top: resolve("padding-top"),
@@ -247,10 +277,17 @@ fn layout_box(
     styles: &StyleMap,
     containing_width: f64,
     parent_font_size_px: f64,
+    parent_font_size_raw: Option<&str>,
     root_font_size_px: f64,
 ) -> Fragment {
     let style = b.node.and_then(|n| styles.get(&n));
-    let font_size_px = resolve_font_size(b.node, styles, parent_font_size_px, root_font_size_px);
+    let (font_size_px, font_size_raw) = resolve_font_size(
+        b.node,
+        styles,
+        parent_font_size_px,
+        parent_font_size_raw,
+        root_font_size_px,
+    );
     let model = resolve_box_model(style, containing_width, font_size_px, root_font_size_px);
 
     match &b.kind {
@@ -276,6 +313,7 @@ fn layout_box(
                     styles,
                     model.content_width,
                     font_size_px,
+                    font_size_raw.as_deref(),
                     root_font_size_px,
                 )
             } else {
@@ -284,7 +322,9 @@ fn layout_box(
                     styles,
                     model.content_width,
                     font_size_px,
+                    font_size_raw.as_deref(),
                     root_font_size_px,
+                    b.node,
                 )
             };
             let explicit_height = values::parse_length_percentage_auto(
@@ -324,6 +364,7 @@ fn layout_block_children(
     styles: &StyleMap,
     containing_width: f64,
     font_size_px: f64,
+    font_size_raw: Option<&str>,
     root_font_size_px: f64,
 ) -> (Vec<Fragment>, f64) {
     struct FloatBox {
@@ -359,6 +400,7 @@ fn layout_block_children(
             styles,
             containing_width,
             font_size_px,
+            font_size_raw,
             root_font_size_px,
         );
 
@@ -415,25 +457,36 @@ fn shift(fragment: &mut Fragment, dx: f64, dy: f64) {
 
 enum InlineItem<'a> {
     Word {
-        node: Option<NodeId>,
+        /// The leaf text node itself -- used as the produced `Fragment`'s
+        /// identity, not for style lookups (text nodes never have their
+        /// own computed style; only `style_node` does).
+        text_node: Option<NodeId>,
+        /// The nearest enclosing *element* (the innermost inline box
+        /// actually wrapping this text, or the containing block box
+        /// itself if none does) -- inherited properties like
+        /// `line-height` are looked up against this, not `text_node`.
+        style_node: Option<NodeId>,
         text: String,
         font_size_px: f64,
     },
-    Atomic(&'a LayoutBox, f64),
+    Atomic(&'a LayoutBox, f64, Option<String>),
 }
 
 fn flatten_inline<'a>(
     b: &'a LayoutBox,
     styles: &StyleMap,
     font_size_px: f64,
+    font_size_raw: Option<&str>,
     root_font_size_px: f64,
+    style_node: Option<NodeId>,
     out: &mut Vec<InlineItem<'a>>,
 ) {
     match &b.kind {
         BoxKind::Text(text) => {
             for word in text.split_whitespace() {
                 out.push(InlineItem::Word {
-                    node: b.node,
+                    text_node: b.node,
+                    style_node,
                     text: word.to_string(),
                     font_size_px,
                 });
@@ -441,12 +494,30 @@ fn flatten_inline<'a>(
         }
         BoxKind::Container(children) => {
             if b.level == BoxLevel::InlineBlock {
-                out.push(InlineItem::Atomic(b, font_size_px));
+                out.push(InlineItem::Atomic(
+                    b,
+                    font_size_px,
+                    font_size_raw.map(str::to_string),
+                ));
             } else {
-                let own_font_size =
-                    resolve_font_size(b.node, styles, font_size_px, root_font_size_px);
+                let (own_font_size, own_font_size_raw) = resolve_font_size(
+                    b.node,
+                    styles,
+                    font_size_px,
+                    font_size_raw,
+                    root_font_size_px,
+                );
+                let child_style_node = b.node.or(style_node);
                 for child in children {
-                    flatten_inline(child, styles, own_font_size, root_font_size_px, out);
+                    flatten_inline(
+                        child,
+                        styles,
+                        own_font_size,
+                        own_font_size_raw.as_deref(),
+                        root_font_size_px,
+                        child_style_node,
+                        out,
+                    );
                 }
             }
         }
@@ -479,28 +550,43 @@ fn layout_inline_children(
     styles: &StyleMap,
     containing_width: f64,
     font_size_px: f64,
+    font_size_raw: Option<&str>,
     root_font_size_px: f64,
+    container_node: Option<NodeId>,
 ) -> (Vec<Fragment>, f64) {
     let mut items = Vec::new();
     for child in children {
-        flatten_inline(child, styles, font_size_px, root_font_size_px, &mut items);
+        flatten_inline(
+            child,
+            styles,
+            font_size_px,
+            font_size_raw,
+            root_font_size_px,
+            container_node,
+            &mut items,
+        );
     }
 
     let mut lines: Vec<Vec<Fragment>> = vec![Vec::new()];
     let mut line_widths: Vec<f64> = vec![0.0];
     let mut line_max_font: Vec<f64> = vec![font_size_px];
+    let default_line_height = line_height_px(None, font_size_px, root_font_size_px);
+    let mut line_max_height: Vec<f64> = vec![default_line_height];
 
     for item in items {
-        let (mut fragment, width, item_font_size) = match item {
+        let (mut fragment, width, item_font_size, item_line_height) = match item {
             InlineItem::Word {
-                node,
+                text_node,
+                style_node,
                 text,
                 font_size_px,
             } => {
                 let w = word_width(&text, font_size_px);
+                let style = style_node.and_then(|n| styles.get(&n));
+                let lh = line_height_px(style, font_size_px, root_font_size_px);
                 (
                     Fragment {
-                        node,
+                        node: text_node,
                         content_rect: Rect {
                             x: 0.0,
                             y: 0.0,
@@ -515,18 +601,22 @@ fn layout_inline_children(
                     },
                     w,
                     font_size_px,
+                    lh,
                 )
             }
-            InlineItem::Atomic(b, inherited_font_size) => {
+            InlineItem::Atomic(b, inherited_font_size, inherited_font_size_raw) => {
                 let f = layout_box(
                     b,
                     styles,
                     containing_width,
                     inherited_font_size,
+                    inherited_font_size_raw.as_deref(),
                     root_font_size_px,
                 );
                 let w = f.margin_box().width;
-                (f, w, inherited_font_size)
+                let style = b.node.and_then(|n| styles.get(&n));
+                let lh = line_height_px(style, inherited_font_size, root_font_size_px);
+                (f, w, inherited_font_size, lh)
             }
         };
 
@@ -541,16 +631,19 @@ fn layout_inline_children(
             lines.push(Vec::new());
             line_widths.push(0.0);
             line_max_font.push(font_size_px);
+            line_max_height.push(default_line_height);
             let current = lines.len() - 1;
             reposition(&mut fragment, 0.0, 0.0);
             line_widths[current] = width;
             line_max_font[current] = line_max_font[current].max(item_font_size);
+            line_max_height[current] = line_max_height[current].max(item_line_height);
             lines[current].push(fragment);
         } else {
             let x = line_widths[current] + extra;
             reposition(&mut fragment, x, 0.0);
             line_widths[current] = x + width;
             line_max_font[current] = line_max_font[current].max(item_font_size);
+            line_max_height[current] = line_max_height[current].max(item_line_height);
             lines[current].push(fragment);
         }
     }
@@ -561,7 +654,7 @@ fn layout_inline_children(
         if line.is_empty() {
             continue;
         }
-        let height = line_height_px(None, line_max_font[i], root_font_size_px);
+        let height = line_max_height[i];
         for fragment in &mut line {
             shift(fragment, 0.0, cursor_y);
         }
@@ -865,5 +958,64 @@ mod tests {
         let fragment = layout(&tree, &styles, 500.0);
         let after_fragment = &fragment.children[1];
         assert_eq!(after_fragment.border_box().y, 40.0);
+    }
+
+    #[test]
+    fn inherited_percentage_font_size_does_not_compound_across_generations() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let outer = el(&mut doc, root, "div", &[]);
+        let middle = el(&mut doc, outer, "div", &[]);
+        let inner = el(&mut doc, middle, "div", &[]);
+        doc.append(inner, NodeData::Text("hi".into()));
+
+        // Simulates real `css::cascade` behavior: an inherited property
+        // with no matching rule copies the parent's *computed* string
+        // through verbatim rather than resolving it (see
+        // `PROPERTY_TABLE`'s `inherited_value()` in `css::cascade`), so
+        // `middle`/`inner` -- which have no `font-size` rule of their own
+        // -- end up with the exact same `"150%"` string as `outer`, not a
+        // resolved px value.
+        let mut styles = StyleMap::new();
+        for id in [outer, middle, inner] {
+            styles.insert(
+                id,
+                [("display", "block"), ("font-size", "150%")]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            );
+        }
+
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 500.0);
+        // outer -> middle -> inner -> (line box) -> "hi" word fragment.
+        let word = &fragment.children[0].children[0].children[0].children[0];
+        // 16px default * 1.5 = 24px, resolved once against the root's
+        // default size and then correctly *inherited* unchanged, not
+        // recompounded to 16*1.5*1.5*1.5 = 54px.
+        assert_eq!(word.content_rect.height, 24.0);
+    }
+
+    #[test]
+    fn explicit_line_height_is_not_ignored() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let p = el(&mut doc, root, "p", &[]);
+        doc.append(p, NodeData::Text("hi".into()));
+        let mut styles = StyleMap::new();
+        styles.insert(
+            p,
+            [("display", "block"), ("line-height", "3")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 500.0);
+        let line = &fragment.children[0];
+        // Default font-size is 16px, so `line-height: 3` should produce a
+        // 48px line box, not the `normal` (1.2x) 19.2px default.
+        assert_eq!(line.content_rect.height, 48.0);
     }
 }
