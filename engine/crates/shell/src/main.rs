@@ -4,8 +4,11 @@
 //! document, parsing a real stylesheet, matching a real selector,
 //! cascading/computing real styles, incrementally restyling after a
 //! targeted DOM mutation, parsing inline SVG via foreign content (A8/A9),
-//! and parsing a standalone XML document (A10). Layout/paint are still
-//! placeholders (Track B).
+//! and parsing a standalone XML document (A10). B1/B2 (box tree + block/
+//! inline layout) are real now too, run below against a fixed 800px
+//! containing-block width (there's no window/viewport concept yet --
+//! see `layout`'s own module docs for what B1/B2 do and don't cover).
+//! Paint (B10+) is still a placeholder.
 
 use css::cascade::Origin;
 use css::cssom::CssomSheet;
@@ -19,9 +22,6 @@ fn main() {
     let stylesheet = css::parse_stylesheet("p.greeting { color: red; }");
     let selector =
         css::selectors::parse_selector_list("p.greeting").expect("selector should parse");
-
-    let fragments = layout::layout();
-    let _display_list = paint::build_display_list(&fragments);
 
     println!("DeChromed Engine -- pipeline smoke test");
     println!("input: {input:?}");
@@ -63,6 +63,24 @@ fn main() {
         touched.len()
     );
 
+    // B1/B2: build a real box tree from the computed styles above and lay
+    // it out against a fixed 800px containing-block width.
+    let mut styles = layout::StyleMap::new();
+    document.walk(document.root(), &mut |id, _depth| {
+        if let Some(style) = engine.computed_style(id) {
+            styles.insert(id, style.clone());
+        }
+    });
+    if let Some(box_tree) = layout::build_box_tree(&document, &styles) {
+        let fragment = layout::layout(&box_tree, &styles, 800.0);
+        let border_box = fragment.border_box();
+        println!(
+            "layout: <html> border-box = {}x{} at ({}, {})",
+            border_box.width, border_box.height, border_box.x, border_box.y
+        );
+        let _display_list = paint::build_display_list(&fragment);
+    }
+
     // A8/A9: inline <svg> inside HTML reaches real foreign content --
     // the nested <path> gets the SVG namespace, not the HTML one.
     let svg_doc = html::parse_document("<body><svg><path d=\"M0 0\"></path></svg></body>");
@@ -77,7 +95,7 @@ fn main() {
         .expect("well-formed XML");
     println!("standalone XML document:\n{}", xml::serialize(&xml_doc));
 
-    println!("(layout/paint stages ran but are placeholders -- see ROADMAP.md Track B)");
+    println!("(paint stage ran but is still a placeholder -- see ROADMAP.md Track B)");
 }
 
 fn find_first(document: &dom::Document, tag: &str) -> dom::NodeId {

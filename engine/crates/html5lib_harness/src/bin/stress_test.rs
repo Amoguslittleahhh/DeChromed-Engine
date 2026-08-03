@@ -384,12 +384,47 @@ fn main() {
     }
     cascade_report.print_summary();
 
+    // B1/B2: fuzz the box-tree/layout pipeline the same way -- computed
+    // styles from a mutated HTML+CSS pair, built into a real box tree and
+    // laid out at a few different containing-block widths (including
+    // pathologically narrow ones, since that's what stresses the inline
+    // line-breaking loop hardest).
+    let mut layout_report = Report::new("layout::layout");
+    for _ in 0..iterations {
+        let html_edits = 1 + rng.next_range(10);
+        let css_edits = 1 + rng.next_range(10);
+        let html_seed = HTML_SEEDS[rng.next_range(HTML_SEEDS.len())];
+        let css_seed = CSS_SEEDS[rng.next_range(CSS_SEEDS.len())];
+        let html_input = mutate(&mut rng, html_seed, HTML_ALPHABET, html_edits);
+        let css_input = mutate(&mut rng, css_seed, CSS_ALPHABET, css_edits);
+        let width = [0.0, 1.0, 60.0, 800.0][rng.next_range(4)];
+        let combined = format!("{html_input}\u{0}{css_input}\u{0}{width}");
+        layout_report.try_input(combined, |s| {
+            let mut parts = s.splitn(3, '\u{0}');
+            let html_part = parts.next().unwrap();
+            let css_part = parts.next().unwrap();
+            let width: f64 = parts.next().unwrap().parse().unwrap_or(800.0);
+            let doc = html::parse_document(html_part);
+            let sheet = css::parse_stylesheet(css_part);
+            let sources = [css::cascade::StyleSource {
+                origin: css::cascade::Origin::Author,
+                sheet: &sheet,
+            }];
+            let styles = css::cascade::compute_document_styles(&doc, &sources);
+            if let Some(tree) = layout::build_box_tree(&doc, &styles) {
+                let _ = layout::layout(&tree, &styles, width);
+            }
+        });
+    }
+    layout_report.print_summary();
+
     let total_failures: usize = [
         &html_report,
         &css_report,
         &selector_report,
         &xml_report,
         &cascade_report,
+        &layout_report,
     ]
     .iter()
     .map(|r| r.failures.len())

@@ -12,9 +12,17 @@ computed-value pipeline (with real [Cascade Layers](https://www.w3.org/TR/css-ca
 support), a real mutable CSSOM with `getComputedStyle` and
 invalidation-set-driven incremental restyling, and a real standalone XML
 1.0 parser (`crates/xml`) with namespace resolution (XSLT explicitly
-dropped, per `ROADMAP.md`'s own long-standing note on it). B1 (box tree
-generation, Track B's start) is the open next step -- see `ROADMAP.md`'s
-"What to actually do next".
+dropped, per `ROADMAP.md`'s own long-standing note on it).
+
+**Track B (layout) is now started**: B1 (box tree generation) and B2
+(block & inline formatting contexts) both have a real, tested first
+landing in `crates/layout` -- `display` computation, anonymous-box
+generation, list markers, real box-model geometry, CSS2.1 margin
+collapsing, line-breaking, and `float`/`clear`. See `ROADMAP.md`'s B1/B2
+entries for exactly what's real vs. a documented gap (`::before`/
+`::after` generated content and real table/flex/grid box types are the
+two biggest remaining gaps). `crates/shell/src/main.rs` runs the real
+pipeline end to end, including this new layout stage.
 
 The workspace targets Rust **edition 2024** (`engine/Cargo.toml`), using
 stable let-chains (`if let X = y && let A = b { ... }`) where they read
@@ -30,14 +38,14 @@ engine/
     html/                    A2 (tokenizer) + A3 (tree construction) + A8/A9 (SVG/MathML foreign content) -- all done
     css/                     A4-A7 (tokenizer/parser, selectors, cascade, CSSOM) -- all done
     xml/                     A10 (standalone XML 1.0 parser + namespace resolution) -- done; also A8's standalone-SVG-document entry point
-    layout/                  B1-B9 (box tree -> fragment tree) -- currently placeholders
+    layout/                  B1/B2 (box tree, block/inline layout) -- started; B3-B9 (tables, flexbox, grid, fragment tree) still placeholders
     paint/                   B10-B12 (text shaping, rasterization, compositing) -- currently placeholders
     js_bindings/              Track C -- placeholder, shape depends on "the JS engine question"
     net/                     D1-D3 (URL parsing, networking, resource loading) -- currently placeholders
     media/                   D5-D7 (images, audio/video, WebRTC) -- currently empty
     a11y/                    F2 (accessibility tree) -- currently placeholders
     devtools/                F1 (inspector protocol) -- currently placeholders
-    shell/                   binary crate; a real HTML->DOM->CSS->selector-match->cascade->getComputedStyle->incremental-restyle->foreign-content->XML pipeline smoke test (layout/paint stages are still placeholders)
+    shell/                   binary crate; a real HTML->DOM->CSS->selector-match->cascade->getComputedStyle->incremental-restyle->foreign-content->XML->box-tree->layout pipeline smoke test (paint is still a placeholder)
     html5lib_harness/        A2/A3/A8/A9's conformance harness (see below)
 ```
 
@@ -147,11 +155,14 @@ resolution/round-trip-serialization cases.
 ## The stress-test fuzzer
 
 `crates/html5lib_harness/src/bin/stress_test.rs` is a cross-crate,
-conformance-blind fuzzer for Track A (A1-A10): it doesn't check parser
-*output* against an expected answer (that's the tokenizer/tree-construction
-harnesses above), only that `html::parse_document`, `css::parse_stylesheet`,
-`css::selectors::parse_selector_list`, `xml::parse_document`, and the
-cascade/computed-style pipeline all return *something* (or a graceful
+conformance-blind fuzzer for Track A (A1-A10) and now Track B's
+`layout::layout` too: it doesn't check parser *output* against an
+expected answer (that's the tokenizer/tree-construction harnesses above),
+only that `html::parse_document`, `css::parse_stylesheet`,
+`css::selectors::parse_selector_list`, `xml::parse_document`, the
+cascade/computed-style pipeline, and now `layout::build_box_tree`/
+`layout::layout` (at several containing-block widths, including
+pathologically narrow/zero ones) all return *something* (or a graceful
 `Err`) instead of panicking, hanging, or aborting the process, across:
 
 - **Truncation fuzzing**: every prefix length of a handful of realistic

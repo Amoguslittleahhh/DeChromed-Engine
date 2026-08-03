@@ -10,3 +10,6 @@ workspace = true
 [dependencies]
 dom = { path = "../dom" }
 css = { path = "../css" }
+
+[dev-dependencies]
+html = { path = "../html" }

@@ -494,17 +494,86 @@ were already pinned to their latest compatible `1`-series versions --
 
 ## Track B — Layout & Graphics
 
-### B1. Box tree generation
-Style tree → box tree: anonymous box generation, `display` computation
-(including `display: contents`, `display: table` internal box types),
-list-item markers, `::before`/`::after` generated content.
-**Exit:** WPT `css/css-display` ≥80%.
+### B1. Box tree generation — *started*
+Real `display` computation and anonymous-box generation in the new
+`engine/crates/layout` crate (`box_tree.rs`, ~250 lines): `display: none`
+generates no box; `display: contents` splices its children straight into
+the parent's child list rather than generating a box of its own; a
+`display: list-item` element gets a real marker box (`disc`/`circle`/
+`square`/`decimal` `list-style-type` keywords, numbered by position among
+same-parent list-item siblings); and — the CSS2.1 rule that actually makes
+this phase non-trivial — a block container with a mix of block-level and
+inline-level children gets every maximal run of inline-level children
+wrapped in a synthetic anonymous block box, so a block box's children end
+up either all block-level or all inline-level, never mixed (verified by
+walking the actual generated tree shape, not just trusting the algorithm
+by inspection).
 
-### B2. Block & inline formatting contexts
-Classic block layout, inline layout with line boxes, `float`/`clear`,
-margin collapsing (an infamous, precisely-specified, easy-to-get-subtly-
-wrong algorithm), BFC establishment rules.
-**Exit:** WPT `css/css-box`, `css/CSS2/normal-flow`, `css/CSS2/floats` ≥80%.
+Known gaps, documented in the crate's own module docs: no `::before`/
+`::after` generated content yet (needs pseudo-element matching support in
+`css::cascade` that doesn't exist -- `p::before` currently never matches
+any real DOM node, see `css::selectors`' own docs); `display: table`/
+`table-row`/`table-cell`/`flex`/`grid` all collapse to plain block-level
+rather than their real internal box types (B3/B4/B5's own job); list
+markers are always rendered "inside" rather than in the margin the way
+`list-style-position: outside` (the initial value) actually requires, and
+don't support `<ol start>`/`<li value>`; whitespace collapsing is minimal
+(an all-whitespace text node produces no box, but internal/leading/
+trailing whitespace within real text isn't otherwise collapsed).
+**Exit not yet met** (no `::before`/`::after`, no real table/flex/grid box
+types) -- WPT `css/css-display` needs a JS engine to run anyway (`Track
+C`), so verified instead with 5 self-authored unit tests covering
+`display: none`/`contents`, anonymous-block wrapping (both the "gets
+wrapped" and "pure inline, doesn't get wrapped" cases), and list-item
+marker numbering, plus the shared stress-test fuzzer (see B2 below).
+
+### B2. Block & inline formatting contexts — *started*
+Real box-model geometry and layout in `engine/crates/layout/src/flow.rs`
+(~450 lines) and `values.rs` (the "used value" length/percentage/keyword
+resolution A6/A7 explicitly deferred until a real layout phase existed to
+consume it): margin/border/padding/content-box widths resolved from
+computed-style strings, including `auto` width filling the remaining
+containing-block space and percentage margins/padding resolved against
+the containing block; a real block formatting context (children stacked
+vertically) with the *actual* CSS2.1 8.3.1 margin-collapsing algorithm
+(positive margins take the max, then a negative margin's magnitude is
+subtracted from that max -- not just "biggest number wins"); a real
+(if simplified, see below) inline formatting context that flattens text
+across nested inline boxes into words and wraps them into line boxes at
+the containing block's width; and `float: left|right`/`clear: left|right|
+both`, correctly scoped per block formatting context (a float leaves
+normal vertical stacking, `clear` pushes a later sibling below it) rather
+than globally.
+
+Known gaps, documented in the module's own doc comments: no real font
+shaping/glyph-metrics engine exists yet (that's B10), so word/line widths
+use a flat `font_size_px * 0.5` per-character heuristic -- every text-
+layout number here is a rough visual approximation, not pixel-accurate;
+no shrink-to-fit/intrinsic sizing (an auto-width `inline-block` or float
+falls back to the same "fill remaining width" rule an ordinary auto-width
+block uses, which isn't spec-correct for either); floats are correctly
+taken out of flow and positioned to a side and `clear` correctly pushes
+below them, but normal-flow siblings/line boxes don't yet get narrowed to
+visually wrap *around* a float (that needs per-line float-aware width
+tracking, a further refinement); no parent-child margin collapsing and no
+collapsing-through-empty-boxes (only adjacent-sibling collapsing is
+implemented); no `auto`-margin centering; and line height on a mixed-
+font-size line is just the max resolved line-height among its items, with
+no baseline alignment.
+**Exit not yet met** (WPT `css/css-box`/`css/CSS2/normal-flow`/`css/CSS2/
+floats` need a JS engine to run and are separately blocked on B1's
+remaining gaps anyway) -- verified with 8 self-authored unit tests
+(box-model geometry, auto-width resolution, sibling margin collapsing
+including the real positive/negative-magnitude algorithm, text line-
+wrapping at different containing widths, float positioning, and `clear`)
+plus a new `layout::layout` fuzzer added to
+`engine/crates/html5lib_harness/src/bin/stress_test.rs` (mutated HTML+CSS
+built into a real box tree and laid out at several containing-block
+widths, including pathologically narrow/zero ones) -- 0 distinct failures
+across 50,000+ iterations on two seeds.
+`engine/crates/shell/src/main.rs` now runs this pipeline for real (parse
+→ style → box tree → layout) against a fixed 800px containing-block
+width in place of the old placeholder call.
 
 ### B3. Table layout
 CSS 2 table layout algorithm (distinct model from block/inline): row/column
@@ -1206,10 +1275,18 @@ standalone XML document.
 That's "renders a real static webpage correctly"'s content-and-style half
 (Track A) fully done. Nothing in Track A blocks what comes next — Track B
 (layout) only needs a styled tree, which has existed since A6 and is now
-more complete with A8/A9's namespace-aware elements included. **B1 (box
-tree generation)** is the natural next step: it's the first phase where
-this project starts producing something visibly different from a data
-structure -- actual pixels -- and every later Track B phase (block/inline
-layout, tables, flexbox, grid, painting) builds on it.
+more complete with A8/A9's namespace-aware elements included.
 
-Say the word and I'll start on B1.
+**B1 (box tree generation) and B2 (block & inline formatting contexts) are
+now started** in the new `engine/crates/layout` crate -- see their entries
+above for exactly what's real (display computation, anonymous-box
+wrapping, list markers, real box-model geometry, margin collapsing, line-
+breaking, float/clear) and what's still a documented gap (`::before`/
+`::after`, real table/flex/grid box types, font-shaping-accurate text
+metrics, shrink-to-fit sizing, float-aware line narrowing). Remaining
+work to fully close out B1/B2: pseudo-element matching in `css::cascade`
+(needed for generated content), and the float/line-narrowing refinement.
+B3 (tables) through B9 (fragment tree & display list) are the natural
+next steps after that -- B10 (text shaping) in particular is worth
+pulling forward opportunistically whenever B2's flat per-character text
+metric heuristic becomes the limiting factor on visual accuracy.
