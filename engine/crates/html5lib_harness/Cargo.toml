@@ -3,6 +3,12 @@ name = "html5lib_harness"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+# `cargo run -p html5lib_harness` (with no `--bin`, e.g. this crate's own
+# CI step and README instructions) needs a default once a package has
+# more than one binary target -- `tree_construction_harness`/
+# `stress_test` are extra debugging tools, not what "run this package"
+# should mean by default.
+default-run = "html5lib_harness"
 
 [lib]
 name = "html5lib_harness"

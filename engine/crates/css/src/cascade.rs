@@ -410,12 +410,10 @@ fn substitute_var_inner(
             } else {
                 None
             };
-            match resolved
-                .or_else(|| fallback.and_then(|f| substitute_var_inner(f, custom_props, resolving)))
-            {
-                Some(s) => out.push_str(&s),
-                None => return None,
-            }
+            let s = resolved.or_else(|| {
+                fallback.and_then(|f| substitute_var_inner(f, custom_props, resolving))
+            })?;
+            out.push_str(&s);
             i = close + 1;
         } else {
             // Found by fuzzing with multi-byte UTF-8 input: this used to
