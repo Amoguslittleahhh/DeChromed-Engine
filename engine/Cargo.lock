@@ -44,6 +44,7 @@ dependencies = [
  "dom",
  "html",
  "layout",
+ "paint",
  "serde",
  "serde_json",
  "xml",
@@ -89,6 +90,7 @@ version = "0.0.0"
 name = "paint"
 version = "0.0.0"
 dependencies = [
+ "dom",
  "layout",
 ]
 

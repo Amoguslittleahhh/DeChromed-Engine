@@ -9,3 +9,6 @@ workspace = true
 
 [dependencies]
 layout = { path = "../layout" }
+
+[dev-dependencies]
+dom = { path = "../dom" }

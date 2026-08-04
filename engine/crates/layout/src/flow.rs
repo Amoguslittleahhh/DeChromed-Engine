@@ -166,8 +166,16 @@ pub struct EdgeSizes {
 #[derive(Debug, Clone)]
 pub struct Fragment {
     pub node: Option<NodeId>,
-    /// Content-box position (in an abstract layout space whose origin is
-    /// the root box's border-box top-left corner) and size.
+    /// Content-box position and size, in a single shared coordinate space
+    /// whose origin is the root box's border-box top-left corner --
+    /// genuinely absolute, not relative to the immediate parent (`layout`
+    /// anchors the root there, and every formatting-context function
+    /// positions a child via `reposition`/`shift`, which moves that
+    /// child's *entire already-built subtree* together, so descendant
+    /// coordinates stay correct once an ancestor's final position is
+    /// known). `query.rs`'s `bounding_client_rect`/`element_from_point`
+    /// depend on this: they read `content_rect`/`border_box()` directly,
+    /// with no per-level offset accumulation needed.
     pub content_rect: Rect,
     pub margin: EdgeSizes,
     pub border: EdgeSizes,
@@ -242,14 +250,27 @@ pub fn layout(root: &LayoutBox, styles: &StyleMap, containing_width: f64) -> Fra
         None,
         values::default_font_size_px(),
     );
-    layout_box(
+    let mut fragment = layout_box(
         root,
         styles,
         containing_width,
         root_font_size,
         root_font_size_raw.as_deref(),
         root_font_size,
-    )
+    );
+    // Every non-root `Fragment` gets its final position from a
+    // `reposition()` call made by whichever formatting-context function
+    // placed it among its siblings -- the root itself has no such caller,
+    // so without this its own `content_rect` would sit at the coordinates
+    // `layout_box` constructs any container at by default (border-box
+    // origin (-padding.left, -padding.top), i.e. the content box floating
+    // at literal (0, 0) regardless of the root's own padding/border).
+    // Anchoring the root's *border* box at (0, 0) here instead makes
+    // "coordinate-space origin = root's border-box top-left" (this
+    // struct's own doc comment, and what `query.rs` assumes) actually
+    // true for every fragment in the tree, not just non-root ones.
+    reposition(&mut fragment, 0.0, 0.0);
+    fragment
 }
 
 /// Resolves `node`'s `font-size`, returning both the resolved pixel value
@@ -1756,14 +1777,15 @@ fn flatten_inline<'a>(
     }
 }
 
-/// Rough visual per-character width heuristic -- see module docs' "no
-/// real font shaping" known gap.
+/// B10: real per-character proportional widths (`crate::values::
+/// char_width_em`) -- see module docs' "no real font shaping" known gap
+/// for exactly what this still doesn't do.
 fn word_width(text: &str, font_size_px: f64) -> f64 {
-    text.chars().count() as f64 * font_size_px * 0.5
+    values::text_width_px(text, font_size_px)
 }
 
 fn space_width(font_size_px: f64) -> f64 {
-    font_size_px * 0.28
+    values::char_width_em(' ') * font_size_px
 }
 
 fn line_height_px(style: Option<&ComputedStyle>, font_size_px: f64, root_font_size_px: f64) -> f64 {
@@ -2792,11 +2814,12 @@ mod tests {
         );
         let tree = build_box_tree(&doc, &styles).unwrap();
         let fragment = layout(&tree, &styles, 100.0);
-        // "hi" is 2 chars -> 16px wide at the 16px default font size;
-        // LTR would place it at x=0, RTL mirrors it flush against the
-        // right edge: 100 - 16 = 84.
+        // "hi" is (0.5 + 0.28) em wide per B10's char-width table, at the
+        // 16px default font size; LTR would place it at x=0, RTL mirrors
+        // it flush against the right edge instead.
         let word = &fragment.children[0].children[0];
-        assert_eq!(word.content_rect.x, 84.0);
+        let expected_width = values::text_width_px("hi", 16.0);
+        assert_eq!(word.content_rect.x, 100.0 - expected_width);
     }
 
     #[test]

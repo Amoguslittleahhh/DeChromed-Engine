@@ -434,6 +434,47 @@ fn main() {
     }
     layout_report.print_summary();
 
+    // B9/B11: fuzz the display-list lowering + rasterizer the same way, on
+    // top of the same fuzzed HTML+CSS+width combinations already stressing
+    // layout above -- since `paint::build_display_list` and
+    // `paint::rasterize` both walk the resulting `Fragment` tree, this
+    // exercises them against a much wider range of fragment-tree shapes
+    // (deeply nested, zero-size, pathologically narrow) than the paint
+    // crate's own hand-written unit tests would ever construct.
+    let mut paint_report = Report::new("paint::build_display_list + rasterize");
+    for _ in 0..iterations {
+        let html_edits = 1 + rng.next_range(10);
+        let css_edits = 1 + rng.next_range(10);
+        let html_seed = HTML_SEEDS[rng.next_range(HTML_SEEDS.len())];
+        let css_seed = CSS_SEEDS[rng.next_range(CSS_SEEDS.len())];
+        let html_input = mutate(&mut rng, html_seed, HTML_ALPHABET, html_edits);
+        let css_input = mutate(&mut rng, css_seed, CSS_ALPHABET, css_edits);
+        let width = [0.0, 1.0, 60.0, 800.0][rng.next_range(4)];
+        let combined = format!("{html_input}\u{0}{css_input}\u{0}{width}");
+        paint_report.try_input(combined, |s| {
+            let mut parts = s.splitn(3, '\u{0}');
+            let html_part = parts.next().unwrap();
+            let css_part = parts.next().unwrap();
+            let width: f64 = parts.next().unwrap().parse().unwrap_or(800.0);
+            let doc = html::parse_document(html_part);
+            let sheet = css::parse_stylesheet(css_part);
+            let sources = [css::cascade::StyleSource {
+                origin: css::cascade::Origin::Author,
+                sheet: &sheet,
+            }];
+            let styles = css::cascade::compute_document_styles(&doc, &sources);
+            if let Some(tree) = layout::build_box_tree(&doc, &styles) {
+                let fragment = layout::layout(&tree, &styles, width);
+                let list = paint::build_display_list(&fragment, &styles);
+                let border_box = fragment.border_box();
+                let raster_width = border_box.width.max(0.0).round() as usize;
+                let raster_height = border_box.height.max(0.0).round() as usize;
+                let _ = paint::rasterize(&list, raster_width.min(2000), raster_height.min(2000));
+            }
+        });
+    }
+    paint_report.print_summary();
+
     let total_failures: usize = [
         &html_report,
         &css_report,
@@ -441,6 +482,7 @@ fn main() {
         &xml_report,
         &cascade_report,
         &layout_report,
+        &paint_report,
     ]
     .iter()
     .map(|r| r.failures.len())

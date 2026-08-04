@@ -28,8 +28,24 @@ mirroring. See `ROADMAP.md`'s B1-B8 entries for exactly what's real vs.
 a documented gap (`::before`/`::after` generated content, the several
 gaps that trace back to "no intrinsic sizing yet", B6's simplified
 containing-block resolution, and B8's complete absence of vertical
-writing modes/UAX #9 bidi are the biggest ones). `crates/shell/src/main.rs`
-runs the real pipeline end to end, including this layout stage.
+writing modes/UAX #9 bidi are the biggest ones).
+
+**B9 (fragment tree & display list), B10 (text shaping & fonts), and B11
+(painting & rasterization) are started too**, in a new `crates/paint`
+crate plus additions to `crates/layout`. `layout::query` implements real
+`getBoundingClientRect`/`elementFromPoint` equivalents by reading the
+fragment tree's already-absolute coordinates directly (B9); `paint::
+display_list` lowers that tree into a real `DisplayList` of draw commands,
+backed by a real CSS `<color>` parser (B9); `layout::values` adds a real
+proportional character-width table replacing the old flat per-character
+heuristic (B10, not real font shaping); and `paint::raster` is a real
+software rasterizer producing an actual RGBA8 pixel buffer with genuine
+scanline fill and Porter-Duff alpha compositing, for `FillRect` items only
+-- `DrawText` items are positioned/colored correctly but not yet painted,
+since no glyph data exists yet (B11). See `ROADMAP.md`'s B9-B11 entries
+for exactly what's real vs. a documented gap in each. `crates/shell/src/main.rs`
+runs the real pipeline end to end, including layout, fragment-tree
+queries, display-list lowering, and rasterization.
 
 The workspace targets Rust **edition 2024** (`engine/Cargo.toml`), using
 stable let-chains (`if let X = y && let A = b { ... }`) where they read
@@ -45,14 +61,14 @@ engine/
     html/                    A2 (tokenizer) + A3 (tree construction) + A8/A9 (SVG/MathML foreign content) -- all done
     css/                     A4-A7 (tokenizer/parser, selectors, cascade, CSSOM) -- all done
     xml/                     A10 (standalone XML 1.0 parser + namespace resolution) -- done; also A8's standalone-SVG-document entry point
-    layout/                  B1-B8 (box tree, block/inline layout, tables, flexbox, grid, positioning, multi-column, logical properties/RTL) -- started; B9 (fragment tree & display list) still a placeholder
-    paint/                   B10-B12 (text shaping, rasterization, compositing) -- currently placeholders
+    layout/                  B1-B8 (box tree, block/inline layout, tables, flexbox, grid, positioning, multi-column, logical properties/RTL) started; B9's query.rs (fragment-tree queries) + B10's char-width table also started
+    paint/                   B9 (display-list lowering + color parsing) and B11 (software rasterizer) started; B12 (compositing) still a placeholder
     js_bindings/              Track C -- placeholder, shape depends on "the JS engine question"
     net/                     D1-D3 (URL parsing, networking, resource loading) -- currently placeholders
     media/                   D5-D7 (images, audio/video, WebRTC) -- currently empty
     a11y/                    F2 (accessibility tree) -- currently placeholders
     devtools/                F1 (inspector protocol) -- currently placeholders
-    shell/                   binary crate; a real HTML->DOM->CSS->selector-match->cascade->getComputedStyle->incremental-restyle->foreign-content->XML->box-tree->layout pipeline smoke test (paint is still a placeholder)
+    shell/                   binary crate; a real HTML->DOM->CSS->selector-match->cascade->getComputedStyle->incremental-restyle->foreign-content->XML->box-tree->layout->fragment-tree-query->display-list->raster pipeline smoke test (text painting/B12 compositing still placeholders/gaps)
     html5lib_harness/        A2/A3/A8/A9's conformance harness (see below)
 ```
 
@@ -75,8 +91,9 @@ cargo test --workspace
 
 # Run the pipeline smoke test (html -> dom -> css -> selectors -> cascade
 # -> getComputedStyle -> incremental restyle -> SVG foreign content ->
-# standalone XML -> layout -> paint -- everything through A10 is real now;
-# layout/paint are still placeholders)
+# standalone XML -> layout -> fragment-tree queries -> display list ->
+# raster -- everything through A10 is real, B1-B9/B11 have real first
+# landings too; see ROADMAP.md for exactly what's still a documented gap)
 cargo run -p shell
 
 # Run the html5lib-tests tokenizer conformance harness
@@ -163,14 +180,17 @@ resolution/round-trip-serialization cases.
 
 `crates/html5lib_harness/src/bin/stress_test.rs` is a cross-crate,
 conformance-blind fuzzer for Track A (A1-A10) and now Track B's
-`layout::layout` too: it doesn't check parser *output* against an
-expected answer (that's the tokenizer/tree-construction harnesses above),
-only that `html::parse_document`, `css::parse_stylesheet`,
+`layout::layout` plus `paint::build_display_list`/`paint::rasterize` too:
+it doesn't check parser *output* against an expected answer (that's the
+tokenizer/tree-construction harnesses above), only that
+`html::parse_document`, `css::parse_stylesheet`,
 `css::selectors::parse_selector_list`, `xml::parse_document`, the
-cascade/computed-style pipeline, and now `layout::build_box_tree`/
-`layout::layout` (at several containing-block widths, including
-pathologically narrow/zero ones) all return *something* (or a graceful
-`Err`) instead of panicking, hanging, or aborting the process, across:
+cascade/computed-style pipeline, `layout::build_box_tree`/`layout::layout`
+(at several containing-block widths, including pathologically narrow/zero
+ones), and now the same fragment trees lowered through
+`paint::build_display_list` and rasterized via `paint::rasterize` all
+return *something* (or a graceful `Err`) instead of panicking, hanging, or
+aborting the process, across:
 
 - **Truncation fuzzing**: every prefix length of a handful of realistic
   seed documents -- a surprisingly effective way to hit boundary

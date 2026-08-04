@@ -768,34 +768,90 @@ instead with 2 self-authored unit tests (RTL inline-content mirroring,
 logical-margin-to-physical-side mapping in both directions) plus the
 shared stress-test fuzzer.
 
-### B9. Fragment tree & display list
-Replace any toy "list of boxes" with a real intermediate representation:
-a **fragment tree** (layout's actual output — positioned, sized boxes
-referencing their originating DOM/style nodes) lowered to a **display
-list** (paint's input — an ordered list of drawing commands: fill rect,
-draw text run, push clip, push transform). This is the real architectural
-seam that lets everything downstream (compositing, hit-testing, incremental
-layout, `getBoundingClientRect()`) work without re-deriving geometry ad hoc.
-**Exit:** hit-testing (`elementFromPoint`) and `getBoundingClientRect`
-implemented purely by querying the fragment tree; display list snapshot
-tests for a corpus of pages.
+### B9. Fragment tree & display list — *started (query utilities + display-list lowering; no snapshot-test corpus)*
+The fragment tree itself has been real since B1/B2 (`layout::Fragment` —
+positioned, sized boxes referencing their originating DOM/style nodes, in a
+single genuinely **absolute** coordinate space: `flow::layout()` anchors the
+root's border box at `(0, 0)`, and every formatting-context function
+positions a child via `reposition()`/`shift()`, which moves that child's
+*entire already-built subtree* together, so descendant coordinates stay
+correct once an ancestor is placed). This phase adds the two things that
+were still missing:
+- **Query utilities** (`layout::query`): `bounding_client_rect`/
+  `element_from_point` — the real `getBoundingClientRect()`/
+  `elementFromPoint()` equivalents — implemented purely by reading
+  `content_rect`/`border_box()` off the tree, with zero re-derivation of
+  geometry. `element_from_point` picks the deepest fragment under the point,
+  breaking ties between overlapping siblings by later-in-tree-order-wins —
+  an approximation of paint order, not a real stacking-context/`z-index`
+  model (that's still B6's own documented gap).
+- **Display-list lowering** (`paint::display_list::build_display_list`):
+  turns a `Fragment` tree into an ordered `DisplayList` of `FillRect`/
+  `DrawText` items, threading real `color` inheritance down through the walk
+  (the same top-down pattern `layout::flow` already uses for `font-size`).
+  Backed by a real (if modest) CSS `<color>` parser (`paint::color`): named
+  colors, `#rgb`/`#rrggbb`/`#rrggbbaa` hex, `rgb()`/`rgba()` functional
+  notation, `transparent`, with `currentcolor` deliberately left unresolved
+  so it naturally falls back to the inherited color.
 
-### B10. Text shaping & fonts
-Real shaping (a HarfBuzz binding or equivalent from-scratch shaper):
-ligatures, kerning, complex scripts (Arabic joining, Indic reordering),
-combined with the bidi algorithm from B8. Font matching/fallback chains,
-`@font-face` loading (WOFF2 parsing), variable fonts.
-**Exit:** WPT `css/css-text`, `css/css-fonts` ≥70%; visual diff tests
-against reference shaping output for a multilingual test corpus.
+**Known gaps:** only `background-color` (fill) and `color` (text) are read
+— no `border-color`/border painting, `background-image`, `box-shadow`,
+`opacity` compositing, or clipping (`overflow: hidden` isn't implemented
+anywhere yet), so there are no `PushClip`/`PushTransform` items yet either.
+**Exit not yet met** — no display-list snapshot-test corpus (would need a
+page corpus and a snapshot format); verified instead with 3 self-authored
+unit tests for `query.rs` (nested-offset accumulation across padding+margin,
+a node not present in the tree, deepest-fragment hit-testing), 3 for
+`display_list.rs` (background fill, transparent background emits nothing,
+text color inheritance), plus the shared stress-test fuzzer, which now also
+runs `paint::build_display_list` over every fuzzed fragment tree.
 
-### B11. Painting & rasterization
-Software rasterizer as the baseline (correctness first, matches how both
-engines actually bootstrap new platforms), then a GPU path (wgpu, given the
-Rust choice) mirroring what Skia (Blink) / WebRender (Gecko) do: batch draw
-calls, cache rasterized glyphs/tiles, avoid re-painting unchanged regions.
-**Exit:** pixel-diff reftests (WPT's reftest methodology) passing against a
-reference corpus within tolerance; a documented perf budget (ms per frame)
-on a fixed benchmark page set.
+### B10. Text shaping & fonts — *started (proportional character-width metrics only; no real shaping)*
+`layout::values::char_width_em`/`text_width_px` replace the previous flat
+`font_size_px * 0.5` per-character heuristic with a real, table-driven
+proportional-width approximation — narrow characters (`i`, `l`, punctuation)
+are genuinely narrower than wide ones (`m`, `w`, uppercase letters) now,
+loosely modeled on typical Latin-alphabet proportional-font ratios. Used by
+`layout::flow`'s inline line-breaking for real per-word/per-space widths
+instead of a uniform constant.
+
+**This is explicitly not real font shaping.** There's no glyph outline
+data, no kerning, no ligatures, no font-specific metrics, no complex-script
+support (Arabic joining, Indic reordering), no font matching/fallback
+chains, no `@font-face`/WOFF2 loading, no variable fonts, and no bidi
+integration (B8's own gap) — every number this produces is still a rough
+visual approximation of *some* common sans-serif font, not a pixel-accurate
+measurement of any real one.
+**Exit not yet met** (WPT `css/css-text`/`css/css-fonts` need a JS engine
+to run anyway, and there's no real shaper to visual-diff against a
+reference corpus) — verified instead with 2 self-authored unit tests
+(character widths are genuinely proportional; text width sums real
+per-character widths) plus the shared stress-test fuzzer.
+
+### B11. Painting & rasterization — *started (software rasterizer, FillRect only; no GPU path)*
+`paint::raster`: a real software rasterizer — the same baseline both Blink
+(Skia) and Gecko (WebRender) also bootstrap new platforms from before
+adding a GPU path. Turns a `DisplayList` into a real RGBA8 pixel buffer
+(`Canvas`), with genuine scanline rectangle fill and Porter-Duff "source-
+over" alpha compositing (real per-channel blend math, not a stand-in) —
+the pixels this module produces are pixel-accurate for what it draws.
+
+**What it draws:** `DisplayItem::FillRect` only. `DisplayItem::DrawText`
+items are correctly positioned and colored by B9's display-list lowering,
+but the rasterizer doesn't paint them — there's no font outline data or
+embedded bitmap glyph atlas yet (B10 only improved *measurement*, not
+shaping/rendering), so drawing placeholder glyph shapes would overclaim
+what's implemented; text regions are simply left unpainted, a documented
+gap rather than a faked rendering.
+**Known gaps:** no anti-aliasing (hard pixel-boundary edges), no clipping,
+no GPU path (wgpu-based, mirroring Skia/WebRender's batching and tile/glyph
+caching, is still entirely future work).
+**Exit not yet met** (no pixel-diff reftest corpus, no perf budget) —
+verified instead with 4 self-authored unit tests (exact-pixel opaque fill,
+alpha-blended fill against the white background, an off-canvas rect that
+doesn't panic, confirming `DrawText` items are left unrasterized) plus the
+shared stress-test fuzzer, which now also runs `paint::rasterize` over
+every fuzzed display list.
 
 ### B12. Compositing
 Layer promotion (`transform`/`opacity`/`will-change`), a compositor thread
@@ -1459,6 +1515,27 @@ shaping) exists to actually measure content -- B6's real containing-block
 resolution (needs ancestor position-type tracking threaded through the
 layout recursion), and B8's vertical-writing-mode axis-agnostic rewrite
 (a genuinely large undertaking, deferred rather than half-built or
-faked). **B9 (fragment tree & display list)** is the natural next Track
-B phase, tying everything above together with B10-B12's eventual paint
-pipeline.
+faked).
+
+**B9 (fragment tree & display list), B10 (text shaping & fonts), and B11
+(painting & rasterization) are now all started too**, in a new
+`engine/crates/paint` crate plus additions to `layout`. `layout::query`
+adds real `getBoundingClientRect`/`elementFromPoint` equivalents that read
+the fragment tree directly (B9), which first required fixing a real,
+previously-latent bug: `flow::layout()` never anchored the *root*
+fragment's own position, so a root element's own padding/border never got
+folded into its or its descendants' coordinates — fixed by repositioning
+the root at absolute `(0, 0)` before returning it, making the tree's
+existing "single shared absolute coordinate space" design (already true
+for every non-root fragment since B1/B2) actually hold for the whole tree.
+`paint::display_list` lowers that fragment tree into a real `DisplayList`
+(B9's other half), backed by a real CSS `<color>` parser. `layout::values`
+adds a real proportional character-width table, replacing the old flat
+per-character heuristic (B10, explicitly not real shaping — see its entry
+above). `paint::raster` is a real software rasterizer producing an actual
+RGBA8 `Canvas` with genuine scanline fill and Porter-Duff alpha
+compositing, for `FillRect` items only — `DrawText` items are positioned/
+colored correctly but not yet painted, since no glyph data exists (B11).
+See each phase's own entry above for exactly what's real and what's a
+documented gap. **B12 (compositing)** is the natural next Track B phase,
+building on B9's display list and B11's rasterizer.

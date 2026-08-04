@@ -1,13 +1,15 @@
-//! Roadmap phase: Track B10 (text shaping/fonts) through B12 (compositing).
-//! Placeholder until B9's fragment tree exists to lower into a display list.
+//! B9's display-list half (`display_list.rs`) and a real `<color>`
+//! parser (`color.rs`) are started here. B10 (text shaping/fonts) is
+//! started too -- see `layout::values`' character-width table. B11
+//! (rasterization, `raster.rs`) covers solid-rectangle painting into a
+//! real pixel buffer; text painting is still a placeholder there (no
+//! glyph outlines exist yet -- see its own module docs). B12
+//! (compositing) hasn't started.
 
-use layout::Fragment;
+pub mod color;
+pub mod display_list;
+pub mod raster;
 
-/// Placeholder for the ordered list of drawing commands paint consumes:
-/// fill rect, draw text run, push clip, push transform (see ROADMAP.md B9).
-#[derive(Debug, Default)]
-pub struct DisplayList;
-
-pub fn build_display_list(_fragment: &Fragment) -> DisplayList {
-    DisplayList
-}
+pub use color::Color;
+pub use display_list::{DisplayItem, DisplayList, build_display_list};
+pub use raster::{Canvas, rasterize};

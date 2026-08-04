@@ -4,11 +4,14 @@
 //! document, parsing a real stylesheet, matching a real selector,
 //! cascading/computing real styles, incrementally restyling after a
 //! targeted DOM mutation, parsing inline SVG via foreign content (A8/A9),
-//! and parsing a standalone XML document (A10). B1/B2 (box tree + block/
-//! inline layout) are real now too, run below against a fixed 800px
-//! containing-block width (there's no window/viewport concept yet --
-//! see `layout`'s own module docs for what B1/B2 do and don't cover).
-//! Paint (B10+) is still a placeholder.
+//! and parsing a standalone XML document (A10). B1-B9 (box tree through
+//! fragment-tree queries + display list) are real now too, run below
+//! against a fixed 800px containing-block width (there's no window/
+//! viewport concept yet -- see `layout`'s own module docs for what's
+//! real and what's a documented gap in each phase). B11's software
+//! rasterizer paints the display list's `FillRect` items into a real
+//! pixel buffer (text painting is a documented B11 gap -- no glyph
+//! outlines exist yet).
 
 use css::cascade::Origin;
 use css::cssom::CssomSheet;
@@ -40,7 +43,16 @@ fn main() {
     // second (unrelated) rule that only kicks in once a class is added,
     // then prove the restyle after that mutation is targeted, not a
     // full-document recompute.
-    let sheet = CssomSheet::parse("p.greeting { color: red; } p.warn { color: orange; }");
+    // `display: block` on html/body/p below isn't a browser default this
+    // engine ships (there's no UA stylesheet yet -- a documented Track A6
+    // gap) -- spelling it out explicitly here is what lets B1-B9's demo
+    // below show a normal box tree instead of collapsing everything into
+    // one degenerate inline formatting context, exactly like this
+    // project's own `layout` unit tests already have to do for the same
+    // reason.
+    let sheet = CssomSheet::parse(
+        "html, body, p { display: block; } p.greeting { color: red; background-color: #ffd; } p.warn { color: orange; }",
+    );
     let mut engine = StyleEngine::new(&document, vec![(Origin::Author, sheet)]);
     let p = find_first(&document, "p");
     println!(
@@ -78,7 +90,30 @@ fn main() {
             "layout: <html> border-box = {}x{} at ({}, {})",
             border_box.width, border_box.height, border_box.x, border_box.y
         );
-        let _display_list = paint::build_display_list(&fragment);
+
+        // B9: query the fragment tree directly, no re-derived geometry.
+        if let Some(rect) = layout::bounding_client_rect(&fragment, p) {
+            println!(
+                "getBoundingClientRect(p) = {}x{} at ({}, {})",
+                rect.width, rect.height, rect.x, rect.y
+            );
+        }
+        let center_x = border_box.x + border_box.width / 2.0;
+        let center_y = border_box.y + border_box.height / 2.0;
+        let hit = layout::element_from_point(&fragment, center_x, center_y);
+        println!("elementFromPoint(<html>'s center) = {hit:?}");
+
+        // B9/B11: lower to a real display list, then rasterize it into a
+        // real RGBA pixel buffer (see `paint`'s own module docs for what
+        // B11's rasterizer does and doesn't paint yet).
+        let display_list = paint::build_display_list(&fragment, &styles);
+        println!("display list: {} item(s)", display_list.items.len());
+        let canvas = paint::rasterize(
+            &display_list,
+            border_box.width as usize,
+            border_box.height as usize,
+        );
+        println!("rasterized canvas: {}x{} px", canvas.width, canvas.height);
     }
 
     // A8/A9: inline <svg> inside HTML reaches real foreign content --
@@ -95,7 +130,9 @@ fn main() {
         .expect("well-formed XML");
     println!("standalone XML document:\n{}", xml::serialize(&xml_doc));
 
-    println!("(paint stage ran but is still a placeholder -- see ROADMAP.md Track B)");
+    println!(
+        "(text painting in B11's rasterizer is still a documented gap -- see ROADMAP.md Track B)"
+    );
 }
 
 fn find_first(document: &dom::Document, tag: &str) -> dom::NodeId {

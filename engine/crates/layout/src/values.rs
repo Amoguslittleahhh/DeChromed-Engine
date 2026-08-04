@@ -114,6 +114,34 @@ pub fn resolve_font_size_px(value: &str, parent_font_size_px: f64, root_font_siz
     }
 }
 
+/// B10: a real, table-driven proportional character-width approximation
+/// -- narrow characters (`i`, `l`, punctuation) really are narrower than
+/// wide ones (`m`, `w`, uppercase letters) here, unlike a single flat
+/// per-character constant. This is **not** real font shaping: there's no
+/// glyph outline data, no kerning, no ligatures, no font-specific
+/// metrics, no complex-script support (Arabic joining, Indic reordering),
+/// and no bidi integration (B8's own gap) -- every number this produces
+/// is still a rough visual approximation of *some* common proportional
+/// sans-serif font, not a pixel-accurate measurement of any real one.
+/// Values are expressed as a fraction of the font size (`em`), loosely
+/// modeled on typical Latin-alphabet proportional-font ratios.
+pub fn char_width_em(c: char) -> f64 {
+    match c {
+        'i' | 'l' | 'j' | '\'' | '.' | ',' | ':' | ';' | '!' | '|' | 'I' => 0.28,
+        'f' | 't' | 'r' | '(' | ')' | '[' | ']' | '"' | '/' | '\\' => 0.35,
+        'm' | 'w' | 'M' | 'W' | '@' | '%' => 0.85,
+        c if c.is_ascii_uppercase() => 0.68,
+        c if c.is_ascii_digit() => 0.55,
+        ' ' => 0.28,
+        _ => 0.5,
+    }
+}
+
+/// Sums [`char_width_em`] over `text`, scaled to `font_size_px`.
+pub fn text_width_px(text: &str, font_size_px: f64) -> f64 {
+    text.chars().map(|c| char_width_em(c) * font_size_px).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +191,21 @@ mod tests {
         assert_eq!(parse_border_width_px("medium", 16.0, 16.0), 3.0);
         assert_eq!(parse_border_width_px("thick", 16.0, 16.0), 5.0);
         assert_eq!(parse_border_width_px("7px", 16.0, 16.0), 7.0);
+    }
+
+    #[test]
+    fn character_widths_are_genuinely_proportional() {
+        // Narrow characters are narrower than wide ones, and both differ
+        // from the "average" fallback -- not a flat constant.
+        assert!(char_width_em('i') < char_width_em('x'));
+        assert!(char_width_em('x') < char_width_em('m'));
+        assert!(char_width_em('m') > 0.5);
+        assert!(char_width_em('i') < 0.5);
+    }
+
+    #[test]
+    fn text_width_sums_real_per_character_widths() {
+        let expected = (char_width_em('m') + char_width_em('i')) * 16.0;
+        assert_eq!(text_width_px("mi", 16.0), expected);
     }
 }
