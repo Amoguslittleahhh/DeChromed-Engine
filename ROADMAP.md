@@ -575,17 +575,73 @@ across 50,000+ iterations on two seeds.
 → style → box tree → layout) against a fixed 800px containing-block
 width in place of the old placeholder call.
 
-### B3. Table layout
-CSS 2 table layout algorithm (distinct model from block/inline): row/column
-sizing passes, `border-collapse`, spanning cells, `<table>` HTML-vs-CSS
-interaction quirks.
-**Exit:** WPT `css/CSS2/tables` ≥75%.
+### B3. Table layout — *started*
+A real, deliberately simplified table layout in `engine/crates/layout`:
+`display: table`/`table-row`/`table-cell` get a genuine box structure
+(`box_tree.rs`'s `BoxKind::Table`/`TableRow`/`TableCell`), with row-groups
+(`<thead>`/`<tbody>`/`<tfoot>`, or any `display: table-row-group`/
+`-header-group`/`-footer-group`) transparently spliced into the table's
+own row list rather than getting a box of their own. `layout_table`
+(`flow.rs`) determines column count and per-column widths (single-colspan
+cells with an explicit `width` hint their column; the rest of the
+available width splits evenly among unhinted columns), then lays out
+every row's cells at their spanned column width (real `colspan` support:
+a spanning cell's content width is the sum of the columns it spans) and
+stacks rows top-to-bottom.
 
-### B4. Flexbox
-[CSS Flexible Box Layout](https://www.w3.org/TR/css-flexbox-1/) in full:
-main/cross axis resolution, flex-basis/grow/shrink distribution algorithm,
-wrapping, alignment (`justify-content`/`align-items`/`align-self`).
-**Exit:** WPT `css/css-flexbox` ≥80%.
+Known gaps, documented in both modules' own docs: this is a simplified
+column-sizing heuristic, not CSS2.1's real automatic-table-layout
+algorithm (no min/max-content sizing pass — that needs intrinsic sizing
+this project doesn't have yet); `rowspan` isn't implemented at all (every
+cell behaves as `rowspan="1"`); `<caption>` and table columns
+(`<col>`/`<colgroup>`) aren't handled; `border-collapse`/`border-spacing`
+aren't in `css::cascade`'s property table yet, so cells always lay out
+flush together regardless of what a stylesheet declares for either;
+non-row/non-cell stray content is dropped rather than wrapped via
+CSS2.1's full "anonymous table object" generation algorithm.
+**Exit not yet met** (no min/max-content sizing, `rowspan`, or
+`border-collapse`/`-spacing`) — WPT `css/CSS2/tables` needs a JS engine to
+run anyway (Track C); verified instead with 3 self-authored unit tests
+(equal column-width splitting, explicit-width column hinting, `colspan`
+spanning + row stacking) plus the shared stress-test fuzzer (a
+table+flex-mixing HTML seed, 0 distinct failures across 50,000+
+iterations on two seeds).
+
+### B4. Flexbox — *started*
+Real (if scoped) [CSS Flexible Box Layout](https://www.w3.org/TR/css-flexbox-1/)
+in `layout::flow::layout_flex_container`: a single implementation works
+in abstract main/cross-axis terms for both `flex-direction: row` and
+`column`, covering `flex-basis`/`flex-grow`/`flex-shrink` (the real
+CSS Flexible Box §9.7 weighted distribution — positive free space by
+`flex-grow` weight, overflow by `flex-shrink × basis` weight),
+`justify-content` (`flex-start`/`flex-end`/`center`/`space-between`/
+`space-around`), `align-items`/`align-self` (`flex-start`/`flex-end`/
+`center`/`stretch`, with `normal`/`auto` correctly resolving to `stretch`
+per spec), `row-reverse`/`column-reverse`, and `flex-wrap` (multi-line).
+B1's `box_tree.rs` "blockifies" every direct child of a flex container
+into a real flex item, unconditionally wrapping stray inline-level
+content into an anonymous item (unlike an ordinary block box's
+conditional anonymous-block wrapping). `css::cascade::PROPERTY_TABLE`
+gained the flexbox longhands (`flex-direction`/`flex-wrap`/`flex-grow`/
+`flex-shrink`/`flex-basis`/`justify-content`/`align-items`/`align-self`/
+`align-content`) so real stylesheet declarations actually reach this code,
+not just hand-built test styles.
+
+Known gaps, documented in the module's own doc comments: `flex-wrap` and
+cross-axis `stretch` are only implemented for row direction (column
+direction is always single-line, and its cross axis — width — never
+stretches, since that would need a second content-reflow pass at a new
+width, which this phase doesn't perform); shrunk items clamp at a `0`
+floor rather than a real min-content size (no intrinsic sizing, the same
+gap B2 already documents); `order`, `gap`/`row-gap`/`column-gap`, and
+multi-line `align-content` spacing aren't implemented (`align-content`
+packs lines tightly with no extra distribution).
+**Exit not yet met** (row-only wrap/stretch, no `order`/`gap`) — WPT
+`css/css-flexbox` needs a JS engine to run anyway (Track C); verified
+instead with 7 self-authored unit tests (grow/shrink weighted
+distribution, `justify-content: center`, `flex-wrap` line-breaking,
+`flex-direction: column` stacking plus auto-height sizing, `align-items:
+stretch`) plus the shared stress-test fuzzer.
 
 ### B5. Grid
 [CSS Grid Layout](https://www.w3.org/TR/css-grid-1/): track sizing
@@ -1277,16 +1333,23 @@ That's "renders a real static webpage correctly"'s content-and-style half
 (layout) only needs a styled tree, which has existed since A6 and is now
 more complete with A8/A9's namespace-aware elements included.
 
-**B1 (box tree generation) and B2 (block & inline formatting contexts) are
-now started** in the new `engine/crates/layout` crate -- see their entries
-above for exactly what's real (display computation, anonymous-box
-wrapping, list markers, real box-model geometry, margin collapsing, line-
-breaking, float/clear) and what's still a documented gap (`::before`/
-`::after`, real table/flex/grid box types, font-shaping-accurate text
-metrics, shrink-to-fit sizing, float-aware line narrowing). Remaining
-work to fully close out B1/B2: pseudo-element matching in `css::cascade`
-(needed for generated content), and the float/line-narrowing refinement.
-B3 (tables) through B9 (fragment tree & display list) are the natural
-next steps after that -- B10 (text shaping) in particular is worth
-pulling forward opportunistically whenever B2's flat per-character text
-metric heuristic becomes the limiting factor on visual accuracy.
+**B1 (box tree generation), B2 (block & inline formatting contexts), B3
+(table layout), and B4 (flexbox) are now started** in the new
+`engine/crates/layout` crate -- see their entries above for exactly
+what's real (display computation, anonymous-box wrapping, list markers,
+real box-model geometry, margin collapsing, line-breaking, float/clear,
+table row/column/colspan layout, flexbox's grow/shrink/wrap/justify/
+align algorithms) and what's still a documented gap (`::before`/
+`::after`, real grid box types, font-shaping-accurate text metrics,
+shrink-to-fit/intrinsic sizing, float-aware line narrowing, table
+`rowspan`/`border-collapse`/`border-spacing`, flex `order`/`gap`/
+column-direction wrap-and-stretch). Remaining work to fully close out
+B1-B4: pseudo-element matching in `css::cascade` (needed for generated
+content), the float/line-narrowing refinement, and the several
+intrinsic-sizing-dependent gaps that recur across B2-B4 (auto-width
+shrink-to-fit, flex's min-content shrink floor, table's min/max-content
+column sizing) -- worth tackling together once B10 (text shaping) exists
+to actually measure content, rather than three separate partial fixes.
+**B5 (grid)** is the natural next Track B phase; B6-B9 (positioning,
+fragmentation, writing modes, fragment tree & display list) follow after
+that.

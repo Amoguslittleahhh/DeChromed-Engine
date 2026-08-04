@@ -1,11 +1,12 @@
 //! B2: block & inline formatting contexts -- turning a box tree (B1) into
-//! a fragment tree of positioned, sized boxes.
+//! a fragment tree of positioned, sized boxes. Also B3 (table layout,
+//! [`layout_table`]) and B4 (flexbox, [`layout_flex_container`]).
 //!
 //! Reference: <https://www.w3.org/TR/CSS22/visuren.html#normal-flow>,
 //! <https://www.w3.org/TR/CSS22/box.html#box-dimensions>,
 //! <https://www.w3.org/TR/CSS22/visudet.html> (width/height resolution),
 //! <https://www.w3.org/TR/CSS22/box.html#collapsing-margins> (margin
-//! collapsing).
+//! collapsing), <https://www.w3.org/TR/css-flexbox-1/> (B4).
 //!
 //! ## What's real here
 //! - Full box-model geometry: margin/border/padding/content-box widths
@@ -55,6 +56,21 @@
 //! - Vertical text layout ignores baseline alignment across mixed font
 //!   sizes on one line -- a line's height is simply the max resolved
 //!   line-height among its items, and everything is top-aligned within it.
+//! - **B3 table layout is simplified** (no min/max-content sizing pass,
+//!   no `rowspan`, no `border-spacing`) -- see `box_tree.rs`'s module
+//!   docs for the full list, and [`layout_table`]'s own doc comment for
+//!   the column-width algorithm actually used.
+//! - **B4 flexbox is real but scoped**: `flex-wrap` and cross-axis
+//!   `stretch` are only implemented for `flex-direction: row` (`column`
+//!   direction is always single-line, and its cross axis -- width --
+//!   never stretches, since that would need a second content-reflow pass
+//!   this phase doesn't perform); `flex-grow`/`flex-shrink` distribution
+//!   is the real weighted algorithm but clamps shrunk items at a `0`
+//!   floor rather than a real min-content size (no intrinsic sizing,
+//!   same gap as above); `order`, `gap`/`row-gap`/`column-gap`, and
+//!   multi-line `align-content` spacing aren't implemented. See
+//!   [`layout_flex_container`]'s own doc comment for the axis-agnostic
+//!   approach the algorithm takes.
 
 use crate::box_tree::{BoxKind, BoxLevel, ComputedStyle, LayoutBox, StyleMap};
 use crate::values::{self, LengthPercentageAuto};
@@ -351,6 +367,122 @@ fn layout_box(
                 text: None,
             }
         }
+        BoxKind::FlexContainer(items) => {
+            let (child_fragments, content_height) = layout_flex_container(
+                items,
+                styles,
+                style,
+                model.content_width,
+                font_size_px,
+                font_size_raw.as_deref(),
+                root_font_size_px,
+            );
+            let explicit_height = values::parse_length_percentage_auto(
+                get(style, "height", "auto"),
+                font_size_px,
+                root_font_size_px,
+            );
+            let height = match explicit_height {
+                LengthPercentageAuto::Length(px) => px,
+                LengthPercentageAuto::Percentage(_) | LengthPercentageAuto::Auto => content_height,
+            };
+            Fragment {
+                node: b.node,
+                content_rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: model.content_width,
+                    height,
+                },
+                margin: model.margin,
+                border: model.border,
+                padding: model.padding,
+                children: child_fragments,
+                text: None,
+            }
+        }
+        BoxKind::Table(rows) => {
+            let (child_fragments, content_height) = layout_table(
+                rows,
+                styles,
+                model.content_width,
+                font_size_px,
+                font_size_raw.as_deref(),
+                root_font_size_px,
+            );
+            let explicit_height = values::parse_length_percentage_auto(
+                get(style, "height", "auto"),
+                font_size_px,
+                root_font_size_px,
+            );
+            let height = match explicit_height {
+                LengthPercentageAuto::Length(px) => px,
+                LengthPercentageAuto::Percentage(_) | LengthPercentageAuto::Auto => content_height,
+            };
+            Fragment {
+                node: b.node,
+                content_rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: model.content_width,
+                    height,
+                },
+                margin: model.margin,
+                border: model.border,
+                padding: model.padding,
+                children: child_fragments,
+                text: None,
+            }
+        }
+        BoxKind::TableCell { children, .. } => {
+            let is_bfc = children.iter().any(|c| c.level == BoxLevel::Block);
+            let (child_fragments, content_height) = if is_bfc {
+                layout_block_children(
+                    children,
+                    styles,
+                    model.content_width,
+                    font_size_px,
+                    font_size_raw.as_deref(),
+                    root_font_size_px,
+                )
+            } else {
+                layout_inline_children(
+                    children,
+                    styles,
+                    model.content_width,
+                    font_size_px,
+                    font_size_raw.as_deref(),
+                    root_font_size_px,
+                    b.node,
+                )
+            };
+            let explicit_height = values::parse_length_percentage_auto(
+                get(style, "height", "auto"),
+                font_size_px,
+                root_font_size_px,
+            );
+            let height = match explicit_height {
+                LengthPercentageAuto::Length(px) => px,
+                LengthPercentageAuto::Percentage(_) | LengthPercentageAuto::Auto => content_height,
+            };
+            Fragment {
+                node: b.node,
+                content_rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: model.content_width,
+                    height,
+                },
+                margin: model.margin,
+                border: model.border,
+                padding: model.padding,
+                children: child_fragments,
+                text: None,
+            }
+        }
+        BoxKind::TableRow(_) => {
+            unreachable!("TableRow is only laid out from within layout_table")
+        }
     }
 }
 
@@ -441,6 +573,522 @@ fn layout_block_children(
     (out, cursor_y)
 }
 
+/// B3: a simplified CSS2.1 table layout -- see module docs for exactly
+/// what's cut relative to the real automatic-table-layout algorithm (no
+/// min/max-content sizing pass, no `rowspan`, no `border-spacing`).
+/// Column count and per-column widths are determined first (single-
+/// colspan cells with an explicit `width` hint their column; the rest of
+/// the width splits evenly among unhinted columns), then every row's
+/// cells are laid out at their spanned column width and stacked
+/// top-to-bottom.
+fn layout_table(
+    rows: &[LayoutBox],
+    styles: &StyleMap,
+    content_width: f64,
+    font_size_px: f64,
+    font_size_raw: Option<&str>,
+    root_font_size_px: f64,
+) -> (Vec<Fragment>, f64) {
+    let mut column_count = 0usize;
+    let mut column_hint: Vec<Option<f64>> = Vec::new();
+    for row in rows {
+        let BoxKind::TableRow(cells) = &row.kind else {
+            continue;
+        };
+        let mut col = 0usize;
+        for cell in cells {
+            let BoxKind::TableCell { colspan, .. } = &cell.kind else {
+                continue;
+            };
+            if column_hint.len() < col + colspan {
+                column_hint.resize(col + colspan, None);
+            }
+            if *colspan == 1 {
+                let cell_style = cell.node.and_then(|n| styles.get(&n));
+                if let LengthPercentageAuto::Length(px) = values::parse_length_percentage_auto(
+                    get(cell_style, "width", "auto"),
+                    font_size_px,
+                    root_font_size_px,
+                ) {
+                    column_hint[col] =
+                        Some(column_hint[col].map_or(px, |existing| existing.max(px)));
+                }
+            }
+            col += colspan;
+        }
+        column_count = column_count.max(col);
+    }
+    if column_count == 0 {
+        return (Vec::new(), 0.0);
+    }
+
+    let hinted_total: f64 = column_hint.iter().flatten().sum();
+    let unhinted_count = column_count - column_hint.iter().filter(|h| h.is_some()).count();
+    let remaining = (content_width - hinted_total).max(0.0);
+    let share = if unhinted_count > 0 {
+        remaining / unhinted_count as f64
+    } else {
+        0.0
+    };
+    let mut column_widths = vec![0.0; column_count];
+    for (i, width) in column_widths.iter_mut().enumerate() {
+        *width = column_hint.get(i).copied().flatten().unwrap_or(share);
+    }
+    let mut column_x = vec![0.0; column_count + 1];
+    for i in 0..column_count {
+        column_x[i + 1] = column_x[i] + column_widths[i];
+    }
+
+    let mut row_fragments = Vec::new();
+    let mut cursor_y = 0.0;
+    for row in rows {
+        let BoxKind::TableRow(cells) = &row.kind else {
+            continue;
+        };
+        let mut col = 0usize;
+        let mut cell_fragments = Vec::new();
+        let mut row_height = 0.0f64;
+        for cell in cells {
+            let BoxKind::TableCell { colspan, .. } = &cell.kind else {
+                continue;
+            };
+            let span_end = (col + colspan).min(column_count);
+            let cell_width = (column_x[span_end] - column_x[col]).max(0.0);
+            let mut fragment = layout_box(
+                cell,
+                styles,
+                cell_width,
+                font_size_px,
+                font_size_raw,
+                root_font_size_px,
+            );
+            reposition(&mut fragment, column_x[col], 0.0);
+            row_height = row_height.max(fragment.border_box().height);
+            cell_fragments.push(fragment);
+            col += colspan;
+        }
+        let mut row_fragment = Fragment {
+            node: row.node,
+            content_rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: content_width,
+                height: row_height,
+            },
+            margin: EdgeSizes::default(),
+            border: EdgeSizes::default(),
+            padding: EdgeSizes::default(),
+            children: cell_fragments,
+            text: None,
+        };
+        reposition(&mut row_fragment, 0.0, cursor_y);
+        cursor_y += row_height;
+        row_fragments.push(row_fragment);
+    }
+    (row_fragments, cursor_y)
+}
+
+/// B4: [CSS Flexible Box Layout](https://www.w3.org/TR/css-flexbox-1/),
+/// real but scoped -- see module docs for exactly what's cut. Works in
+/// abstract main/cross axis terms throughout (`column` selects which of
+/// width/height is "main"), so the same code handles `flex-direction:
+/// row`/`column`; only wrapping and cross-axis stretch are restricted to
+/// row direction, both documented below and in the module docs.
+fn layout_flex_container(
+    items: &[LayoutBox],
+    styles: &StyleMap,
+    container_style: Option<&ComputedStyle>,
+    content_width: f64,
+    font_size_px: f64,
+    font_size_raw: Option<&str>,
+    root_font_size_px: f64,
+) -> (Vec<Fragment>, f64) {
+    let direction = get(container_style, "flex-direction", "row");
+    let column = direction == "column" || direction == "column-reverse";
+    let reverse = direction == "row-reverse" || direction == "column-reverse";
+    // Wrap and cross-axis stretch are only implemented for row direction:
+    // row direction's main axis (width) is always a known/bounded size,
+    // so "does the next item still fit on this line" is well-defined and
+    // stretch (a height override) doesn't require re-flowing content.
+    // Column direction's main axis (height) is usually auto/unbounded
+    // (no line-break point) and its cross axis (width) *would* need
+    // content to re-flow at a new width to really stretch -- both
+    // deferred, see module docs.
+    let wraps = !column && get(container_style, "flex-wrap", "nowrap") != "nowrap";
+    let justify = get(container_style, "justify-content", "normal");
+    let align_items_default = get(container_style, "align-items", "normal");
+    let main_bound: Option<f64> = if column { None } else { Some(content_width) };
+
+    struct Item<'a> {
+        b: &'a LayoutBox,
+        margin: EdgeSizes,
+        border: EdgeSizes,
+        padding: EdgeSizes,
+        natural_cross_content: f64, // ordinary (non-flex) resolution along the CROSS axis, reused as-is for column direction's width
+        basis: f64,
+        grow: f64,
+        shrink: f64,
+        align_self: String,
+        cross_auto: bool,
+    }
+
+    let prepared: Vec<Item> = items
+        .iter()
+        .map(|b| {
+            let style = b.node.and_then(|n| styles.get(&n));
+            let model = resolve_box_model(style, content_width, font_size_px, root_font_size_px);
+            let basis = resolve_flex_basis(
+                style,
+                column,
+                content_width,
+                font_size_px,
+                root_font_size_px,
+            )
+            .unwrap_or(0.0);
+            let grow = get(style, "flex-grow", "0")
+                .parse::<f64>()
+                .unwrap_or(0.0)
+                .max(0.0);
+            let shrink = get(style, "flex-shrink", "1")
+                .parse::<f64>()
+                .unwrap_or(1.0)
+                .max(0.0);
+            let align_self_raw = get(style, "align-self", "auto");
+            let align_self = if align_self_raw == "auto" {
+                align_items_default.to_string()
+            } else {
+                align_self_raw.to_string()
+            };
+            let cross_prop = if column { "width" } else { "height" };
+            let cross_auto = get(style, cross_prop, "auto") == "auto";
+            Item {
+                b,
+                margin: model.margin,
+                border: model.border,
+                padding: model.padding,
+                natural_cross_content: model.content_width,
+                basis,
+                grow,
+                shrink,
+                align_self,
+                cross_auto,
+            }
+        })
+        .collect();
+
+    let main_extra = |it: &Item| -> f64 {
+        if column {
+            it.margin.top
+                + it.margin.bottom
+                + it.border.top
+                + it.border.bottom
+                + it.padding.top
+                + it.padding.bottom
+        } else {
+            it.margin.left
+                + it.margin.right
+                + it.border.left
+                + it.border.right
+                + it.padding.left
+                + it.padding.right
+        }
+    };
+
+    let order: Vec<usize> = if reverse {
+        (0..prepared.len()).rev().collect()
+    } else {
+        (0..prepared.len()).collect()
+    };
+
+    // Line-breaking: greedily accumulate items until the next one would
+    // overflow `main_bound` (row direction only -- `wraps` is false for
+    // column, so this is always a single line there).
+    let mut lines: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut line_main_sum: Vec<f64> = vec![0.0];
+    for &idx in &order {
+        let outer = prepared[idx].basis + main_extra(&prepared[idx]);
+        let cur = lines.len() - 1;
+        if wraps
+            && line_main_sum[cur] > 0.0
+            && line_main_sum[cur] + outer > main_bound.unwrap_or(f64::INFINITY)
+        {
+            lines.push(Vec::new());
+            line_main_sum.push(0.0);
+        }
+        let cur = lines.len() - 1;
+        line_main_sum[cur] += outer;
+        lines[cur].push(idx);
+    }
+
+    // Flex-grow/shrink: real CSS Flexible Box §9.7 distribution, per
+    // line -- positive free space distributes by `flex-grow` weight,
+    // negative free space (overflow) distributes by `flex-shrink *
+    // basis` weight, clamped at a 0 floor (a real UA clamps at the
+    // item's min-content size instead, which needs intrinsic sizing this
+    // project doesn't have yet -- documented gap).
+    let mut final_main = vec![0.0; prepared.len()];
+    for line in &lines {
+        let sum_outer: f64 = line
+            .iter()
+            .map(|&i| prepared[i].basis + main_extra(&prepared[i]))
+            .sum();
+        let bound = main_bound.unwrap_or(sum_outer);
+        let free = bound - sum_outer;
+        let sum_grow: f64 = line.iter().map(|&i| prepared[i].grow).sum();
+        let sum_shrink_basis: f64 = line
+            .iter()
+            .map(|&i| prepared[i].shrink * prepared[i].basis)
+            .sum();
+        for &i in line {
+            let it = &prepared[i];
+            final_main[i] = if free > 0.0 && sum_grow > 0.0 {
+                it.basis + free * (it.grow / sum_grow)
+            } else if free < 0.0 && sum_shrink_basis > 0.0 {
+                (it.basis + free * (it.shrink * it.basis) / sum_shrink_basis).max(0.0)
+            } else {
+                it.basis
+            };
+        }
+    }
+
+    // Lay out each item's own content at its resolved main size (see
+    // `layout_flex_item_content`), producing an unstretched/"hypothetical"
+    // cross size per item.
+    let mut item_fragments: Vec<Fragment> = Vec::with_capacity(prepared.len());
+    for (idx, it) in prepared.iter().enumerate() {
+        let children_containing_width = if column {
+            it.natural_cross_content
+        } else {
+            final_main[idx]
+        };
+        let (child_fragments, natural_content_main_or_cross) = layout_flex_item_content(
+            it.b,
+            styles,
+            children_containing_width,
+            font_size_px,
+            font_size_raw,
+            root_font_size_px,
+        );
+        let style = it.b.node.and_then(|n| styles.get(&n));
+        let (width, height) = if column {
+            (it.natural_cross_content, final_main[idx])
+        } else {
+            let explicit_height = values::parse_length_percentage_auto(
+                get(style, "height", "auto"),
+                font_size_px,
+                root_font_size_px,
+            );
+            let height = match explicit_height {
+                LengthPercentageAuto::Length(px) => px,
+                LengthPercentageAuto::Percentage(_) | LengthPercentageAuto::Auto => {
+                    natural_content_main_or_cross
+                }
+            };
+            (final_main[idx], height)
+        };
+        item_fragments.push(Fragment {
+            node: it.b.node,
+            content_rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
+            },
+            margin: it.margin,
+            border: it.border,
+            padding: it.padding,
+            children: child_fragments,
+            text: None,
+        });
+    }
+
+    // Cross size per line (max item outer cross size in that line), then
+    // row-direction stretch overrides -- see the `wraps`/module-docs note
+    // on why column direction doesn't stretch.
+    let cross_of = |f: &Fragment| -> f64 {
+        if column {
+            f.border_box().width
+        } else {
+            f.border_box().height
+        }
+    };
+    let line_cross_size: Vec<f64> = lines
+        .iter()
+        .map(|line| {
+            line.iter()
+                .map(|&i| cross_of(&item_fragments[i]))
+                .fold(0.0, f64::max)
+        })
+        .collect();
+    if !column {
+        for (line_idx, line) in lines.iter().enumerate() {
+            for &i in line {
+                let stretches =
+                    prepared[i].align_self == "stretch" || prepared[i].align_self == "normal";
+                if stretches && prepared[i].cross_auto {
+                    let target = line_cross_size[line_idx]
+                        - prepared[i].margin.top
+                        - prepared[i].margin.bottom
+                        - prepared[i].border.top
+                        - prepared[i].border.bottom
+                        - prepared[i].padding.top
+                        - prepared[i].padding.bottom;
+                    item_fragments[i].content_rect.height = target.max(0.0);
+                }
+            }
+        }
+    }
+
+    // Position: main-axis via `justify-content`, cross-axis (within its
+    // line) via `align-items`/`align-self`, lines stacked along the cross
+    // axis in order.
+    let mut cross_cursor = 0.0;
+    for (line_idx, line) in lines.iter().enumerate() {
+        let line_cross = line_cross_size[line_idx];
+        let used_main: f64 = line
+            .iter()
+            .map(|&i| final_main[i] + main_extra(&prepared[i]))
+            .sum();
+        let free_main = main_bound.map(|b| (b - used_main).max(0.0)).unwrap_or(0.0);
+        let n = line.len();
+        let (mut main_cursor, gap) = match justify {
+            "flex-end" => (free_main, 0.0),
+            "center" => (free_main / 2.0, 0.0),
+            "space-between" if n > 1 => (0.0, free_main / (n - 1) as f64),
+            "space-around" if n > 0 => (free_main / n as f64 / 2.0, free_main / n as f64),
+            _ => (0.0, 0.0),
+        };
+        for &i in line {
+            let it = &prepared[i];
+            let main_margin_start = if column {
+                it.margin.top
+            } else {
+                it.margin.left
+            };
+            let cross_margin_start = if column {
+                it.margin.left
+            } else {
+                it.margin.top
+            };
+            let item_cross_outer = cross_of(&item_fragments[i]);
+            let align_offset = match it.align_self.as_str() {
+                "flex-end" => line_cross - item_cross_outer,
+                "center" => (line_cross - item_cross_outer) / 2.0,
+                _ => 0.0, // flex-start/stretch/normal/baseline(unsupported, falls back to flex-start)
+            };
+            let main_pos = main_cursor + main_margin_start;
+            let cross_pos = cross_cursor + cross_margin_start + align_offset.max(0.0);
+            let (x, y) = if column {
+                (cross_pos, main_pos)
+            } else {
+                (main_pos, cross_pos)
+            };
+            reposition(&mut item_fragments[i], x, y);
+            main_cursor += final_main[i] + main_extra(it) + gap;
+        }
+        cross_cursor += line_cross;
+    }
+
+    let content_main_or_cross_total = if column {
+        lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|&i| final_main[i] + main_extra(&prepared[i]))
+                    .sum::<f64>()
+            })
+            .fold(0.0, f64::max)
+    } else {
+        cross_cursor
+    };
+    (item_fragments, content_main_or_cross_total)
+}
+
+/// See `layout_flex_container`'s `basis` field: resolves `flex-basis`
+/// (falling back to `width`/`height`, whichever is the main-axis
+/// property, when `flex-basis` is `auto`) into a content-box pixel size.
+/// Returns `None` when nothing resolvable is found (truly `auto` with no
+/// explicit main-axis length either) -- the caller falls back to `0.0`,
+/// the same "no intrinsic sizing" simplification B2 already documents.
+fn resolve_flex_basis(
+    style: Option<&ComputedStyle>,
+    column: bool,
+    content_width: f64,
+    font_size_px: f64,
+    root_font_size_px: f64,
+) -> Option<f64> {
+    let basis_raw = get(style, "flex-basis", "auto");
+    if basis_raw != "auto" {
+        match values::parse_length_percentage_auto(basis_raw, font_size_px, root_font_size_px) {
+            LengthPercentageAuto::Length(px) => return Some(px),
+            LengthPercentageAuto::Percentage(pct) if !column => {
+                return Some(content_width * pct / 100.0);
+            }
+            _ => {}
+        }
+    }
+    let main_prop = if column { "height" } else { "width" };
+    match values::parse_length_percentage_auto(
+        get(style, main_prop, "auto"),
+        font_size_px,
+        root_font_size_px,
+    ) {
+        LengthPercentageAuto::Length(px) => Some(px),
+        LengthPercentageAuto::Percentage(pct) if !column => Some(content_width * pct / 100.0),
+        _ => None,
+    }
+}
+
+/// Lays out a flex item's own children (its `Container`'s block/inline
+/// formatting context, same dispatch `layout_box` uses) at
+/// `children_containing_width`, returning the child fragments and the
+/// resulting natural content size along whichever axis ordinary block
+/// layout would compute automatically (content_height, in the usual
+/// sense) -- the caller decides whether that's the item's cross size
+/// (row direction) or gets discarded in favor of the flex-resolved main
+/// size (column direction).
+fn layout_flex_item_content(
+    b: &LayoutBox,
+    styles: &StyleMap,
+    children_containing_width: f64,
+    font_size_px: f64,
+    font_size_raw: Option<&str>,
+    root_font_size_px: f64,
+) -> (Vec<Fragment>, f64) {
+    match &b.kind {
+        BoxKind::Container(children) => {
+            let is_bfc = children.iter().any(|c| c.level == BoxLevel::Block);
+            if is_bfc {
+                layout_block_children(
+                    children,
+                    styles,
+                    children_containing_width,
+                    font_size_px,
+                    font_size_raw,
+                    root_font_size_px,
+                )
+            } else {
+                layout_inline_children(
+                    children,
+                    styles,
+                    children_containing_width,
+                    font_size_px,
+                    font_size_raw,
+                    root_font_size_px,
+                    b.node,
+                )
+            }
+        }
+        // B1's `flex_items` always blockifies real elements into
+        // `Container` boxes (an anonymous wrapper for stray inline
+        // content is also a `Container`); nested table/flex formatting
+        // contexts directly as a flex item aren't laid out specially
+        // here yet -- documented gap, falls back to empty content rather
+        // than panicking.
+        _ => (Vec::new(), 0.0),
+    }
+}
+
 fn reposition(fragment: &mut Fragment, x: f64, y: f64) {
     let dx = x - fragment.border_box().x;
     let dy = y - fragment.border_box().y;
@@ -521,6 +1169,16 @@ fn flatten_inline<'a>(
                 }
             }
         }
+        // A flex/table box directly inside an inline formatting context
+        // is an unusual edge case (B1's `flex_items`/table dispatch
+        // always produce block-level boxes, so this only happens if one
+        // somehow ends up as `display: inline`-adjacent content) -- drop
+        // it rather than trying to flatten table/flex-internal structure
+        // into words, a documented gap.
+        BoxKind::FlexContainer(_)
+        | BoxKind::Table(_)
+        | BoxKind::TableRow(_)
+        | BoxKind::TableCell { .. } => {}
     }
 }
 
@@ -694,6 +1352,16 @@ mod tests {
                     .collect(),
             )),
         )
+    }
+
+    fn set_style(styles: &mut StyleMap, node: NodeId, props: &[(&str, &str)]) {
+        styles.insert(
+            node,
+            props
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
     }
 
     #[test]
@@ -1017,5 +1685,250 @@ mod tests {
         // Default font-size is 16px, so `line-height: 3` should produce a
         // 48px line box, not the `normal` (1.2x) 19.2px default.
         assert_eq!(line.content_rect.height, 48.0);
+    }
+
+    fn build_table(
+        doc: &mut Document,
+        styles: &mut StyleMap,
+        cols_per_row: &[usize],
+    ) -> Vec<NodeId> {
+        let root = doc.root();
+        let table = el(doc, root, "table", &[]);
+        set_style(styles, table, &[("display", "table")]);
+        for &n in cols_per_row {
+            let row = el(doc, table, "tr", &[]);
+            set_style(styles, row, &[("display", "table-row")]);
+            for _ in 0..n {
+                let cell = el(doc, row, "td", &[]);
+                set_style(styles, cell, &[("display", "table-cell")]);
+            }
+        }
+        vec![table]
+    }
+
+    #[test]
+    fn table_columns_split_width_equally_with_no_hints() {
+        let mut doc = Document::new();
+        let mut styles = StyleMap::new();
+        build_table(&mut doc, &mut styles, &[2]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 400.0);
+        let row = &fragment.children[0];
+        assert_eq!(row.children[0].border_box().width, 200.0);
+        assert_eq!(row.children[1].border_box().x, 200.0);
+        assert_eq!(row.children[1].border_box().width, 200.0);
+    }
+
+    #[test]
+    fn table_explicit_cell_width_hints_its_column() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let table = el(&mut doc, root, "table", &[]);
+        let row = el(&mut doc, table, "tr", &[]);
+        let a = el(&mut doc, row, "td", &[]);
+        let b = el(&mut doc, row, "td", &[]);
+        let mut styles = StyleMap::new();
+        set_style(&mut styles, table, &[("display", "table")]);
+        set_style(&mut styles, row, &[("display", "table-row")]);
+        set_style(
+            &mut styles,
+            a,
+            &[("display", "table-cell"), ("width", "100px")],
+        );
+        set_style(&mut styles, b, &[("display", "table-cell")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 400.0);
+        let row_fragment = &fragment.children[0];
+        assert_eq!(row_fragment.children[0].border_box().width, 100.0);
+        // The remaining 300px goes entirely to the one unhinted column.
+        assert_eq!(row_fragment.children[1].border_box().width, 300.0);
+        assert_eq!(row_fragment.children[1].border_box().x, 100.0);
+    }
+
+    #[test]
+    fn table_colspan_spans_multiple_columns_and_rows_stack() {
+        let mut doc = Document::new();
+        let mut styles = StyleMap::new();
+        let root = doc.root();
+        let table = el(&mut doc, root, "table", &[]);
+        set_style(&mut styles, table, &[("display", "table")]);
+        let row1 = el(&mut doc, table, "tr", &[]);
+        set_style(&mut styles, row1, &[("display", "table-row")]);
+        let spanning = el(&mut doc, row1, "td", &[("colspan", "2")]);
+        set_style(&mut styles, spanning, &[("display", "table-cell")]);
+        let solo = el(&mut doc, row1, "td", &[]);
+        set_style(&mut styles, solo, &[("display", "table-cell")]);
+        let row2 = el(&mut doc, table, "tr", &[]);
+        set_style(&mut styles, row2, &[("display", "table-row")]);
+        for _ in 0..3 {
+            let c = el(&mut doc, row2, "td", &[]);
+            set_style(&mut styles, c, &[("display", "table-cell")]);
+        }
+
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 300.0);
+        let row1_fragment = &fragment.children[0];
+        // 3 equal columns of 100px each; the colspan=2 cell spans the
+        // first two.
+        assert_eq!(row1_fragment.children[0].border_box().width, 200.0);
+        assert_eq!(row1_fragment.children[1].border_box().x, 200.0);
+        let row2_fragment = &fragment.children[1];
+        assert_eq!(
+            row2_fragment.border_box().y,
+            row1_fragment.border_box().height
+        );
+    }
+
+    #[test]
+    fn flex_row_grow_distributes_free_space_by_weight() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let container = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, container, "div", &[]);
+        let b = el(&mut doc, container, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(&mut styles, container, &[("display", "flex")]);
+        set_style(
+            &mut styles,
+            a,
+            &[
+                ("display", "block"),
+                ("flex-basis", "0"),
+                ("flex-grow", "1"),
+            ],
+        );
+        set_style(
+            &mut styles,
+            b,
+            &[
+                ("display", "block"),
+                ("flex-basis", "0"),
+                ("flex-grow", "3"),
+            ],
+        );
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 400.0);
+        // 400px free space split 1:3 -> 100px and 300px.
+        assert_eq!(fragment.children[0].content_rect.width, 100.0);
+        assert_eq!(fragment.children[1].content_rect.width, 300.0);
+        assert_eq!(fragment.children[1].content_rect.x, 100.0);
+    }
+
+    #[test]
+    fn flex_row_shrink_distributes_overflow_by_weight() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let container = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, container, "div", &[]);
+        let b = el(&mut doc, container, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(&mut styles, container, &[("display", "flex")]);
+        set_style(&mut styles, a, &[("display", "block"), ("width", "80px")]);
+        set_style(&mut styles, b, &[("display", "block"), ("width", "80px")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        // 160px of basis crammed into 100px -- equal basis and default
+        // flex-shrink:1 means the 60px overflow splits evenly, 30px each.
+        let fragment = layout(&tree, &styles, 100.0);
+        assert_eq!(fragment.children[0].content_rect.width, 50.0);
+        assert_eq!(fragment.children[1].content_rect.width, 50.0);
+    }
+
+    #[test]
+    fn flex_justify_content_center_centers_the_line() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let container = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, container, "div", &[]);
+        let b = el(&mut doc, container, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(
+            &mut styles,
+            container,
+            &[("display", "flex"), ("justify-content", "center")],
+        );
+        set_style(&mut styles, a, &[("display", "block"), ("width", "50px")]);
+        set_style(&mut styles, b, &[("display", "block"), ("width", "50px")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 300.0);
+        // Used main size = 100px, free = 200px, centered -> 100px offset.
+        assert_eq!(fragment.children[0].content_rect.x, 100.0);
+        assert_eq!(fragment.children[1].content_rect.x, 150.0);
+    }
+
+    #[test]
+    fn flex_wrap_starts_a_new_line_when_items_overflow() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let container = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, container, "div", &[]);
+        let b = el(&mut doc, container, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(
+            &mut styles,
+            container,
+            &[("display", "flex"), ("flex-wrap", "wrap")],
+        );
+        set_style(
+            &mut styles,
+            a,
+            &[("display", "block"), ("width", "80px"), ("height", "20px")],
+        );
+        set_style(
+            &mut styles,
+            b,
+            &[("display", "block"), ("width", "80px"), ("height", "30px")],
+        );
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        // Container is 100px wide -- two 80px items can't share a line.
+        let fragment = layout(&tree, &styles, 100.0);
+        assert_eq!(fragment.children[0].content_rect.y, 0.0);
+        // Second line starts below the first line's cross size (20px).
+        assert_eq!(fragment.children[1].content_rect.y, 20.0);
+    }
+
+    #[test]
+    fn flex_column_direction_stacks_items_vertically() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let container = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, container, "div", &[]);
+        let b = el(&mut doc, container, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(
+            &mut styles,
+            container,
+            &[("display", "flex"), ("flex-direction", "column")],
+        );
+        set_style(&mut styles, a, &[("display", "block"), ("height", "50px")]);
+        set_style(&mut styles, b, &[("display", "block"), ("height", "30px")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 200.0);
+        assert_eq!(fragment.children[0].content_rect.y, 0.0);
+        assert_eq!(fragment.children[1].content_rect.y, 50.0);
+        // Container's own auto height should be the sum of both items.
+        assert_eq!(fragment.content_rect.height, 80.0);
+    }
+
+    #[test]
+    fn flex_align_items_stretch_fills_cross_size() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let container = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, container, "div", &[]);
+        let b = el(&mut doc, container, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(&mut styles, container, &[("display", "flex")]);
+        set_style(
+            &mut styles,
+            a,
+            &[("display", "block"), ("width", "50px"), ("height", "10px")],
+        );
+        set_style(&mut styles, b, &[("display", "block"), ("width", "50px")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 200.0);
+        // `b` has no explicit height (auto) and default align-items is
+        // stretch, so it should stretch to the line's cross size -- the
+        // tallest item, `a`'s explicit 10px.
+        assert_eq!(fragment.children[1].content_rect.height, 10.0);
     }
 }

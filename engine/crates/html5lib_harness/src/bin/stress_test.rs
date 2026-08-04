@@ -145,6 +145,10 @@ const HTML_SEEDS: &[&str] = &[
     "<select><option>a<option>b</select>",
     "<math><mi>x</mi><annotation-xml encoding=\"text/html\"><div>y</div></annotation-xml></math>",
     "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\"><body xlink:href=foo><math xlink:href=bar></math>",
+    // B3/B4: a table with a colspan cell plus a nested flex container, to
+    // exercise layout_table/layout_flex_container together with the rest
+    // of the fuzzer's HTML+CSS combinations.
+    "<div style=\"display:flex\"><table><thead><tr><th colspan=\"2\">h</th></tr></thead><tbody><tr><td>a</td><td><div style=\"display:flex;flex-direction:column\">x<span>y</span></div></td></tr></tbody></table><p>item</p></div>",
 ];
 
 const CSS_SEEDS: &[&str] = &[
@@ -155,6 +159,8 @@ const CSS_SEEDS: &[&str] = &[
     // comma-separated nested/parent selectors, nested @media.
     ".a, .b { color: red; &:hover, & .c { color: blue; } @media (min-width: 1px) { color: green; &:focus { color: purple; } } }",
     "@layer base { .a { color: red; & .b { color: blue; } } }",
+    // B3/B4: table/flex display values plus flexbox longhands.
+    "table { display: table; } tr { display: table-row; } td { display: table-cell; width: 40px; } .f { display: flex; flex-wrap: wrap; flex-grow: 1; flex-shrink: 2; flex-basis: 10%; justify-content: space-between; align-items: center; }",
 ];
 
 const SELECTOR_SEEDS: &[&str] = &[

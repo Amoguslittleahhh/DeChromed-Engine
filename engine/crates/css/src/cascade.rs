@@ -287,6 +287,16 @@ const PROPERTY_TABLE: &[(&str, bool, &str)] = &[
     ("background-color", false, "transparent"),
     ("opacity", false, "1"),
     ("z-index", false, "auto"),
+    // B4: Flexible Box Layout longhands (all non-inherited, per spec).
+    ("flex-direction", false, "row"),
+    ("flex-wrap", false, "nowrap"),
+    ("flex-grow", false, "0"),
+    ("flex-shrink", false, "1"),
+    ("flex-basis", false, "auto"),
+    ("justify-content", false, "normal"),
+    ("align-items", false, "normal"),
+    ("align-self", false, "auto"),
+    ("align-content", false, "normal"),
     // A8: a handful of SVG presentation properties (inherited per
     // <https://www.w3.org/TR/SVG2/propidx.html>, unlike most CSS box
     // properties) -- enough for these to cascade/inherit correctly onto
