@@ -62,10 +62,23 @@ impl Canvas {
         self.pixels[i..i + 4].copy_from_slice(&color);
     }
 
+    /// A direct, unblended pixel write -- what `ImageData`'s `putImageData`
+    /// means (it replaces pixels outright, it doesn't composite them; see
+    /// `canvas2d`'s own module docs). Out-of-bounds coordinates are simply
+    /// ignored, matching `putImageData`'s own clip-to-canvas behavior.
+    pub fn put_pixel(&mut self, x: usize, y: usize, color: [u8; 4]) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        self.set_pixel(x, y, color);
+    }
+
     /// Real "source-over" alpha compositing (the standard Porter-Duff
     /// `over` operator), not a stand-in -- blends `color` onto whatever's
-    /// already at `(x, y)`.
-    fn blend_pixel(&mut self, x: usize, y: usize, color: Color) {
+    /// already at `(x, y)`. Public so `canvas2d`'s path fill/stroke can
+    /// reuse the same real blending math this module already uses for
+    /// `FillRect`, instead of a second, subtly-different implementation.
+    pub fn blend_pixel(&mut self, x: usize, y: usize, color: Color) {
         if x >= self.width || y >= self.height {
             return;
         }
@@ -93,6 +106,63 @@ impl Canvas {
                 (out_a * 255.0).round().clamp(0.0, 255.0) as u8,
             ],
         );
+    }
+
+    /// B12: composites `layer` (another, already-rasterized canvas -- a
+    /// compositor layer's own pixels) onto `self` at `(offset_x,
+    /// offset_y)`, nearest-neighbor-scaled by `scale` and alpha-multiplied
+    /// by `opacity`. This is the real per-pixel work behind
+    /// [`crate::compositor::composite_layers`] -- separating it from
+    /// [`rasterize`] is the actual architectural point of "layer
+    /// promotion": once a layer's own pixels exist, moving or fading it
+    /// (the common case for scrolling and `transform`/`opacity`
+    /// animations) costs only this compositing pass, not a full
+    /// re-rasterization of its display list.
+    pub fn composite_over(
+        &mut self,
+        layer: &Canvas,
+        offset_x: f64,
+        offset_y: f64,
+        scale: f64,
+        opacity: f64,
+    ) {
+        if scale <= 0.0 || opacity <= 0.0 || layer.width == 0 || layer.height == 0 {
+            return;
+        }
+        let opacity = opacity.min(1.0);
+        let dst_w = ((layer.width as f64) * scale).round().max(0.0) as usize;
+        let dst_h = ((layer.height as f64) * scale).round().max(0.0) as usize;
+        let x0 = offset_x.round() as isize;
+        let y0 = offset_y.round() as isize;
+        for dy in 0..dst_h {
+            let ty = y0 + dy as isize;
+            if ty < 0 || ty as usize >= self.height {
+                continue;
+            }
+            let sy = ((dy as f64) / scale).floor() as usize;
+            if sy >= layer.height {
+                continue;
+            }
+            for dx in 0..dst_w {
+                let tx = x0 + dx as isize;
+                if tx < 0 || tx as usize >= self.width {
+                    continue;
+                }
+                let sx = ((dx as f64) / scale).floor() as usize;
+                if sx >= layer.width {
+                    continue;
+                }
+                let src = layer.get_pixel(sx, sy);
+                let a = (src[3] as f64 / 255.0) * opacity;
+                let color = Color {
+                    r: src[0],
+                    g: src[1],
+                    b: src[2],
+                    a: (a * 255.0).round().clamp(0.0, 255.0) as u8,
+                };
+                self.blend_pixel(tx as usize, ty as usize, color);
+            }
+        }
     }
 }
 
@@ -210,5 +280,54 @@ mod tests {
         // Still the untouched white background -- documented gap, see
         // module docs.
         assert_eq!(canvas.get_pixel(2, 2), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn composite_over_translates_and_scales_a_layer() {
+        let mut layer = Canvas::new(2, 2);
+        layer.put_pixel(0, 0, [255, 0, 0, 255]);
+        layer.put_pixel(1, 1, [0, 255, 0, 255]);
+        let mut target = Canvas::new(10, 10);
+        target.composite_over(&layer, 4.0, 4.0, 2.0, 1.0);
+        // (0,0) of the layer, scaled 2x, offset by (4,4) -> a 2x2 block at
+        // (4,4).
+        assert_eq!(target.get_pixel(4, 4), [255, 0, 0, 255]);
+        assert_eq!(target.get_pixel(5, 4), [255, 0, 0, 255]);
+        // (1,1) of the layer -> a 2x2 block at (6,6).
+        assert_eq!(target.get_pixel(6, 6), [0, 255, 0, 255]);
+        // Untouched background elsewhere.
+        assert_eq!(target.get_pixel(0, 0), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn composite_over_multiplies_alpha_by_opacity() {
+        let mut layer = Canvas::new(1, 1);
+        layer.put_pixel(0, 0, [0, 0, 0, 255]);
+        let mut target = Canvas::new(1, 1);
+        target.composite_over(&layer, 0.0, 0.0, 1.0, 0.5);
+        // Fully opaque black at 50% layer opacity, over opaque white ->
+        // roughly mid-gray, same math as translucent_fill_rect's own test.
+        let px = target.get_pixel(0, 0);
+        assert!((120..=136).contains(&px[0]));
+    }
+
+    #[test]
+    fn composite_over_with_zero_or_negative_scale_does_not_panic() {
+        let layer = Canvas::new(2, 2);
+        let mut target = Canvas::new(4, 4);
+        target.composite_over(&layer, 0.0, 0.0, 0.0, 1.0);
+        target.composite_over(&layer, 0.0, 0.0, -1.0, 1.0);
+        target.composite_over(&layer, 0.0, 0.0, 1.0, 0.0);
+        // Nothing panicked; canvas is still the untouched white background.
+        assert_eq!(target.get_pixel(0, 0), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn composite_over_off_canvas_offset_does_not_panic() {
+        let mut layer = Canvas::new(2, 2);
+        layer.put_pixel(0, 0, [255, 0, 0, 255]);
+        let mut target = Canvas::new(4, 4);
+        target.composite_over(&layer, 1000.0, -1000.0, 1.0, 1.0);
+        assert_eq!(target.get_pixel(0, 0), [255, 255, 255, 255]);
     }
 }

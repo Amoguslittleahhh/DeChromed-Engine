@@ -853,21 +853,79 @@ doesn't panic, confirming `DrawText` items are left unrasterized) plus the
 shared stress-test fuzzer, which now also runs `paint::rasterize` over
 every fuzzed display list.
 
-### B12. Compositing
-Layer promotion (`transform`/`opacity`/`will-change`), a compositor thread
-independent of the main thread — this is *the* thing that makes scrolling
-and animations feel smooth in real browsers and is routinely the difference
-between "demo" and "usable." Threaded scrolling, async transform animations.
-**Exit:** scroll/animate a layered page at a sustained 60fps target on a
-benchmark corpus; compositor operates without blocking on main-thread JS.
+### B12. Compositing — *started (single-threaded software layer compositor; no thread/GPU path)*
+`paint::compositor` is a real layer compositor: a [`Layer`] bundles its own
+`DisplayList` with a translate/uniform-scale/opacity transform; `Canvas::
+composite_over` (B11's rasterizer module) does the actual per-pixel work —
+nearest-neighbor-scaled, alpha-multiplied-by-opacity source-over blending,
+the same real Porter-Duff math B11 already uses for `FillRect`, not a
+stand-in. `composite_layers` rasterizes each layer's display list exactly
+once, then composites the layers back-to-front onto one output canvas.
+That separation is the real architectural point of "layer promotion":
+moving or fading an already-rasterized layer (the common case for
+scrolling and `transform`/`opacity` animations) costs only a compositing
+pass, not a full display-list re-rasterization.
 
-### B13. Canvas 2D & WebGL/WebGPU
-`<canvas>` 2D context API (path filling/stroking, `ImageData`, compositing
-operations) — its own spec surface distinct from CSS painting. WebGL
-(bindings to an existing GL/Vulkan abstraction — nobody hand-writes a GPU
-driver) and WebGPU for the modern API surface.
-**Exit:** WPT `html/canvas` ≥60%; a handful of real-world WebGL demos (e.g.
-three.js samples) rendering correctly.
+**What's still missing, stated plainly:** no compositor *thread* — everything
+here runs synchronously on whatever thread calls it, so this doesn't yet
+decouple compositing from a busy main thread the way real engines do; no
+GPU path (layers are rasterized and composited entirely in software); no
+rotation/skew/non-uniform or 3D scale (`Layer`'s transform is translate +
+uniform scale + opacity only); no automatic layer promotion (the decision
+of *which* elements get their own layer — `will-change`, active
+`transform`/`opacity` animations, certain stacking-context triggers — isn't
+wired up to the DOM/style side at all; callers construct `Layer`s by hand);
+no real async animation scheduling (nothing here interpolates a layer's
+fields over time or drives a frame loop).
+**Exit not yet met** (no threaded/GPU compositor, so no sustained-60fps
+benchmark claim would mean anything yet) — verified instead with 5
+self-authored unit tests in `compositor.rs` (offset compositing, paint
+order between stacked layers, opacity fading, scaling, an empty layer
+stack) plus 5 more in `raster.rs` for `Canvas::composite_over` itself
+(translate+scale, opacity multiplication, zero/negative scale, an
+off-canvas offset — all checked for correct output or a graceful no-op,
+never a panic), plus a new stress-fuzzer entry (`paint::composite_layers`)
+generating random layer counts/sizes/offsets/scales/opacities, including
+deliberately out-of-range values (negative scale, opacity outside `[0,
+1]`, huge offsets) that a real in-flight animation could momentarily
+produce between keyframes.
+
+### B13. Canvas 2D & WebGL/WebGPU — *started (Canvas 2D graphics primitives only; no WebGL/WebGPU, no DOM/JS wiring)*
+`paint::canvas2d` implements the real graphics-primitive layer beneath
+`CanvasRenderingContext2D`: `Path2D`-equivalent path building (`move_to`/
+`line_to`/`close_path`/`rect`), `fill()` via a genuine scanline polygon
+rasterizer using the nonzero winding rule (a clockwise outer subpath plus
+a counter-clockwise inner one renders a real hole — e.g. a ring/donut
+shape — not just two independently-filled disks), `stroke()` via real
+per-pixel Bresenham line rasterization (line width approximated by several
+parallel offset lines, not true mitered polygon stroking), and
+`ImageData`-equivalent `get_image_data`/`put_image_data` for direct pixel
+access, clipped to canvas bounds rather than panicking on out-of-range
+regions.
+
+**This is deliberately not wired to `<canvas>` the DOM element or to
+JavaScript** — there's no Track C yet, so nothing calls `getContext("2d")`
+and dispatches into this module; it exists as the real primitives a future
+JS binding would call into, the same relationship `paint::raster` already
+has to CSS painting. Also missing: bezier/quadratic curves and `arc()`
+(paths are polylines only), anti-aliasing, `fillText`/`strokeText` (needs
+real font shaping, B10's own gap), gradients/patterns, clipping regions,
+a per-context 2D transform (distinct from B12's compositor-layer
+transforms), and every `globalCompositeOperation` mode besides the
+default `source-over`. **WebGL/WebGPU haven't started at all** — real GPU
+bindings (wgpu, given the Rust choice) are a separate, large undertaking,
+left as future work rather than half-built or faked, exactly as this
+section's own text already called for.
+**Exit not yet met** (WPT `html/canvas` needs a JS engine to dispatch into
+this module at all, and there's no WebGL/WebGPU to run three.js-style
+demos against) — verified instead with 8 self-authored unit tests
+(rectangular fill, nonzero-winding hole rendering, an empty path, a
+diagonal stroke, off-canvas stroking, `ImageData` get/put round-tripping,
+an out-of-bounds region reading back transparent black, an out-of-bounds
+`putImageData` not panicking) plus a new stress-fuzzer entry generating
+random path point sequences (including move/line/close mixed in any
+order, and coordinates far outside the canvas) run through fill, stroke,
+and an `ImageData` round-trip.
 
 ---
 
@@ -1537,5 +1595,23 @@ RGBA8 `Canvas` with genuine scanline fill and Porter-Duff alpha
 compositing, for `FillRect` items only — `DrawText` items are positioned/
 colored correctly but not yet painted, since no glyph data exists (B11).
 See each phase's own entry above for exactly what's real and what's a
-documented gap. **B12 (compositing)** is the natural next Track B phase,
-building on B9's display list and B11's rasterizer.
+documented gap.
+
+**B12 (compositing) and B13 (Canvas 2D & WebGL/WebGPU) are now started
+too.** `paint::compositor` adds a real (single-threaded, software) layer
+compositor: a `Layer` bundles a `DisplayList` with a translate/uniform-
+scale/opacity transform, and `Canvas::composite_over` (added to B11's own
+`raster.rs`) does the real per-pixel compositing work, reusing the same
+Porter-Duff blending `FillRect` already uses. `paint::canvas2d` adds real
+Canvas 2D graphics primitives — path building, scanline polygon fill with
+the nonzero winding rule (so donut/ring shapes render a real hole), real
+Bresenham line stroking, and `ImageData` get/put — not yet reachable from
+JS (no Track C), but a real implementation of the primitives a future
+binding would call into. See each phase's own entry above for exactly
+what's real vs. a documented gap (B12's biggest: no compositor thread, no
+GPU path, no rotation; B13's biggest: no WebGL/WebGPU at all, no bezier
+curves, no text). With every numbered Track B phase now at least started,
+the natural next direction is either deepening B1-B13's own documented
+gaps (B13's WebGL/WebGPU half chief among them) or starting Track C now
+that a full paint pipeline (layout → fragment tree → display list →
+raster → compositor) exists end to end for a future JS engine to drive.

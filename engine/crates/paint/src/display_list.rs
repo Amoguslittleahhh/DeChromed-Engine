@@ -37,7 +37,7 @@ pub enum DisplayItem {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DisplayList {
     pub items: Vec<DisplayItem>,
 }

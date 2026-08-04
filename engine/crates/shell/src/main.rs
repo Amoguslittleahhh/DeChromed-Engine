@@ -11,7 +11,12 @@
 //! real and what's a documented gap in each phase). B11's software
 //! rasterizer paints the display list's `FillRect` items into a real
 //! pixel buffer (text painting is a documented B11 gap -- no glyph
-//! outlines exist yet).
+//! outlines exist yet). B12's layer compositor (`paint::compositor`)
+//! composites that same rasterized frame as its own layer, offset and
+//! faded, to demonstrate the real translate/opacity math. B13's Canvas 2D
+//! primitives (`paint::canvas2d`) paint a small filled-and-stroked shape
+//! onto a standalone canvas, independent of the HTML/CSS pipeline (there's
+//! no `<canvas>` DOM element or JS binding to reach it through yet).
 
 use css::cascade::Origin;
 use css::cssom::CssomSheet;
@@ -114,7 +119,37 @@ fn main() {
             border_box.height as usize,
         );
         println!("rasterized canvas: {}x{} px", canvas.width, canvas.height);
+
+        // B12: promote that same rasterized frame to its own compositor
+        // layer and composite it again, offset and half-faded -- the real
+        // per-pixel work (`Canvas::composite_over`) that lets a real
+        // engine move/fade already-rasterized content without re-running
+        // paint at all.
+        let mut layer = paint::Layer::new(display_list, canvas.width, canvas.height);
+        layer.offset_x = 20.0;
+        layer.offset_y = 10.0;
+        layer.opacity = 0.5;
+        let composited = paint::composite_layers(&[layer], canvas.width + 40, canvas.height + 20);
+        println!(
+            "composited frame (1 layer, offset (20, 10), 50% opacity): {}x{} px",
+            composited.width, composited.height
+        );
     }
+
+    // B13: Canvas 2D graphics primitives, independent of the HTML/CSS
+    // pipeline above -- real scanline polygon fill (nonzero winding rule)
+    // and Bresenham line stroking onto a standalone pixel buffer.
+    let mut canvas2d = paint::Canvas::new(40, 40);
+    let mut path = paint::Path2D::new();
+    path.rect(5.0, 5.0, 20.0, 20.0);
+    paint::fill(&mut canvas2d, &path, paint::Color::rgb(0, 128, 0));
+    paint::stroke(&mut canvas2d, &path, paint::Color::rgb(0, 0, 0), 2.0);
+    println!(
+        "canvas2d: filled+stroked a 20x20 rect on a {}x{} canvas, center pixel = {:?}",
+        canvas2d.width,
+        canvas2d.height,
+        canvas2d.get_pixel(15, 15)
+    );
 
     // A8/A9: inline <svg> inside HTML reaches real foreign content --
     // the nested <path> gets the SVG namespace, not the HTML one.

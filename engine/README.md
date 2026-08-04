@@ -42,10 +42,26 @@ heuristic (B10, not real font shaping); and `paint::raster` is a real
 software rasterizer producing an actual RGBA8 pixel buffer with genuine
 scanline fill and Porter-Duff alpha compositing, for `FillRect` items only
 -- `DrawText` items are positioned/colored correctly but not yet painted,
-since no glyph data exists yet (B11). See `ROADMAP.md`'s B9-B11 entries
-for exactly what's real vs. a documented gap in each. `crates/shell/src/main.rs`
-runs the real pipeline end to end, including layout, fragment-tree
-queries, display-list lowering, and rasterization.
+since no glyph data exists yet (B11).
+
+**B12 (compositing) and B13 (Canvas 2D & WebGL/WebGPU) are started too.**
+`paint::compositor` is a real (single-threaded, software) layer
+compositor: a `Layer` bundles a `DisplayList` with a translate/uniform-
+scale/opacity transform, and `Canvas::composite_over` (added to B11's own
+`raster.rs`) does the real per-pixel compositing work -- rasterizing each
+layer's display list exactly once, then compositing back-to-front with the
+same real Porter-Duff blending `FillRect` already uses (B12; no compositor
+thread or GPU path yet). `paint::canvas2d` implements real Canvas 2D
+graphics primitives -- path building, scanline polygon fill using the
+nonzero winding rule (so a donut/ring shape with an inner and outer
+subpath wound opposite ways renders a real hole), Bresenham line
+stroking, and `ImageData` get/put (B13's Canvas 2D half; WebGL/WebGPU
+haven't started at all, and nothing here is wired to the `<canvas>` DOM
+element or JS yet, since there's no Track C). See `ROADMAP.md`'s B9-B13
+entries for exactly what's real vs. a documented gap in each.
+`crates/shell/src/main.rs` runs the real pipeline end to end, including
+layout, fragment-tree queries, display-list lowering, rasterization,
+compositing a layer, and a standalone Canvas 2D fill/stroke.
 
 The workspace targets Rust **edition 2024** (`engine/Cargo.toml`), using
 stable let-chains (`if let X = y && let A = b { ... }`) where they read
@@ -62,13 +78,13 @@ engine/
     css/                     A4-A7 (tokenizer/parser, selectors, cascade, CSSOM) -- all done
     xml/                     A10 (standalone XML 1.0 parser + namespace resolution) -- done; also A8's standalone-SVG-document entry point
     layout/                  B1-B8 (box tree, block/inline layout, tables, flexbox, grid, positioning, multi-column, logical properties/RTL) started; B9's query.rs (fragment-tree queries) + B10's char-width table also started
-    paint/                   B9 (display-list lowering + color parsing) and B11 (software rasterizer) started; B12 (compositing) still a placeholder
+    paint/                   B9 (display-list lowering + color parsing), B11 (software rasterizer), B12 (layer compositor), and B13 (Canvas 2D primitives) all started; B13's WebGL/WebGPU half not started
     js_bindings/              Track C -- placeholder, shape depends on "the JS engine question"
     net/                     D1-D3 (URL parsing, networking, resource loading) -- currently placeholders
     media/                   D5-D7 (images, audio/video, WebRTC) -- currently empty
     a11y/                    F2 (accessibility tree) -- currently placeholders
     devtools/                F1 (inspector protocol) -- currently placeholders
-    shell/                   binary crate; a real HTML->DOM->CSS->selector-match->cascade->getComputedStyle->incremental-restyle->foreign-content->XML->box-tree->layout->fragment-tree-query->display-list->raster pipeline smoke test (text painting/B12 compositing still placeholders/gaps)
+    shell/                   binary crate; a real HTML->DOM->CSS->selector-match->cascade->getComputedStyle->incremental-restyle->foreign-content->XML->box-tree->layout->fragment-tree-query->display-list->raster->compositor pipeline smoke test, plus a standalone Canvas 2D demo (text painting is still a documented B11 gap)
     html5lib_harness/        A2/A3/A8/A9's conformance harness (see below)
 ```
 
@@ -92,8 +108,9 @@ cargo test --workspace
 # Run the pipeline smoke test (html -> dom -> css -> selectors -> cascade
 # -> getComputedStyle -> incremental restyle -> SVG foreign content ->
 # standalone XML -> layout -> fragment-tree queries -> display list ->
-# raster -- everything through A10 is real, B1-B9/B11 have real first
-# landings too; see ROADMAP.md for exactly what's still a documented gap)
+# raster -> compositor, plus a standalone Canvas 2D fill/stroke demo --
+# everything through A10 is real, B1-B13 have real first landings too;
+# see ROADMAP.md for exactly what's still a documented gap in each)
 cargo run -p shell
 
 # Run the html5lib-tests tokenizer conformance harness
@@ -180,15 +197,19 @@ resolution/round-trip-serialization cases.
 
 `crates/html5lib_harness/src/bin/stress_test.rs` is a cross-crate,
 conformance-blind fuzzer for Track A (A1-A10) and now Track B's
-`layout::layout` plus `paint::build_display_list`/`paint::rasterize` too:
-it doesn't check parser *output* against an expected answer (that's the
-tokenizer/tree-construction harnesses above), only that
+`layout::layout`, `paint::build_display_list`/`paint::rasterize`,
+`paint::composite_layers`, and `paint::canvas2d`'s fill/stroke/`ImageData`
+too: it doesn't check parser *output* against an expected answer (that's
+the tokenizer/tree-construction harnesses above), only that
 `html::parse_document`, `css::parse_stylesheet`,
 `css::selectors::parse_selector_list`, `xml::parse_document`, the
 cascade/computed-style pipeline, `layout::build_box_tree`/`layout::layout`
 (at several containing-block widths, including pathologically narrow/zero
-ones), and now the same fragment trees lowered through
-`paint::build_display_list` and rasterized via `paint::rasterize` all
+ones), the same fragment trees lowered through `paint::build_display_list`
+and rasterized via `paint::rasterize`, `paint::composite_layers` fed
+randomized layer counts/offsets/scales/opacities (including deliberately
+out-of-range values), and `paint::canvas2d` fed randomized path point
+sequences (mixed move/line/close, coordinates far outside the canvas) all
 return *something* (or a graceful `Err`) instead of panicking, hanging, or
 aborting the process, across:
 

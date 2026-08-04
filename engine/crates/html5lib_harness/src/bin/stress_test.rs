@@ -475,6 +475,96 @@ fn main() {
     }
     paint_report.print_summary();
 
+    // B12: fuzz the layer compositor with random layer counts/sizes/
+    // transforms -- translate/scale/opacity values well outside sane
+    // ranges (negative, zero, huge, off-canvas) are exactly what a real
+    // `transform`/`opacity` animation could momentarily produce between
+    // keyframes.
+    let mut compositor_report = Report::new("paint::composite_layers");
+    for _ in 0..iterations {
+        let layer_count = rng.next_range(5);
+        let canvas_w = rng.next_range(50);
+        let canvas_h = rng.next_range(50);
+        let mut layers = Vec::new();
+        let mut desc = format!("canvas={canvas_w}x{canvas_h};");
+        for _ in 0..layer_count {
+            let w = rng.next_range(20);
+            let h = rng.next_range(20);
+            let offset_x = rng.next_range(200) as f64 - 100.0;
+            let offset_y = rng.next_range(200) as f64 - 100.0;
+            let scale = (rng.next_range(400) as f64 - 100.0) / 100.0;
+            let opacity = (rng.next_range(300) as f64 - 100.0) / 100.0;
+            let color = paint::Color::rgb(
+                rng.next_range(256) as u8,
+                rng.next_range(256) as u8,
+                rng.next_range(256) as u8,
+            );
+            desc.push_str(&format!(
+                "layer(w={w},h={h},x={offset_x},y={offset_y},scale={scale},opacity={opacity});"
+            ));
+            let list = paint::DisplayList {
+                items: vec![paint::DisplayItem::FillRect {
+                    rect: layout::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: w as f64,
+                        height: h as f64,
+                    },
+                    color,
+                }],
+            };
+            let mut layer = paint::Layer::new(list, w, h);
+            layer.offset_x = offset_x;
+            layer.offset_y = offset_y;
+            layer.scale = scale;
+            layer.opacity = opacity;
+            layers.push(layer);
+        }
+        compositor_report.try_input(desc, |_| {
+            let _ = paint::composite_layers(&layers, canvas_w, canvas_h);
+        });
+    }
+    compositor_report.print_summary();
+
+    // B13: fuzz Path2D construction + fill/stroke + ImageData round-tripping
+    // with random (including wildly out-of-canvas and degenerate) points --
+    // the scanline fill's sorted-intersection math and the Bresenham
+    // stroker are exactly the kind of code that panics on unexpected edge
+    // cases (a horizontal edge, a zero-length segment, coordinates far
+    // outside the canvas) rather than producing wrong-but-safe output.
+    let mut canvas2d_report = Report::new("paint::canvas2d (fill/stroke/ImageData)");
+    for _ in 0..iterations {
+        let canvas_w = 1 + rng.next_range(30);
+        let canvas_h = 1 + rng.next_range(30);
+        let point_count = rng.next_range(8);
+        let mut path = paint::Path2D::new();
+        let mut desc = format!("canvas={canvas_w}x{canvas_h};path=");
+        for i in 0..point_count {
+            let x = rng.next_range(400) as f64 - 200.0;
+            let y = rng.next_range(400) as f64 - 200.0;
+            if i == 0 || rng.next_range(4) == 0 {
+                path.move_to(x, y);
+                desc.push_str(&format!("M{x},{y};"));
+            } else {
+                path.line_to(x, y);
+                desc.push_str(&format!("L{x},{y};"));
+            }
+            if rng.next_range(5) == 0 {
+                path.close_path();
+                desc.push_str("Z;");
+            }
+        }
+        let line_width = rng.next_range(10) as f64;
+        canvas2d_report.try_input(desc, |_| {
+            let mut canvas = paint::Canvas::new(canvas_w, canvas_h);
+            paint::fill(&mut canvas, &path, paint::Color::rgb(255, 0, 0));
+            paint::stroke(&mut canvas, &path, paint::Color::rgb(0, 0, 255), line_width);
+            let snapshot = paint::get_image_data(&canvas, -5, -5, canvas_w + 10, canvas_h + 10);
+            paint::put_image_data(&mut canvas, &snapshot, -5, -5);
+        });
+    }
+    canvas2d_report.print_summary();
+
     let total_failures: usize = [
         &html_report,
         &css_report,
@@ -483,6 +573,8 @@ fn main() {
         &cascade_report,
         &layout_report,
         &paint_report,
+        &compositor_report,
+        &canvas2d_report,
     ]
     .iter()
     .map(|r| r.failures.len())
