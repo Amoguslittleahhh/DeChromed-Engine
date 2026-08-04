@@ -114,32 +114,25 @@ pub fn resolve_font_size_px(value: &str, parent_font_size_px: f64, root_font_siz
     }
 }
 
-/// B10: a real, table-driven proportional character-width approximation
-/// -- narrow characters (`i`, `l`, punctuation) really are narrower than
-/// wide ones (`m`, `w`, uppercase letters) here, unlike a single flat
-/// per-character constant. This is **not** real font shaping: there's no
-/// glyph outline data, no kerning, no ligatures, no font-specific
-/// metrics, no complex-script support (Arabic joining, Indic reordering),
-/// and no bidi integration (B8's own gap) -- every number this produces
-/// is still a rough visual approximation of *some* common proportional
-/// sans-serif font, not a pixel-accurate measurement of any real one.
-/// Values are expressed as a fraction of the font size (`em`), loosely
-/// modeled on typical Latin-alphabet proportional-font ratios.
-pub fn char_width_em(c: char) -> f64 {
-    match c {
-        'i' | 'l' | 'j' | '\'' | '.' | ',' | ':' | ';' | '!' | '|' | 'I' => 0.28,
-        'f' | 't' | 'r' | '(' | ')' | '[' | ']' | '"' | '/' | '\\' => 0.35,
-        'm' | 'w' | 'M' | 'W' | '@' | '%' => 0.85,
-        c if c.is_ascii_uppercase() => 0.68,
-        c if c.is_ascii_digit() => 0.55,
-        ' ' => 0.28,
-        _ => 0.5,
-    }
+/// B10: real text measurement, replacing the earlier landing's flat
+/// per-character-table approximation with genuine shaping (`text::shape`)
+/// against this engine's one embedded font (DejaVu Sans -- see
+/// `crates/text`'s own module docs and `assets/fonts/README.md`). The
+/// font is parsed once and cached for the process's lifetime, since
+/// shaping is real, non-trivial work that every inline layout pass calls
+/// repeatedly.
+fn font() -> &'static text::Font {
+    static FONT: std::sync::OnceLock<text::Font> = std::sync::OnceLock::new();
+    FONT.get_or_init(text::Font::dejavu_sans)
 }
 
-/// Sums [`char_width_em`] over `text`, scaled to `font_size_px`.
+/// The real shaped width of `text` at `font_size_px`, via `text::shape` --
+/// genuine kerning/ligature-aware advances from the embedded font's own
+/// GSUB/GPOS tables, not a per-character ratio approximation. See
+/// `crates/text`'s own module docs for exactly what's still a documented
+/// gap (one embedded font, no fallback, no hinting).
 pub fn text_width_px(text: &str, font_size_px: f64) -> f64 {
-    text.chars().map(|c| char_width_em(c) * font_size_px).sum()
+    text::shape(font(), text, font_size_px).width_px
 }
 
 #[cfg(test)]
@@ -195,17 +188,17 @@ mod tests {
 
     #[test]
     fn character_widths_are_genuinely_proportional() {
-        // Narrow characters are narrower than wide ones, and both differ
-        // from the "average" fallback -- not a flat constant.
-        assert!(char_width_em('i') < char_width_em('x'));
-        assert!(char_width_em('x') < char_width_em('m'));
-        assert!(char_width_em('m') > 0.5);
-        assert!(char_width_em('i') < 0.5);
+        // Real shaped widths from the embedded font, not a guessed ratio:
+        // narrower letterforms measure narrower than wider ones.
+        assert!(text_width_px("i", 16.0) < text_width_px("x", 16.0));
+        assert!(text_width_px("x", 16.0) < text_width_px("m", 16.0));
     }
 
     #[test]
-    fn text_width_sums_real_per_character_widths() {
-        let expected = (char_width_em('m') + char_width_em('i')) * 16.0;
-        assert_eq!(text_width_px("mi", 16.0), expected);
+    fn text_width_is_positive_and_scales_with_font_size() {
+        let at_16 = text_width_px("mi", 16.0);
+        let at_32 = text_width_px("mi", 32.0);
+        assert!(at_16 > 0.0);
+        assert!((at_32 - at_16 * 2.0).abs() < 0.01);
     }
 }

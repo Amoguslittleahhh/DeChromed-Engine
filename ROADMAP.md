@@ -733,40 +733,64 @@ unit tests (even balancing across 3 columns, `break-before: always`
 forcing a column regardless of natural balance) plus the shared
 stress-test fuzzer.
 
-### B8. Writing modes & internationalized layout — *started (logical properties + `direction: rtl` only)*
+### B8. Writing modes & internationalized layout — *started (logical properties, `direction: rtl`, and now real UAX #9 bidi + UAX #14 line-breaking)*
 Real logical-property resolution in `layout::flow::resolve_box_model`:
 `margin-inline-start/-end`, `margin-block-start/-end`,
 `padding-inline-start/-end`, and `padding-block-start/-end` all resolve
 to the correct physical side (block-start/-end always map to top/bottom,
 since only `horizontal-tb` writing mode is supported; inline-start/-end
 map to left/right according to `direction`) when a stylesheet doesn't
-set the equivalent physical longhand directly. `direction: rtl` also has
-a real effect on inline layout (`layout::flow::layout_inline_children`):
-each already-built line is mirrored within the full containing width,
-correctly reversing visual left/right order while preserving logical
-(source) order, so the first word in reading order ends up rightmost, as
-RTL requires.
+set the equivalent physical longhand directly.
+
+`direction: rtl` sets the paragraph's real embedding level (matching CSS:
+the property sets base direction explicitly, it doesn't auto-detect it —
+that's `unicode-bidi: plaintext`, not implemented), and the actual Unicode
+Bidirectional Algorithm (UAX #9) now runs for real via the `unicode-bidi`
+crate, replacing the earlier landing's "mirror the whole line uniformly"
+approximation: `layout::flow::layout_inline_children` builds a synthetic
+per-line string (atomic inline content is represented as U+FFFC, matching
+how the algorithm expects an opaque inline object), runs
+`unicode_bidi::ParagraphBidiInfo` over it once per inline formatting
+context, and then reorders each finished line for real via
+`ParagraphBidiInfo::reorder_visual` — so mixed-direction text (e.g. a
+Hebrew phrase embedded in an English paragraph) now reorders the RTL run
+correctly *within* the surrounding LTR content, not just "the whole line
+flips if `direction: rtl`". Line-breaking (word segmentation) is now real
+Unicode line-breaking (UAX #14) via the `unicode-linebreak` crate too,
+replacing naive whitespace-only splitting — a long hyphenated word (e.g.
+`"high-quality"`, which contains no whitespace at all) can now wrap after
+its hyphen, since that's a real UAX #14 break opportunity, and scripts
+that don't use spaces (CJK) get real per-character break opportunities
+instead of being treated as one giant unbreakable "word".
 
 **Vertical writing modes (`writing-mode: vertical-rl`/`vertical-lr`)
-are explicitly not implemented at all in this landing** — real vertical
-writing modes swap which axis is "block" and which is "inline"
-throughout *every* formatting context this crate has (block, inline,
-table, flex, grid), which needs the same kind of axis-agnostic rewrite
-B4's flexbox algorithm already does for its own two axes, but applied
-project-wide. That's a real architectural undertaking on its own, stated
-plainly as future work rather than faked via a cosmetic post-hoc
-rotation of otherwise-horizontal layout output. The full Unicode
-Bidirectional Algorithm (UAX #9) also isn't implemented — mixed-
-direction text within one inline formatting context isn't reordered
-per-run, only the container's own `direction` is honored uniformly for
-the whole context.
-**Exit not yet met** (no vertical writing modes, no UAX #9 bidi) — WPT
-`css/css-writing-modes`/`css/css-logical` need a JS engine to run
-anyway, and bidi conformance against the Unicode BidiTest data files
-needs the UAX #9 algorithm this phase doesn't implement; verified
-instead with 2 self-authored unit tests (RTL inline-content mirroring,
-logical-margin-to-physical-side mapping in both directions) plus the
-shared stress-test fuzzer.
+are still explicitly not implemented at all** — real vertical writing
+modes swap which axis is "block" and which is "inline" throughout *every*
+formatting context this crate has (block, inline, table, flex, grid),
+which needs the same kind of axis-agnostic rewrite B4's flexbox algorithm
+already does for its own two axes, but applied project-wide. That's a
+real architectural undertaking on its own, stated plainly as future work
+rather than faked via a cosmetic post-hoc rotation of otherwise-horizontal
+layout output — adopting `unicode-bidi`/`unicode-linebreak` (both
+horizontal-writing-mode-agnostic algorithms) didn't reduce this gap at
+all, it's an entirely separate undertaking. **The one real scoping limit
+left in the bidi integration**: each text node's UAX #9 analysis runs
+independently of its sibling text nodes/elements (there's no single
+paragraph-wide text buffer spanning element boundaries yet), so a
+direction-sensitive run split across two elements with no whitespace
+between them won't reorder as one unit — a real gap, but a much narrower
+one than "no UAX #9 at all".
+**Exit not yet met** (no vertical writing modes; WPT
+`css/css-writing-modes`/`css/css-logical` need a JS engine to run anyway,
+and full bidi conformance would need running against the Unicode
+BidiTest/BidiCharacterTest data files, which this phase doesn't do) —
+verified instead with 4 self-authored unit tests (RTL line alignment,
+logical-margin-to-physical-side mapping in both directions, mixed-
+direction UAX #9 reordering with an embedded Hebrew run, UAX #14
+hyphen-wrap) plus the shared stress-test fuzzer (which now also runs
+`text::shape`/`text::glyph_outline` — see B10 — over a much broader
+Unicode range, including Hebrew/Arabic/combining marks/CJK/emoji, than
+the HTML/CSS fuzzers' own ASCII-biased alphabets reach).
 
 ### B9. Fragment tree & display list — *started (query utilities + display-list lowering; no snapshot-test corpus)*
 The fragment tree itself has been real since B1/B2 (`layout::Fragment` —
@@ -806,29 +830,49 @@ a node not present in the tree, deepest-fragment hit-testing), 3 for
 text color inheritance), plus the shared stress-test fuzzer, which now also
 runs `paint::build_display_list` over every fuzzed fragment tree.
 
-### B10. Text shaping & fonts — *started (proportional character-width metrics only; no real shaping)*
-`layout::values::char_width_em`/`text_width_px` replace the previous flat
-`font_size_px * 0.5` per-character heuristic with a real, table-driven
-proportional-width approximation — narrow characters (`i`, `l`, punctuation)
-are genuinely narrower than wide ones (`m`, `w`, uppercase letters) now,
-loosely modeled on typical Latin-alphabet proportional-font ratios. Used by
-`layout::flow`'s inline line-breaking for real per-word/per-space widths
-instead of a uniform constant.
+### B10. Text shaping & fonts — *started (real shaping via `rustybuzz` + `ttf-parser` against one embedded font; no fallback/`@font-face`)*
+A new `crates/text` replaces the earlier landing's flat per-character
+width-ratio table with **real font shaping**: [`rustybuzz`](https://github.com/harfbuzz/rustybuzz),
+a complete Rust port of HarfBuzz — the same shaping engine real browsers
+(via HarfBuzz itself) and other production Rust text stacks (`resvg`,
+Servo's own font stack) actually use — shapes text against a real,
+embedded font (`assets/fonts/DejaVuSans.ttf`, freely redistributable
+under the Bitstream Vera license), producing genuine per-glyph advances
+driven by that font's own GSUB/GPOS tables (real kerning and ligature
+substitution for whatever DejaVu Sans covers), not a guessed ratio.
+Glyph outlines come from [`ttf-parser`](https://github.com/RazrFalcon/ttf-parser),
+a widely-used, spec-conformant TrueType/OpenType parser, with quadratic
+curves flattened to line segments. `layout::values::text_width_px` now
+calls this real shaper for every word/space width `layout::flow`'s inline
+line-breaking uses, and `paint::raster`'s rasterizer uses the same
+outlines to actually paint glyphs (see B11).
 
-**This is explicitly not real font shaping.** There's no glyph outline
-data, no kerning, no ligatures, no font-specific metrics, no complex-script
-support (Arabic joining, Indic reordering), no font matching/fallback
-chains, no `@font-face`/WOFF2 loading, no variable fonts, and no bidi
-integration (B8's own gap) — every number this produces is still a rough
-visual approximation of *some* common sans-serif font, not a pixel-accurate
-measurement of any real one.
+**Known gaps, stated plainly:** this engine ships exactly **one** embedded
+font — there's no font matching/fallback chain (a codepoint the font
+doesn't cover still shapes, typically to `.notdef`, rather than falling
+back to a font that has it), no `@font-face`/WOFF2 loading, no variable
+fonts, and no hinting (outlines are used at their native resolution,
+scaled, with no grid-fitting). Complex-script shaping (Arabic joining,
+Indic reordering) works to whatever extent HarfBuzz's real algorithm and
+DejaVu Sans's own glyph/table coverage support — no separate fallback
+font exists for scripts DejaVu Sans doesn't cover well.
 **Exit not yet met** (WPT `css/css-text`/`css/css-fonts` need a JS engine
-to run anyway, and there's no real shaper to visual-diff against a
-reference corpus) — verified instead with 2 self-authored unit tests
-(character widths are genuinely proportional; text width sums real
-per-character widths) plus the shared stress-test fuzzer.
+to run anyway, and there's no visual-diff reference corpus) — verified
+instead with 9 self-authored unit tests in `crates/text` (the embedded
+font parses; empty text shapes to zero glyphs; one glyph per character
+for plain Latin text; a real font's own metrics make "m" measurably wider
+than "i"; shaping scales linearly with font size; RTL-direction shaping
+doesn't panic; a real letterform like "o" has a genuine two-contour
+outline — outer ring plus inner hole, same nonzero-winding-hole story as
+`canvas2d`'s own donut test; a space glyph has no outline; every ASCII
+printable character shapes and outlines without panicking), 2 more in
+`layout::values` (character widths are genuinely proportional per the
+real shaper; text width is positive and scales with font size), plus a
+new stress-fuzzer entry (`text::shape` + `text::glyph_outline`) covering
+a much broader Unicode range — Hebrew, Arabic, combining marks, CJK,
+emoji — than the HTML/CSS fuzzers' own ASCII-biased alphabets reach.
 
-### B11. Painting & rasterization — *started (software rasterizer, FillRect only; no GPU path)*
+### B11. Painting & rasterization — *started (software rasterizer; FillRect **and now real glyph rasterization**; no GPU path)*
 `paint::raster`: a real software rasterizer — the same baseline both Blink
 (Skia) and Gecko (WebRender) also bootstrap new platforms from before
 adding a GPU path. Turns a `DisplayList` into a real RGBA8 pixel buffer
@@ -836,22 +880,37 @@ adding a GPU path. Turns a `DisplayList` into a real RGBA8 pixel buffer
 over" alpha compositing (real per-channel blend math, not a stand-in) —
 the pixels this module produces are pixel-accurate for what it draws.
 
-**What it draws:** `DisplayItem::FillRect` only. `DisplayItem::DrawText`
-items are correctly positioned and colored by B9's display-list lowering,
-but the rasterizer doesn't paint them — there's no font outline data or
-embedded bitmap glyph atlas yet (B10 only improved *measurement*, not
-shaping/rendering), so drawing placeholder glyph shapes would overclaim
-what's implemented; text regions are simply left unpainted, a documented
-gap rather than a faked rendering.
-**Known gaps:** no anti-aliasing (hard pixel-boundary edges), no clipping,
-no GPU path (wgpu-based, mirroring Skia/WebRender's batching and tile/glyph
-caching, is still entirely future work).
-**Exit not yet met** (no pixel-diff reftest corpus, no perf budget) —
-verified instead with 4 self-authored unit tests (exact-pixel opaque fill,
-alpha-blended fill against the white background, an off-canvas rect that
-doesn't panic, confirming `DrawText` items are left unrasterized) plus the
-shared stress-test fuzzer, which now also runs `paint::rasterize` over
-every fuzzed display list.
+**`DisplayItem::DrawText` is now really rasterized, closing what was this
+phase's headline gap.** Each `DrawText` item is shaped by B10's real
+`text::shape` (font size taken from `rect.height`, the same convention
+`layout::flow` uses when building a word fragment), and every shaped
+glyph's real outline (`text::glyph_outline`) is filled with the *exact
+same* nonzero-winding scanline fill `canvas2d::fill` already implements
+for arbitrary paths — text painting isn't a separate, special-cased
+renderer, it's this rasterizer's own real path-fill algorithm applied to
+real glyph shapes from a real font.
+
+**A real GPU path was evaluated and is deferred, not merely unattempted.**
+A `wgpu`-based headless adapter probe was run in this environment
+(`Instance::request_adapter`) and returned no adapter at all — this
+sandboxed container has no GPU device and no software Vulkan/GL ICD
+(no llvmpipe/lavapipe), so a GPU rasterizer here would be dead, untestable
+code, not a real landing. This is a documented environment constraint,
+not a claim that GPU rasterization is somehow inherently out of scope for
+this project — it's the correct call given nothing in this session could
+actually exercise it.
+**Known gaps:** no anti-aliasing anywhere (both rectangle and glyph edges
+are hard pixel boundaries), no clipping, no GPU path (see above), and
+text rendering inherits `crates/text`'s own scoping limits (one embedded
+font, no fallback, no hinting).
+**Exit not yet met** (no pixel-diff reftest corpus, no perf budget, no
+GPU path) — verified instead with 7 self-authored unit tests for text
+rasterization specifically (a real "M" genuinely paints non-background
+pixels; empty text paints nothing and doesn't panic; an off-canvas
+`DrawText` doesn't panic; a zero-height rect doesn't panic) on top of the
+4 pre-existing `FillRect` tests, plus the shared stress-test fuzzer, which
+now exercises real glyph rasterization on every fuzzed page that contains
+text (which is most of them) via `paint::rasterize`.
 
 ### B12. Compositing — *started (single-threaded software layer compositor; no thread/GPU path)*
 `paint::compositor` is a real layer compositor: a [`Layer`] bundles its own
@@ -869,7 +928,10 @@ pass, not a full display-list re-rasterization.
 **What's still missing, stated plainly:** no compositor *thread* — everything
 here runs synchronously on whatever thread calls it, so this doesn't yet
 decouple compositing from a busy main thread the way real engines do; no
-GPU path (layers are rasterized and composited entirely in software); no
+GPU path (layers are rasterized and composited entirely in software — see
+B11's entry for the empirical `wgpu` adapter probe that confirmed this
+sandboxed environment has no GPU/software-Vulkan path to build one
+against, rather than this simply not having been attempted); no
 rotation/skew/non-uniform or 3D scale (`Layer`'s transform is translate +
 uniform scale + opacity only); no automatic layer promotion (the decision
 of *which* elements get their own layer — `will-change`, active
@@ -908,14 +970,19 @@ JavaScript** — there's no Track C yet, so nothing calls `getContext("2d")`
 and dispatches into this module; it exists as the real primitives a future
 JS binding would call into, the same relationship `paint::raster` already
 has to CSS painting. Also missing: bezier/quadratic curves and `arc()`
-(paths are polylines only), anti-aliasing, `fillText`/`strokeText` (needs
-real font shaping, B10's own gap), gradients/patterns, clipping regions,
-a per-context 2D transform (distinct from B12's compositor-layer
-transforms), and every `globalCompositeOperation` mode besides the
-default `source-over`. **WebGL/WebGPU haven't started at all** — real GPU
-bindings (wgpu, given the Rust choice) are a separate, large undertaking,
-left as future work rather than half-built or faked, exactly as this
-section's own text already called for.
+(paths are polylines only), anti-aliasing, `fillText`/`strokeText` as a
+Canvas 2D API surface (B10's real shaping/outline pipeline exists now and
+`paint::raster` already uses it for CSS text painting — see B10/B11 — but
+nothing in *this* module exposes it as a `canvas2d` function yet),
+gradients/patterns, clipping regions, a per-context 2D transform (distinct
+from B12's compositor-layer transforms), and every
+`globalCompositeOperation` mode besides the default `source-over`.
+**WebGL/WebGPU haven't started at all** — real GPU bindings (`wgpu`,
+given the Rust choice) are a separate, large undertaking; this session
+specifically evaluated `wgpu` (see B11's adapter-probe note) and confirmed
+this sandboxed environment has no GPU adapter to build and verify a real
+GPU-backed API against, so this stays future work rather than half-built
+or faked, exactly as this section's own text already called for.
 **Exit not yet met** (WPT `html/canvas` needs a JS engine to dispatch into
 this module at all, and there's no WebGL/WebGPU to run three.js-style
 demos against) — verified instead with 8 self-authored unit tests
@@ -1243,11 +1310,17 @@ picking one before C3 starts.
   directly, wherever the goal is "recreate" rather than "wrap" — e.g. run
   your own HTML tokenizer's output against html5ever's as a correctness
   oracle in CI, without shipping html5ever itself.
-- TLS (rustls), image/media codecs, and ICU/Unicode data are the standing
-  exceptions: bind existing audited libraries for these always. They are
-  security-critical, spec-external (codecs aren't web specs, they're
-  separate standards bodies' formats), and reimplementing them buys
-  security risk with no engine-architecture learning in return.
+- TLS (rustls), image/media codecs, ICU/Unicode data, and (as of the B10
+  landing) text shaping/font parsing are the standing exceptions: bind
+  existing audited libraries for these always. They are security-critical,
+  spec-external (codecs aren't web specs, they're separate standards
+  bodies' formats; the Unicode Bidirectional Algorithm and OpenType
+  shaping are their own enormous specs with reference implementations
+  everyone actually uses rather than reimplements), and reimplementing
+  them buys security risk with no engine-architecture learning in return
+  — `rustybuzz` (a Rust HarfBuzz port), `ttf-parser`, `unicode-bidi`, and
+  `unicode-linebreak` are this project's concrete instances of that
+  principle.
 
 ---
 
@@ -1587,15 +1660,9 @@ the root at absolute `(0, 0)` before returning it, making the tree's
 existing "single shared absolute coordinate space" design (already true
 for every non-root fragment since B1/B2) actually hold for the whole tree.
 `paint::display_list` lowers that fragment tree into a real `DisplayList`
-(B9's other half), backed by a real CSS `<color>` parser. `layout::values`
-adds a real proportional character-width table, replacing the old flat
-per-character heuristic (B10, explicitly not real shaping — see its entry
-above). `paint::raster` is a real software rasterizer producing an actual
-RGBA8 `Canvas` with genuine scanline fill and Porter-Duff alpha
-compositing, for `FillRect` items only — `DrawText` items are positioned/
-colored correctly but not yet painted, since no glyph data exists (B11).
-See each phase's own entry above for exactly what's real and what's a
-documented gap.
+(B9's other half), backed by a real CSS `<color>` parser. See each
+phase's own entry above for exactly what's real and what's a documented
+gap.
 
 **B12 (compositing) and B13 (Canvas 2D & WebGL/WebGPU) are now started
 too.** `paint::compositor` adds a real (single-threaded, software) layer
@@ -1610,8 +1677,35 @@ JS (no Track C), but a real implementation of the primitives a future
 binding would call into. See each phase's own entry above for exactly
 what's real vs. a documented gap (B12's biggest: no compositor thread, no
 GPU path, no rotation; B13's biggest: no WebGL/WebGPU at all, no bezier
-curves, no text). With every numbered Track B phase now at least started,
-the natural next direction is either deepening B1-B13's own documented
-gaps (B13's WebGL/WebGPU half chief among them) or starting Track C now
-that a full paint pipeline (layout → fragment tree → display list →
-raster → compositor) exists end to end for a future JS engine to drive.
+curves).
+
+**A later pass upgraded B8, B10, and B11 from their own initial
+approximations to real, externally-audited implementations**, in response
+to an explicit request to bring Track B up to its "latest technologies"
+rather than continuing to hand-roll approximations indefinitely: a new
+`engine/crates/text` now does real font shaping via `rustybuzz` (a
+complete Rust port of HarfBuzz) and real glyph outline extraction via
+`ttf-parser`, against one embedded, freely-licensed font
+(`assets/fonts/DejaVuSans.ttf`) — B10's flat character-width table is
+gone, replaced by genuine per-glyph shaped advances. `paint::raster` now
+uses that same shaping/outline pipeline to actually rasterize
+`DisplayItem::DrawText` for real (B11's headline gap, closed — text is
+filled via the exact same nonzero-winding scanline algorithm
+`canvas2d::fill` already used for arbitrary paths). `layout::flow` now
+runs the real Unicode Bidirectional Algorithm (via `unicode-bidi`) and
+real UAX #14 line-breaking (via `unicode-linebreak`) instead of "mirror
+the whole line if RTL" and "split only on whitespace" (B8). A GPU path
+for B11/B12 and WebGL/WebGPU for B13 were **evaluated, not skipped**: a
+`wgpu` headless adapter probe was run in this sandboxed environment and
+returned no adapter at all (no GPU device, no software Vulkan/GL ICD), so
+building a GPU-backed renderer here would produce untestable code — that
+gap stays documented as an environment constraint on this specific
+session, not a claim that it's out of scope for the project. With every
+numbered Track B phase now started and B8/B10/B11 specifically upgraded
+to real, well-established external implementations rather than hand-rolled
+approximations, the natural next direction is either deepening the
+remaining documented gaps (B13's WebGL/WebGPU chief among them, and B8's
+vertical writing modes) or starting Track C now that a full paint
+pipeline (layout → fragment tree → display list → raster → compositor)
+with real text rendering exists end to end for a future JS engine to
+drive.

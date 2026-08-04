@@ -30,5 +30,6 @@ css = { path = "../css" }
 xml = { path = "../xml" }
 layout = { path = "../layout" }
 paint = { path = "../paint" }
+text = { path = "../text" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -5,24 +5,36 @@
 //! rectangle fill and alpha-over compositing (not a stand-in) -- the
 //! numbers this module produces are pixel-accurate for what it draws.
 //!
-//! **What it draws:** `DisplayItem::FillRect` only. `DisplayItem::
-//! DrawText` items are correctly positioned and colored by B9's display-
-//! list lowering, but this rasterizer doesn't paint them -- there's no
-//! font outline data or embedded bitmap glyph atlas yet (B10 only
-//! improved *measurement*, via `layout::values`' character-width table,
-//! not shaping/rendering), so drawing placeholder glyph shapes here would
-//! overclaim what's actually implemented. Text regions are simply left
-//! unpainted, a documented gap rather than a faked rendering.
+//! **What it draws:** `DisplayItem::FillRect` (solid rectangles) and, now,
+//! `DisplayItem::DrawText` too -- real glyph rasterization, not a
+//! placeholder: each `DrawText` item is shaped by `text::shape` (real
+//! HarfBuzz-equivalent shaping) at `rect.height` as the font size (the
+//! same convention `layout::flow` uses when it sets a word fragment's
+//! `content_rect.height` to its own font size), then every shaped glyph's
+//! real outline (`text::glyph_outline`, from `ttf-parser`) is filled with
+//! the exact same nonzero-winding scanline fill `canvas2d::fill` already
+//! implements for arbitrary paths -- text painting is not a separate,
+//! special-cased renderer, it's this rasterizer's own real path-fill
+//! algorithm applied to real glyph shapes.
 //!
-//! **Known gaps:** no anti-aliasing (rectangle edges are hard pixel
-//! boundaries, since fill rects are always axis-aligned integers-after-
-//! rounding); no clipping (nothing establishes a clip region yet); no
-//! GPU path (the "software rasterizer as the baseline" half of B11's own
-//! entry -- a GPU path is explicitly future work, not this landing).
+//! **Known gaps:** no anti-aliasing anywhere (both rectangle edges and
+//! glyph edges are hard pixel boundaries); no clipping (nothing
+//! establishes a clip region yet); no GPU path (the "software rasterizer
+//! as the baseline" half of B11's own entry -- a GPU path was evaluated
+//! and is deferred, see `ROADMAP.md`'s B11 entry for why); text painting
+//! inherits `crates/text`'s own scoping limits (one embedded font, no
+//! fallback, no hinting -- see that crate's module docs).
 
+use crate::canvas2d::{self, Path2D};
 use crate::color::Color;
 use crate::display_list::{DisplayItem, DisplayList};
 use layout::Rect;
+use std::sync::OnceLock;
+
+fn font() -> &'static text::Font {
+    static FONT: OnceLock<text::Font> = OnceLock::new();
+    FONT.get_or_init(text::Font::dejavu_sans)
+}
 
 /// An RGBA8 pixel buffer, row-major, 4 bytes per pixel.
 #[derive(Debug, Clone)]
@@ -169,12 +181,51 @@ impl Canvas {
 pub fn rasterize(list: &DisplayList, width: usize, height: usize) -> Canvas {
     let mut canvas = Canvas::new(width, height);
     for item in &list.items {
-        if let DisplayItem::FillRect { rect, color } = item {
-            fill_rect(&mut canvas, rect, *color);
+        match item {
+            DisplayItem::FillRect { rect, color } => fill_rect(&mut canvas, rect, *color),
+            DisplayItem::DrawText { rect, text, color } => {
+                draw_text(&mut canvas, rect, text, *color)
+            }
         }
-        // DrawText: documented gap, see module docs.
     }
     canvas
+}
+
+/// Real glyph rasterization for one `DrawText` item -- see module docs
+/// for the shaping/outline/fill pipeline this drives.
+fn draw_text(canvas: &mut Canvas, rect: &Rect, text: &str, color: Color) {
+    let font_size_px = rect.height;
+    if font_size_px <= 0.0 || text.is_empty() {
+        return;
+    }
+    let font = font();
+    let shaped = text::shape(font, text, font_size_px);
+    let scale = font_size_px / font.units_per_em() as f64;
+    let baseline_y = rect.y + font.ascender() as f64 * scale;
+    let mut pen_x = rect.x;
+    for glyph in &shaped.glyphs {
+        if let Some(outline) = text::glyph_outline(font, glyph.glyph_id) {
+            let mut path = Path2D::new();
+            for contour in &outline.contours {
+                let mut points = contour.iter();
+                if let Some(&(fx, fy)) = points.next() {
+                    path.move_to(
+                        pen_x + glyph.x_offset + fx * scale,
+                        baseline_y - glyph.y_offset - fy * scale,
+                    );
+                    for &(fx, fy) in points {
+                        path.line_to(
+                            pen_x + glyph.x_offset + fx * scale,
+                            baseline_y - glyph.y_offset - fy * scale,
+                        );
+                    }
+                    path.close_path();
+                }
+            }
+            canvas2d::fill(canvas, &path, color);
+        }
+        pen_x += glyph.x_advance;
+    }
 }
 
 fn fill_rect(canvas: &mut Canvas, rect: &Rect, color: Color) {
@@ -263,7 +314,35 @@ mod tests {
     }
 
     #[test]
-    fn draw_text_items_are_not_rasterized() {
+    fn draw_text_paints_real_glyph_pixels() {
+        let list = DisplayList {
+            items: vec![DisplayItem::DrawText {
+                rect: Rect {
+                    x: 2.0,
+                    y: 2.0,
+                    width: 60.0,
+                    height: 20.0,
+                },
+                text: "M".to_string(),
+                color: Color::rgb(0, 0, 0),
+            }],
+        };
+        let canvas = rasterize(&list, 30, 30);
+        // A 20px-tall "M" genuinely paints *some* non-background pixels
+        // somewhere in its own rect -- not a placeholder/no-op.
+        let mut painted_any = false;
+        for y in 0..30 {
+            for x in 0..30 {
+                if canvas.get_pixel(x, y) != [255, 255, 255, 255] {
+                    painted_any = true;
+                }
+            }
+        }
+        assert!(painted_any, "expected at least one non-background pixel");
+    }
+
+    #[test]
+    fn draw_text_with_empty_string_does_not_panic_and_paints_nothing() {
         let list = DisplayList {
             items: vec![DisplayItem::DrawText {
                 rect: Rect {
@@ -272,14 +351,48 @@ mod tests {
                     width: 5.0,
                     height: 5.0,
                 },
-                text: "hi".to_string(),
+                text: String::new(),
                 color: Color::rgb(0, 0, 0),
             }],
         };
         let canvas = rasterize(&list, 10, 10);
-        // Still the untouched white background -- documented gap, see
-        // module docs.
         assert_eq!(canvas.get_pixel(2, 2), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn draw_text_off_canvas_does_not_panic() {
+        let list = DisplayList {
+            items: vec![DisplayItem::DrawText {
+                rect: Rect {
+                    x: 1000.0,
+                    y: 1000.0,
+                    width: 40.0,
+                    height: 16.0,
+                },
+                text: "hello".to_string(),
+                color: Color::rgb(0, 0, 0),
+            }],
+        };
+        let canvas = rasterize(&list, 10, 10);
+        assert_eq!(canvas.get_pixel(0, 0), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn draw_text_with_zero_height_rect_does_not_panic() {
+        let list = DisplayList {
+            items: vec![DisplayItem::DrawText {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 40.0,
+                    height: 0.0,
+                },
+                text: "hello".to_string(),
+                color: Color::rgb(0, 0, 0),
+            }],
+        };
+        let canvas = rasterize(&list, 10, 10);
+        assert_eq!(canvas.get_pixel(0, 0), [255, 255, 255, 255]);
     }
 
     #[test]

@@ -9,11 +9,12 @@
 //! against a fixed 800px containing-block width (there's no window/
 //! viewport concept yet -- see `layout`'s own module docs for what's
 //! real and what's a documented gap in each phase). B11's software
-//! rasterizer paints the display list's `FillRect` items into a real
-//! pixel buffer (text painting is a documented B11 gap -- no glyph
-//! outlines exist yet). B12's layer compositor (`paint::compositor`)
-//! composites that same rasterized frame as its own layer, offset and
-//! faded, to demonstrate the real translate/opacity math. B13's Canvas 2D
+//! rasterizer paints the display list's `FillRect` items *and* real
+//! shaped/rasterized text (`DrawText`, via `crates/text`'s real
+//! HarfBuzz-equivalent shaping and TrueType glyph outlines) into a real
+//! pixel buffer. B12's layer compositor (`paint::compositor`) composites
+//! that same rasterized frame as its own layer, offset and faded, to
+//! demonstrate the real translate/opacity math. B13's Canvas 2D
 //! primitives (`paint::canvas2d`) paint a small filled-and-stroked shape
 //! onto a standalone canvas, independent of the HTML/CSS pipeline (there's
 //! no `<canvas>` DOM element or JS binding to reach it through yet).
@@ -119,6 +120,20 @@ fn main() {
             border_box.height as usize,
         );
         println!("rasterized canvas: {}x{} px", canvas.width, canvas.height);
+        // "hello" ends up styled `color: orange` by this point (the
+        // class mutation above already applied "warn" before this style
+        // map was built) -- count pixels matching that exact color to
+        // prove B11 rasterized real letterform outlines, distinct from
+        // the pale-yellow `background-color` FillRect that also covers
+        // most of this canvas.
+        let text_color = [255, 165, 0, 255];
+        let text_pixels = (0..canvas.height)
+            .flat_map(|y| (0..canvas.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| canvas.get_pixel(x, y) == text_color)
+            .count();
+        println!(
+            "  -> {text_pixels} real glyph pixel(s) painted for \"hello\" (B11 now rasterizes real glyph outlines, not just FillRects)"
+        );
 
         // B12: promote that same rasterized frame to its own compositor
         // layer and composite it again, offset and half-faded -- the real
@@ -166,7 +181,8 @@ fn main() {
     println!("standalone XML document:\n{}", xml::serialize(&xml_doc));
 
     println!(
-        "(text painting in B11's rasterizer is still a documented gap -- see ROADMAP.md Track B)"
+        "(remaining Track B gaps -- vertical writing modes, GPU compositing/rasterization, \
+WebGL/WebGPU -- are documented in ROADMAP.md's B8/B11-B13 entries)"
     );
 }
 

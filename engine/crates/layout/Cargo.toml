@@ -10,6 +10,9 @@ workspace = true
 [dependencies]
 dom = { path = "../dom" }
 css = { path = "../css" }
+text = { path = "../text" }
+unicode-bidi = "0.3"
+unicode-linebreak = "0.1"
 
 [dev-dependencies]
 html = { path = "../html" }

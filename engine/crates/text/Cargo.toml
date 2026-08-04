@@ -1,5 +1,5 @@
 [package]
-name = "paint"
+name = "text"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -8,8 +8,5 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-layout = { path = "../layout" }
-text = { path = "../text" }
-
-[dev-dependencies]
-dom = { path = "../dom" }
+rustybuzz = "0.20"
+ttf-parser = "0.25"

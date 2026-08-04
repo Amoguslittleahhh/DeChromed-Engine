@@ -28,21 +28,37 @@ mirroring. See `ROADMAP.md`'s B1-B8 entries for exactly what's real vs.
 a documented gap (`::before`/`::after` generated content, the several
 gaps that trace back to "no intrinsic sizing yet", B6's simplified
 containing-block resolution, and B8's complete absence of vertical
-writing modes/UAX #9 bidi are the biggest ones).
+writing modes are the biggest ones -- **B8's other big gap, UAX #9 bidi,
+is now real, see below**).
 
-**B9 (fragment tree & display list), B10 (text shaping & fonts), and B11
-(painting & rasterization) are started too**, in a new `crates/paint`
+**B9 (fragment tree & display list) is started**, in a new `crates/paint`
 crate plus additions to `crates/layout`. `layout::query` implements real
 `getBoundingClientRect`/`elementFromPoint` equivalents by reading the
-fragment tree's already-absolute coordinates directly (B9); `paint::
+fragment tree's already-absolute coordinates directly; `paint::
 display_list` lowers that tree into a real `DisplayList` of draw commands,
-backed by a real CSS `<color>` parser (B9); `layout::values` adds a real
-proportional character-width table replacing the old flat per-character
-heuristic (B10, not real font shaping); and `paint::raster` is a real
-software rasterizer producing an actual RGBA8 pixel buffer with genuine
-scanline fill and Porter-Duff alpha compositing, for `FillRect` items only
--- `DrawText` items are positioned/colored correctly but not yet painted,
-since no glyph data exists yet (B11).
+backed by a real CSS `<color>` parser.
+
+**B8 (bidi/line-breaking), B10 (text shaping & fonts), and B11 (painting &
+rasterization) were upgraded to real, externally-audited implementations**,
+replacing their own earlier hand-rolled approximations. A new
+`crates/text` does real font shaping via [`rustybuzz`](https://github.com/harfbuzz/rustybuzz)
+(a complete Rust port of HarfBuzz) and real glyph outline extraction via
+[`ttf-parser`](https://github.com/RazrFalcon/ttf-parser), against one
+embedded, freely-licensed font (`assets/fonts/DejaVuSans.ttf`) --
+`layout::values::text_width_px` now measures text with real shaped
+advances instead of a per-character width-ratio table (B10).
+`layout::flow` now runs the real Unicode Bidirectional Algorithm (via
+`unicode-bidi`) and real UAX #14 line-breaking (via `unicode-linebreak`)
+instead of "mirror the whole line if RTL" and "split only on whitespace"
+(B8). `paint::raster` is a real software rasterizer producing an actual
+RGBA8 pixel buffer with genuine scanline fill and Porter-Duff alpha
+compositing, for `FillRect` items *and now real glyph rasterization* --
+`DrawText` items are shaped and their real glyph outlines filled with the
+same nonzero-winding algorithm `canvas2d::fill` uses for arbitrary paths
+(B11, this phase's former headline gap, now closed). A `wgpu` GPU path
+was evaluated for B11/B12 and confirmed infeasible in this sandboxed
+environment (no GPU adapter available at all) rather than simply
+unattempted -- see `ROADMAP.md`'s B11 entry.
 
 **B12 (compositing) and B13 (Canvas 2D & WebGL/WebGPU) are started too.**
 `paint::compositor` is a real (single-threaded, software) layer
@@ -77,15 +93,18 @@ engine/
     html/                    A2 (tokenizer) + A3 (tree construction) + A8/A9 (SVG/MathML foreign content) -- all done
     css/                     A4-A7 (tokenizer/parser, selectors, cascade, CSSOM) -- all done
     xml/                     A10 (standalone XML 1.0 parser + namespace resolution) -- done; also A8's standalone-SVG-document entry point
-    layout/                  B1-B8 (box tree, block/inline layout, tables, flexbox, grid, positioning, multi-column, logical properties/RTL) started; B9's query.rs (fragment-tree queries) + B10's char-width table also started
-    paint/                   B9 (display-list lowering + color parsing), B11 (software rasterizer), B12 (layer compositor), and B13 (Canvas 2D primitives) all started; B13's WebGL/WebGPU half not started
+    layout/                  B1-B8 (box tree, block/inline layout, tables, flexbox, grid, positioning, multi-column, logical properties/RTL + real UAX #9 bidi/UAX #14 line-breaking) started; B9's query.rs (fragment-tree queries) also started
+    text/                    B10 (real font shaping via rustybuzz + glyph outlines via ttf-parser, one embedded font) -- new crate, shared by layout (measurement) and paint (glyph painting)
+    paint/                   B9 (display-list lowering + color parsing), B11 (software rasterizer, now with real glyph rasterization), B12 (layer compositor), and B13 (Canvas 2D primitives) all started; B13's WebGL/WebGPU half not started (see ROADMAP.md's B11 entry for why -- no GPU adapter in this environment)
     js_bindings/              Track C -- placeholder, shape depends on "the JS engine question"
     net/                     D1-D3 (URL parsing, networking, resource loading) -- currently placeholders
     media/                   D5-D7 (images, audio/video, WebRTC) -- currently empty
     a11y/                    F2 (accessibility tree) -- currently placeholders
     devtools/                F1 (inspector protocol) -- currently placeholders
-    shell/                   binary crate; a real HTML->DOM->CSS->selector-match->cascade->getComputedStyle->incremental-restyle->foreign-content->XML->box-tree->layout->fragment-tree-query->display-list->raster->compositor pipeline smoke test, plus a standalone Canvas 2D demo (text painting is still a documented B11 gap)
+    shell/                   binary crate; a real HTML->DOM->CSS->selector-match->cascade->getComputedStyle->incremental-restyle->foreign-content->XML->box-tree->layout->fragment-tree-query->display-list->raster (incl. real text)->compositor pipeline smoke test, plus a standalone Canvas 2D demo
     html5lib_harness/        A2/A3/A8/A9's conformance harness (see below)
+  assets/
+    fonts/                   the one embedded font (DejaVu Sans) crates/text ships -- see its own README.md for licensing
 ```
 
 Every placeholder crate's `lib.rs` doc comment says which roadmap phase
@@ -197,10 +216,12 @@ resolution/round-trip-serialization cases.
 
 `crates/html5lib_harness/src/bin/stress_test.rs` is a cross-crate,
 conformance-blind fuzzer for Track A (A1-A10) and now Track B's
-`layout::layout`, `paint::build_display_list`/`paint::rasterize`,
-`paint::composite_layers`, and `paint::canvas2d`'s fill/stroke/`ImageData`
-too: it doesn't check parser *output* against an expected answer (that's
-the tokenizer/tree-construction harnesses above), only that
+`layout::layout`, `paint::build_display_list`/`paint::rasterize` (which now
+also exercises real glyph shaping/rasterization on every fuzzed page with
+text), `paint::composite_layers`, `paint::canvas2d`'s fill/stroke/
+`ImageData`, and `text::shape`/`text::glyph_outline` directly too: it
+doesn't check parser *output* against an expected answer (that's the
+tokenizer/tree-construction harnesses above), only that
 `html::parse_document`, `css::parse_stylesheet`,
 `css::selectors::parse_selector_list`, `xml::parse_document`, the
 cascade/computed-style pipeline, `layout::build_box_tree`/`layout::layout`
@@ -208,10 +229,13 @@ cascade/computed-style pipeline, `layout::build_box_tree`/`layout::layout`
 ones), the same fragment trees lowered through `paint::build_display_list`
 and rasterized via `paint::rasterize`, `paint::composite_layers` fed
 randomized layer counts/offsets/scales/opacities (including deliberately
-out-of-range values), and `paint::canvas2d` fed randomized path point
-sequences (mixed move/line/close, coordinates far outside the canvas) all
-return *something* (or a graceful `Err`) instead of panicking, hanging, or
-aborting the process, across:
+out-of-range values), `paint::canvas2d` fed randomized path point
+sequences (mixed move/line/close, coordinates far outside the canvas), and
+`text::shape`/`text::glyph_outline` fed random text across a much broader
+Unicode range (Hebrew, Arabic, combining marks, CJK, emoji) than the
+HTML/CSS fuzzers' own ASCII-biased alphabets reach, all return *something*
+(or a graceful `Err`) instead of panicking, hanging, or aborting the
+process, across:
 
 - **Truncation fuzzing**: every prefix length of a handful of realistic
   seed documents -- a surprisingly effective way to hit boundary

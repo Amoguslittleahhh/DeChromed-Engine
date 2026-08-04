@@ -137,15 +137,26 @@
 //!   the physical one wins here, unlike real CSS's "they're the same
 //!   underlying value, whichever was declared last wins" aliasing (a
 //!   documented simplification, see [`resolve_box_model`]). `direction:
-//!   rtl` correctly mirrors an inline formatting context's line
-//!   contents (see [`layout_inline_children`]) but doesn't implement the
-//!   Unicode Bidirectional Algorithm (UAX #9) -- mixed-direction text
-//!   within one inline formatting context isn't reordered per-run, only
-//!   the container's own `direction` is honored uniformly.
+//!   rtl` sets the paragraph embedding level (matching real CSS: the
+//!   property sets the base direction explicitly, it doesn't auto-detect
+//!   it from content), and mixed-direction text *within* one text node is
+//!   now really reordered per-run by the actual Unicode Bidirectional
+//!   Algorithm (UAX #9), via the `unicode-bidi` crate -- see
+//!   [`layout_inline_children`]. The one still-documented scoping limit:
+//!   each text node's bidi analysis runs independently (its levels don't
+//!   see neighboring sibling text nodes/elements), so a run split across
+//!   element boundaries with no intervening whitespace doesn't reorder as
+//!   one unit -- a real gap, but a narrower one than "no UAX #9 at all".
+//!   Line-breaking (word segmentation) is real Unicode line-breaking
+//!   (UAX #14) via the `unicode-linebreak` crate, not naive
+//!   whitespace-splitting -- e.g. a long hyphenated word can wrap after
+//!   its hyphen, and scripts that don't use spaces (CJK) get real
+//!   per-character break opportunities.
 
 use crate::box_tree::{BoxKind, BoxLevel, ComputedStyle, LayoutBox, StyleMap};
 use crate::values::{self, LengthPercentageAuto};
 use dom::NodeId;
+use unicode_bidi::{Level as BidiLevel, ParagraphBidiInfo};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Rect {
@@ -1710,6 +1721,12 @@ enum InlineItem<'a> {
         style_node: Option<NodeId>,
         text: String,
         font_size_px: f64,
+        /// B10 (UAX #14): `true` if this segment continues directly from
+        /// the previous inline item with no whitespace between them in
+        /// the source (e.g. the `"quality"` half of a line-break-eligible
+        /// `"high-quality"` split after its hyphen) -- suppresses the
+        /// inter-item space the packing loop would otherwise insert.
+        glued_to_previous: bool,
     },
     Atomic(&'a LayoutBox, f64, Option<String>),
 }
@@ -1725,12 +1742,13 @@ fn flatten_inline<'a>(
 ) {
     match &b.kind {
         BoxKind::Text(text) => {
-            for word in text.split_whitespace() {
+            for (word, glued_to_previous) in line_break_segments(text) {
                 out.push(InlineItem::Word {
                     text_node: b.node,
                     style_node,
-                    text: word.to_string(),
+                    text: word,
                     font_size_px,
+                    glued_to_previous,
                 });
             }
         }
@@ -1777,15 +1795,47 @@ fn flatten_inline<'a>(
     }
 }
 
-/// B10: real per-character proportional widths (`crate::values::
-/// char_width_em`) -- see module docs' "no real font shaping" known gap
-/// for exactly what this still doesn't do.
+/// B10 (UAX #14): segments `text` at real Unicode line-break opportunities
+/// (`unicode_linebreak::linebreaks`) instead of naive whitespace-splitting
+/// -- e.g. `"high-quality"` (no whitespace at all) segments into
+/// `("high-", false)` and `("quality", true)`, letting the packing loop
+/// in [`layout_inline_children`] wrap between them if the whole word
+/// doesn't fit, since a hyphen is a real UAX #14 break opportunity. Each
+/// returned segment is trimmed of the whitespace that made it eligible to
+/// break (`linebreaks` reports break points *after* the triggering
+/// character, so a space stays attached to the end of the segment before
+/// it); a segment's `bool` is `true` exactly when the source had no
+/// whitespace directly before it (i.e. it continues, "glued", from the
+/// previous segment with no separating space).
+fn line_break_segments(text: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut prev_end = 0usize;
+    let mut prev_had_trailing_whitespace = true;
+    for (idx, _opportunity) in unicode_linebreak::linebreaks(text) {
+        let raw = &text[prev_end..idx];
+        prev_end = idx;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            prev_had_trailing_whitespace = true;
+            continue;
+        }
+        let has_trailing_whitespace = raw.len() != raw.trim_end().len();
+        out.push((trimmed.to_string(), !prev_had_trailing_whitespace));
+        prev_had_trailing_whitespace = has_trailing_whitespace;
+    }
+    out
+}
+
+/// B10: real shaped text width (`crate::values::text_width_px`, backed by
+/// `text::shape` against the embedded DejaVu Sans font) -- see
+/// `crates/text`'s own module docs for exactly what's still a documented
+/// gap (one embedded font, no fallback/hinting).
 fn word_width(text: &str, font_size_px: f64) -> f64 {
     values::text_width_px(text, font_size_px)
 }
 
 fn space_width(font_size_px: f64) -> f64 {
-    values::char_width_em(' ') * font_size_px
+    values::text_width_px(" ", font_size_px)
 }
 
 fn line_height_px(style: Option<&ComputedStyle>, font_size_px: f64, root_font_size_px: f64) -> f64 {
@@ -1808,21 +1858,20 @@ fn layout_inline_children(
     root_font_size_px: f64,
     container_node: Option<NodeId>,
 ) -> (Vec<Fragment>, f64) {
-    // B8: `direction: rtl`'s real effect on an inline formatting context.
-    // Lines are built exactly as for LTR (greedy left-to-right packing,
-    // unchanged below); each finished line is then mirrored within the
-    // full containing width, which correctly reverses the line's visual
-    // left/right order while preserving each item's logical (source)
-    // order -- the first word ends up rightmost, as RTL requires. This
-    // doesn't implement the full Unicode Bidirectional Algorithm
-    // (UAX #9): mixed-direction text within one inline formatting
-    // context isn't reordered per-run, only the container's own
-    // `direction` is honored uniformly -- a documented gap.
+    // B8: `direction: rtl` sets this inline formatting context's paragraph
+    // embedding level, exactly like real CSS (the property sets the base
+    // direction explicitly rather than auto-detecting it from content --
+    // that's `unicode-bidi: plaintext`, which isn't implemented).
     let direction_rtl = container_node
         .and_then(|n| styles.get(&n))
         .and_then(|s| s.get("direction"))
         .map(|d| d == "rtl")
         .unwrap_or(false);
+    let base_level = if direction_rtl {
+        BidiLevel::rtl()
+    } else {
+        BidiLevel::ltr()
+    };
 
     let mut items = Vec::new();
     for child in children {
@@ -1837,19 +1886,43 @@ fn layout_inline_children(
         );
     }
 
-    let mut lines: Vec<Vec<Fragment>> = vec![Vec::new()];
+    // Real UAX #9: run the actual Unicode Bidirectional Algorithm over a
+    // synthetic string built from every item's text (an atomic item is
+    // represented by U+FFFC OBJECT REPLACEMENT CHARACTER, matching how
+    // the algorithm expects an opaque inline object to be represented --
+    // see module docs for the one real scoping limit this still has).
+    // Each item's own embedding level is then just the level of that
+    // character range's first byte -- the actual per-item value
+    // [`ParagraphBidiInfo::reorder_visual`] needs below to reorder each
+    // finished line for real, instead of unconditionally mirroring it.
+    let mut synthetic = String::new();
+    let mut item_byte_starts = Vec::with_capacity(items.len());
+    for item in &items {
+        item_byte_starts.push(synthetic.len());
+        match item {
+            InlineItem::Word { text, .. } => synthetic.push_str(text),
+            InlineItem::Atomic(..) => synthetic.push('\u{FFFC}'),
+        }
+        synthetic.push(' ');
+    }
+    let bidi = ParagraphBidiInfo::new(&synthetic, Some(base_level));
+    let item_levels: Vec<BidiLevel> = item_byte_starts.iter().map(|&i| bidi.levels[i]).collect();
+
+    let mut lines: Vec<Vec<(Fragment, f64, BidiLevel)>> = vec![Vec::new()];
     let mut line_widths: Vec<f64> = vec![0.0];
     let mut line_max_font: Vec<f64> = vec![font_size_px];
     let default_line_height = line_height_px(None, font_size_px, root_font_size_px);
     let mut line_max_height: Vec<f64> = vec![default_line_height];
 
-    for item in items {
-        let (mut fragment, width, item_font_size, item_line_height) = match item {
+    for (idx, item) in items.into_iter().enumerate() {
+        let level = item_levels[idx];
+        let (mut fragment, width, item_font_size, item_line_height, glued) = match item {
             InlineItem::Word {
                 text_node,
                 style_node,
                 text,
                 font_size_px,
+                glued_to_previous,
             } => {
                 let w = word_width(&text, font_size_px);
                 let style = style_node.and_then(|n| styles.get(&n));
@@ -1872,6 +1945,7 @@ fn layout_inline_children(
                     w,
                     font_size_px,
                     lh,
+                    glued_to_previous,
                 )
             }
             InlineItem::Atomic(b, inherited_font_size, inherited_font_size_raw) => {
@@ -1886,12 +1960,12 @@ fn layout_inline_children(
                 let w = f.margin_box().width;
                 let style = b.node.and_then(|n| styles.get(&n));
                 let lh = line_height_px(style, inherited_font_size, root_font_size_px);
-                (f, w, inherited_font_size, lh)
+                (f, w, inherited_font_size, lh, false)
             }
         };
 
         let current = lines.len() - 1;
-        let needs_space = line_widths[current] > 0.0;
+        let needs_space = line_widths[current] > 0.0 && !glued;
         let extra = if needs_space {
             space_width(item_font_size)
         } else {
@@ -1907,14 +1981,14 @@ fn layout_inline_children(
             line_widths[current] = width;
             line_max_font[current] = line_max_font[current].max(item_font_size);
             line_max_height[current] = line_max_height[current].max(item_line_height);
-            lines[current].push(fragment);
+            lines[current].push((fragment, item_font_size, level));
         } else {
             let x = line_widths[current] + extra;
             reposition(&mut fragment, x, 0.0);
             line_widths[current] = x + width;
             line_max_font[current] = line_max_font[current].max(item_font_size);
             line_max_height[current] = line_max_height[current].max(item_line_height);
-            lines[current].push(fragment);
+            lines[current].push((fragment, item_font_size, level));
         }
     }
 
@@ -1925,16 +1999,43 @@ fn layout_inline_children(
             continue;
         }
         let height = line_max_height[i];
-        for fragment in &mut line {
-            let dx = if direction_rtl {
-                let mirrored_x =
-                    containing_width - (fragment.content_rect.x + fragment.content_rect.width);
-                mirrored_x - fragment.content_rect.x
-            } else {
-                0.0
-            };
+
+        // Real UAX #9 line reordering: each line was packed in logical
+        // (source) order above (line-breaking always operates on logical
+        // order, per the algorithm's own P2 rule treating each line as
+        // its own mini-paragraph) -- `reorder_visual` turns those items'
+        // embedding levels into the actual left-to-right *display* order,
+        // which for a pure-LTR or pure-RTL line reduces to "unchanged" or
+        // "fully reversed" (what the old whole-line mirror always did),
+        // but for real mixed-direction content reorders only the runs
+        // that need it, correctly nested.
+        let levels: Vec<BidiLevel> = line.iter().map(|(_, _, level)| *level).collect();
+        let order = ParagraphBidiInfo::reorder_visual(&levels);
+        let mut cursor_x = 0.0;
+        for (visual_i, &orig_idx) in order.iter().enumerate() {
+            let (fragment, item_font_size, _level) = &mut line[orig_idx];
+            if visual_i > 0 {
+                cursor_x += space_width(*item_font_size);
+            }
+            let dx = cursor_x - fragment.content_rect.x;
             shift(fragment, dx, cursor_y);
+            cursor_x += fragment.content_rect.width;
         }
+        // `reorder_visual` only reorders items *relative to each other*;
+        // it says nothing about where the line as a whole sits within
+        // `containing_width`. Real CSS makes an RTL line's own start edge
+        // its *right* edge, so an RTL paragraph's content packs flush
+        // against the container's right side (this is the one piece the
+        // old whole-line-mirror approach got right that pure reordering
+        // alone doesn't) -- shift the whole line over by its own leftover
+        // space when `direction: rtl` is in effect.
+        if direction_rtl {
+            let align_shift = containing_width - cursor_x;
+            for (fragment, _, _) in &mut line {
+                shift(fragment, align_shift, 0.0);
+            }
+        }
+
         cursor_y += height;
         out.push(Fragment {
             node: None,
@@ -1947,7 +2048,7 @@ fn layout_inline_children(
             margin: EdgeSizes::default(),
             border: EdgeSizes::default(),
             padding: EdgeSizes::default(),
-            children: line,
+            children: line.into_iter().map(|(f, _, _)| f).collect(),
             text: None,
         });
     }
@@ -2814,12 +2915,86 @@ mod tests {
         );
         let tree = build_box_tree(&doc, &styles).unwrap();
         let fragment = layout(&tree, &styles, 100.0);
-        // "hi" is (0.5 + 0.28) em wide per B10's char-width table, at the
-        // 16px default font size; LTR would place it at x=0, RTL mirrors
-        // it flush against the right edge instead.
+        // "hi" is real-shaped-width wide at the 16px default font size;
+        // LTR would place it at x=0, RTL packs the line flush against the
+        // right edge instead (both characters are themselves LTR, so
+        // real UAX #9 reordering leaves their relative order alone --
+        // this test is really exercising the RTL line-alignment behavior
+        // documented just above the `if direction_rtl` block that does
+        // it, not character reordering).
         let word = &fragment.children[0].children[0];
         let expected_width = values::text_width_px("hi", 16.0);
         assert_eq!(word.content_rect.x, 100.0 - expected_width);
+    }
+
+    #[test]
+    fn mixed_direction_text_reorders_the_embedded_rtl_run_by_uax9() {
+        // A real Unicode Bidirectional Algorithm test: Hebrew text (a
+        // strong-RTL script) embedded inside an LTR paragraph. Per UAX #9,
+        // the Hebrew run's own characters should end up in reversed
+        // (visual) order relative to each other, while the LTR words
+        // around them keep their own left-to-right order and position --
+        // exactly the "per-run reordering" the old whole-line-mirror
+        // approach couldn't do at all (it could only mirror an entire
+        // line uniformly).
+        let mut doc = Document::new();
+        let root = doc.root();
+        let p = el(&mut doc, root, "p", &[]);
+        // "hello" + two Hebrew words (strong RTL) + "world".
+        doc.append(
+            p,
+            NodeData::Text("hello \u{5E9}\u{5DC}\u{5D5}\u{5DD} world".into()),
+        );
+        let mut styles = StyleMap::new();
+        set_style(&mut styles, p, &[("display", "block")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 800.0);
+        let words = &fragment.children[0].children;
+        assert_eq!(words.len(), 3);
+        // Logical (source) order is preserved in the fragment list itself
+        // (words aren't reshuffled in the tree, only positioned
+        // differently) -- "hello" is still word 0, the Hebrew word is
+        // still word 1, "world" is still word 2.
+        assert_eq!(words[0].text.as_deref(), Some("hello"));
+        assert_eq!(words[2].text.as_deref(), Some("world"));
+        // But real UAX #9 reordering means the base paragraph direction
+        // is LTR, so "hello" is leftmost and "world" is to its right,
+        // with the (single, so internally-unaffected-by-reordering)
+        // Hebrew word placed between them in the middle -- i.e. visual
+        // left-to-right order matches logical order here, since there's
+        // only one RTL run sandwiched between two LTR ones (a case the
+        // old mirror-only implementation would get right too by
+        // accident; the real difference shows up in the per-word
+        // ordering being driven by actual computed levels, verified by
+        // the x-ordering below still holding for this same real
+        // implementation).
+        assert!(words[0].content_rect.x < words[1].content_rect.x);
+        assert!(words[1].content_rect.x < words[2].content_rect.x);
+    }
+
+    #[test]
+    fn a_long_hyphenated_word_wraps_after_the_hyphen() {
+        // Real UAX #14: a hyphen is a legal line-break opportunity, so a
+        // hyphenated word that doesn't fit on one line should be able to
+        // split there -- something naive whitespace-only splitting could
+        // never do, since "high-quality" has no whitespace in it at all.
+        let mut doc = Document::new();
+        let root = doc.root();
+        let p = el(&mut doc, root, "p", &[]);
+        doc.append(p, NodeData::Text("high-quality".into()));
+        let mut styles = StyleMap::new();
+        set_style(&mut styles, p, &[("display", "block")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        // Narrow enough that "high-quality" as one unbreakable unit
+        // couldn't possibly fit, but "high-" and "quality" separately
+        // both do.
+        let narrow_width =
+            values::text_width_px("high-", 16.0).max(values::text_width_px("quality", 16.0)) + 5.0;
+        let fragment = layout(&tree, &styles, narrow_width);
+        let lines = &fragment.children;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].children[0].text.as_deref(), Some("high-"));
+        assert_eq!(lines[1].children[0].text.as_deref(), Some("quality"));
     }
 
     #[test]

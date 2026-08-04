@@ -565,6 +565,47 @@ fn main() {
     }
     canvas2d_report.print_summary();
 
+    // B10/B11 (real shaping/rasterization): fuzz `text::shape` +
+    // `text::glyph_outline` directly with a much broader Unicode range
+    // than the HTML/CSS fuzzers' own ASCII-biased alphabets reach --
+    // strong-RTL scripts (Hebrew/Arabic, which drive real UAX #9 runs),
+    // combining marks, and codepoints the embedded font has no glyph for
+    // at all (which must resolve to `.notdef`/no outline gracefully, not
+    // panic). This is exactly the kind of adversarial input a real
+    // HarfBuzz-equivalent shaper and TrueType outline parser need to
+    // handle without crashing.
+    const UNICODE_RANGES: &[(u32, u32)] = &[
+        (0x20, 0x7e),       // ASCII
+        (0x5d0, 0x5ea),     // Hebrew (strong RTL)
+        (0x600, 0x6ff),     // Arabic (strong RTL, joining behavior)
+        (0x300, 0x36f),     // combining diacritical marks
+        (0x4e00, 0x4e8c),   // a couple of CJK ideographs
+        (0x1f600, 0x1f602), // emoji (outside the BMP, surrogate-pair territory in UTF-16 -- exercises real char-boundary handling)
+    ];
+    let mut text_report = Report::new("text::shape + glyph_outline");
+    let font = text::Font::dejavu_sans();
+    for _ in 0..iterations {
+        let len = rng.next_range(12);
+        let mut s = String::new();
+        for _ in 0..len {
+            let (lo, hi) = UNICODE_RANGES[rng.next_range(UNICODE_RANGES.len())];
+            let cp = lo + rng.next_range((hi - lo + 1) as usize) as u32;
+            if let Some(c) = char::from_u32(cp) {
+                s.push(c);
+            }
+        }
+        let font_size = [1.0, 16.0, 200.0][rng.next_range(3)];
+        let ltr = rng.next_range(2) == 0;
+        text_report.try_input(s.clone(), |s| {
+            let run = text::shape(&font, s, font_size);
+            for glyph in &run.glyphs {
+                let _ = text::glyph_outline(&font, glyph.glyph_id);
+            }
+            let _ = text::shape_with_direction(&font, s, font_size, ltr);
+        });
+    }
+    text_report.print_summary();
+
     let total_failures: usize = [
         &html_report,
         &css_report,
@@ -575,6 +616,7 @@ fn main() {
         &paint_report,
         &compositor_report,
         &canvas2d_report,
+        &text_report,
     ]
     .iter()
     .map(|r| r.failures.len())
