@@ -998,12 +998,53 @@ and an `ImageData` round-trip.
 
 ## Track C — Script & Runtime
 
-### C1. DOM Level tree API
-The actual addressable DOM (`Node`, `Element`, live `NodeList`/
-`HTMLCollection`, mutation algorithms per the DOM spec, not just an
-internal tree) — this has to exist as a real spec-shaped API before JS
-Track work is meaningful, since JS mostly *is* DOM manipulation in practice.
-**Exit:** WPT `dom/nodes` ≥75%.
+### C1. DOM Level tree API — *started (Node/Element/Document methods, real mutation algorithms, classList, querySelector family; no JS binding yet)*
+`dom::api` and `dom::class_list` layer the actual addressable DOM on top
+of `dom`'s existing arena tree (which its own module doc had already
+earmarked this as needing since A2/A3): `Node.nodeType`/`nodeName`,
+sibling/child navigation (`firstChild`/`previousSibling`/`nextSibling`),
+`Element`'s element-only navigation (`children`/`firstElementChild`/
+`previousElementSibling`/`childElementCount`, filtering out text/comment/
+PI siblings for real), `textContent` get/set (the real "collect every
+descendant text node in tree order" getter, and the real "replace all
+children with one text node, or none if empty" setter), real mutation
+algorithms (`removeChild`/`replaceChild`, both honoring the spec's own
+"no-op unless the node is actually this parent's child" precondition),
+`cloneNode(deep)` (genuine structural duplication into fresh node ids,
+not a second reference to the same nodes), `contains`/`isConnected`,
+`getElementById`/`getElementsByTagName` (real tree-order traversal
+algorithms, not a cached index), and a real, live, order-preserving
+`classList` (`add`/`remove`/`toggle`/`contains`) backed directly by the
+element's own `class` attribute string via the spec's own ordered-set
+parser/serializer algorithms. `css::query` (kept in `css`, not `dom`, to
+avoid `dom` depending on CSS selector syntax) adds real `querySelector`/
+`querySelectorAll`/`closest`/`Element.matches`, built directly on A5's
+existing `selectors::matches`.
+
+**A genuine architectural point, not a hedge:** every query here takes
+`&Document` explicitly and does a real traversal on each call — there is
+no cached `NodeList`/`HTMLCollection` object to go stale, because Rust's
+borrow checker already forbids holding a reference across a mutation that
+would invalidate it. This reproduces the DOM spec's own "live" requirement
+exactly (a query always reflects the current tree) without needing the
+separate caching-plus-invalidation machinery a garbage-collected language
+needs to get the same guarantee — see `dom::api`'s own module doc for the
+full argument.
+
+**Known gaps:** no `Range`/`Selection`; no `MutationObserver` (needs
+Track C2's event loop to queue records against); no cross-document
+`adoptNode` (this crate only ever has one `Document` per tree so far); no
+JS binding yet reaching any of this (that's C3+/C8) — this phase is the
+real Rust-side API surface a future binding calls into, the same
+relationship B9-B13's own "real primitives, not yet wired to JS" gaps
+already established for layout/paint. `remove_child` orphans a node
+rather than physically freeing its arena slot, a pre-existing (not new to
+C1) Track A simplification: this crate's arena never frees slots at all.
+**Exit not yet met** (WPT `dom/nodes` needs a JS engine to dispatch into
+this module at all) — verified instead with 25 self-authored unit tests
+in `dom::api`, 6 in `dom::class_list`, and 7 in `css::query`, plus the
+shell demo running the whole API end to end (nodeName, textContent,
+classList mutation, querySelector/closest, cloneNode).
 
 ### C2. Event loop & event dispatch
 Task queues/microtask queue ordering per the HTML spec (this ordering is
@@ -1709,3 +1750,17 @@ vertical writing modes) or starting Track C now that a full paint
 pipeline (layout → fragment tree → display list → raster → compositor)
 with real text rendering exists end to end for a future JS engine to
 drive.
+
+**Track C is now started too: C1 (the addressable DOM API) has a real
+first landing.** `dom::api`/`dom::class_list` add spec-shaped `Node`/
+`Element` methods and real mutation algorithms directly on top of the
+arena tree that's existed since A2/A3; `css::query` adds `querySelector`/
+`querySelectorAll`/`closest` built on A5's own selector matcher. See C1's
+own entry above for what's real (a genuinely live-by-construction query
+API, no separate caching layer needed, per that entry's own explanation
+of why) and what's a documented gap (`Range`/`Selection`,
+`MutationObserver`, cross-document `adoptNode`, and — the big one — no JS
+binding reaches any of this yet, since that's C2 (event loop) and C3+
+(the JS engine itself) territory). **C2 or C3 is the natural next Track C
+phase**, per "The JS engine question" section below, which still needs
+answering explicitly before committing to either.

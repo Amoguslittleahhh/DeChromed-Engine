@@ -4,7 +4,10 @@
 //! document, parsing a real stylesheet, matching a real selector,
 //! cascading/computing real styles, incrementally restyling after a
 //! targeted DOM mutation, parsing inline SVG via foreign content (A8/A9),
-//! and parsing a standalone XML document (A10). B1-B9 (box tree through
+//! and parsing a standalone XML document (A10). C1's real spec-shaped DOM
+//! API (`dom::api`/`dom::class_list`/`css::query`) is demonstrated next --
+//! nodeName, textContent, classList, querySelector/closest, cloneNode.
+//! B1-B9 (box tree through
 //! fragment-tree queries + display list) are real now too, run below
 //! against a fixed 800px containing-block width (there's no window/
 //! viewport concept yet -- see `layout`'s own module docs for what's
@@ -79,6 +82,47 @@ fn main() {
         "getComputedStyle(p).color = {:?} (after adding class \"warn\", {} node(s) restyled)",
         engine.get_computed_style(p, "color"),
         touched.len()
+    );
+
+    // C1: the real spec-shaped DOM API layered on the arena tree --
+    // Node/Element navigation, real mutation algorithms, classList, and
+    // (via css::query, built on A5's selector matcher) querySelector/
+    // querySelectorAll/closest.
+    println!("nodeName(p) = {:?}", document.node_name(p));
+    println!("textContent(p) = {:?}", document.text_content(p));
+    if let NodeData::Element(e) = document.data_mut(p) {
+        e.add_class("featured");
+        println!("classList after add(\"featured\") -> {:?}", e.attr("class"));
+        println!("classList.contains(\"warn\") = {}", e.has_class("warn"));
+        e.toggle_class("warn");
+        println!("classList after toggle(\"warn\") -> {:?}", e.attr("class"));
+    }
+    let body = find_first(&document, "body");
+    let query = css::selectors::parse_selector_list("p.featured").expect("selector should parse");
+    println!(
+        "querySelector(body, \"p.featured\") = {:?}",
+        css::query::query_selector(&document, body, &query)
+    );
+    println!(
+        "closest(p, \"body\") = {:?}",
+        css::query::closest(
+            &document,
+            p,
+            &css::selectors::parse_selector_list("body").expect("selector should parse")
+        )
+    );
+    // cloneNode demonstrated on a throwaway copy of the document, not the
+    // live one -- the real `document` below feeds straight into B1/B2's
+    // layout pass, and an unstyled clone spliced into it would confuse
+    // that pipeline rather than the DOM API this section is about.
+    let mut scratch = html::parse_document(input);
+    let scratch_p = find_first(&scratch, "p");
+    let scratch_body = find_first(&scratch, "body");
+    let clone = scratch.clone_node(scratch_p, true);
+    scratch.append_existing(scratch_body, clone);
+    println!(
+        "cloneNode(p, deep=true) -> new node {clone:?}, {} total <p> now (getElementsByTagName)",
+        scratch.get_elements_by_tag_name(scratch.root(), "p").len()
     );
 
     // B1/B2: build a real box tree from the computed styles above and lay

@@ -18,6 +18,10 @@
 
 use std::fmt;
 
+mod api;
+pub mod class_list;
+pub use api::NodeType;
+
 /// The three namespaces A3/A8/A9's tree construction actually switches
 /// between. Real DOM has more (XLink, XML, XMLNS as attribute namespaces),
 /// but those only matter for the small set of foreign attributes the HTML

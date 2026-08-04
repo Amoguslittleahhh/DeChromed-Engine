@@ -73,11 +73,31 @@ nonzero winding rule (so a donut/ring shape with an inner and outer
 subpath wound opposite ways renders a real hole), Bresenham line
 stroking, and `ImageData` get/put (B13's Canvas 2D half; WebGL/WebGPU
 haven't started at all, and nothing here is wired to the `<canvas>` DOM
-element or JS yet, since there's no Track C). See `ROADMAP.md`'s B9-B13
-entries for exactly what's real vs. a documented gap in each.
-`crates/shell/src/main.rs` runs the real pipeline end to end, including
-layout, fragment-tree queries, display-list lowering, rasterization,
-compositing a layer, and a standalone Canvas 2D fill/stroke.
+element or JS yet -- Track C's own JS binding is still ahead). See
+`ROADMAP.md`'s B9-B13 entries for exactly what's real vs. a documented
+gap in each. `crates/shell/src/main.rs` runs the real pipeline end to
+end, including layout, fragment-tree queries, display-list lowering,
+rasterization, compositing a layer, and a standalone Canvas 2D
+fill/stroke.
+
+**Track C (script & runtime) is started too: C1 (the addressable DOM
+API) has a real first landing**, in `crates/dom`'s new `api.rs`/
+`class_list.rs` modules plus `crates/css`'s new `query.rs`. Real
+spec-shaped `Node`/`Element` methods (`nodeType`/`nodeName`, sibling/
+element navigation, `textContent` get/set, `removeChild`/`replaceChild`,
+`cloneNode(deep)`, `contains`/`isConnected`, `getElementById`/
+`getElementsByTagName`), a real live `classList` backed directly by the
+`class` attribute, and `querySelector`/`querySelectorAll`/`closest`
+built on A5's existing selector matcher. Every query here takes
+`&Document` explicitly and does a real, uncached traversal on each call
+-- there's no separate `NodeList`/`HTMLCollection` caching layer to keep
+in sync, because Rust's own borrow checker already forbids holding a
+stale reference across a mutation, which reproduces the DOM spec's
+"live" requirement without needing a mechanism to achieve it (see
+`dom::api`'s own module doc for the full argument). Known gaps: no
+`Range`/`Selection`/`MutationObserver`/cross-document `adoptNode`, and no
+JS binding reaches any of this yet (that's C2/C3+). See `ROADMAP.md`'s
+C1 entry for the rest.
 
 The workspace targets Rust **edition 2024** (`engine/Cargo.toml`), using
 stable let-chains (`if let X = y && let A = b { ... }`) where they read
@@ -89,14 +109,14 @@ better than nested `if let`s.
 engine/
   Cargo.toml                 workspace manifest
   crates/
-    dom/                     tree representation shared by html/css/xml/layout/js_bindings (C1's future home)
+    dom/                     tree representation (A2/A3+) plus C1's real addressable DOM API (api.rs/class_list.rs) -- started
     html/                    A2 (tokenizer) + A3 (tree construction) + A8/A9 (SVG/MathML foreign content) -- all done
-    css/                     A4-A7 (tokenizer/parser, selectors, cascade, CSSOM) -- all done
+    css/                     A4-A7 (tokenizer/parser, selectors, cascade, CSSOM) -- all done; C1's query.rs (querySelector/querySelectorAll/closest) also started
     xml/                     A10 (standalone XML 1.0 parser + namespace resolution) -- done; also A8's standalone-SVG-document entry point
     layout/                  B1-B8 (box tree, block/inline layout, tables, flexbox, grid, positioning, multi-column, logical properties/RTL + real UAX #9 bidi/UAX #14 line-breaking) started; B9's query.rs (fragment-tree queries) also started
     text/                    B10 (real font shaping via rustybuzz + glyph outlines via ttf-parser, one embedded font) -- new crate, shared by layout (measurement) and paint (glyph painting)
     paint/                   B9 (display-list lowering + color parsing), B11 (software rasterizer, now with real glyph rasterization), B12 (layer compositor), and B13 (Canvas 2D primitives) all started; B13's WebGL/WebGPU half not started (see ROADMAP.md's B11 entry for why -- no GPU adapter in this environment)
-    js_bindings/              Track C -- placeholder, shape depends on "the JS engine question"
+    js_bindings/              Track C's JS<->DOM binding layer -- placeholder, shape depends on "the JS engine question"; C1 itself (the DOM API this would bind to) now lives in dom/ and css/ instead
     net/                     D1-D3 (URL parsing, networking, resource loading) -- currently placeholders
     media/                   D5-D7 (images, audio/video, WebRTC) -- currently empty
     a11y/                    F2 (accessibility tree) -- currently placeholders

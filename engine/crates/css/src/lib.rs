@@ -24,7 +24,11 @@
 //! DOM tree. `cascade.rs` (A6) resolves competing declarations (including
 //! layer priority) and computes styles. `cssom.rs`/`style_engine.rs` (A7)
 //! wrap all of the above in a mutable object graph with incremental,
-//! invalidation-set-driven restyling.
+//! invalidation-set-driven restyling. `query.rs` (Track C1) is
+//! `querySelector`/`querySelectorAll`/`closest`/`Element.matches`, real
+//! DOM `ParentNode`/`Element` methods built on `selectors::matches` --
+//! kept here rather than in the `dom` crate specifically to avoid `dom`
+//! needing to depend on CSS selector syntax at all.
 //!
 //! **Known gap:** nested layers (`@layer a { @layer b { ... } }`) are
 //! ordered by their full dotted path's (`"a.b"`) first appearance in one
@@ -40,6 +44,7 @@
 pub mod cascade;
 pub mod cssom;
 pub mod parser;
+pub mod query;
 pub mod selectors;
 pub mod style_engine;
 pub mod tokenizer;
