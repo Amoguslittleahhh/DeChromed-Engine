@@ -9,3 +9,4 @@ workspace = true
 
 [dependencies]
 dom = { path = "../dom" }
+v8 = "130"

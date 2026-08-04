@@ -33,7 +33,7 @@
 //! a pre-existing, already-documented Track A simplification, not new to
 //! C1).
 
-use crate::{Document, NodeData, NodeId};
+use crate::{Document, ElementData, NodeData, NodeId};
 
 /// The DOM's own small numeric node-type space (`Node.nodeType`),
 /// modeled as a real enum instead of the spec's bare integers -- the
@@ -316,6 +316,56 @@ impl Document {
             current = self.next_sibling(node);
         }
         None
+    }
+
+    /// `Element.getAttribute`. `None` both when `id` isn't an element and
+    /// when the attribute is genuinely absent -- this crate has no
+    /// exception type to distinguish "wrong node kind" from "not found"
+    /// with, matching `text_content`'s/`set_text_content`'s own
+    /// documented no-op-on-wrong-kind precedent above.
+    pub fn get_attribute(&self, id: NodeId, name: &str) -> Option<String> {
+        match self.data(id) {
+            NodeData::Element(e) => e.attr(name).map(str::to_string),
+            _ => None,
+        }
+    }
+
+    /// `Element.setAttribute`: overwrites `name` if already present,
+    /// otherwise appends it -- a no-op if `id` isn't an element.
+    pub fn set_attribute(&mut self, id: NodeId, name: &str, value: &str) {
+        if let NodeData::Element(e) = self.data_mut(id) {
+            match e.attributes.iter_mut().find(|(k, _)| k == name) {
+                Some((_, v)) => *v = value.to_string(),
+                None => e.attributes.push((name.to_string(), value.to_string())),
+            }
+        }
+    }
+
+    /// `Element.hasAttribute`.
+    pub fn has_attribute(&self, id: NodeId, name: &str) -> bool {
+        matches!(self.data(id), NodeData::Element(e) if e.attr(name).is_some())
+    }
+
+    /// `Element.removeAttribute`.
+    pub fn remove_attribute(&mut self, id: NodeId, name: &str) {
+        if let NodeData::Element(e) = self.data_mut(id) {
+            e.attributes.retain(|(k, _)| k != name);
+        }
+    }
+
+    /// `Document.createElement`: a new, detached HTML-namespace element --
+    /// the caller inserts it wherever it belongs (matching
+    /// `clone_node`'s own "returns a detached node" contract above).
+    pub fn create_element(&mut self, local_name: &str) -> NodeId {
+        self.push_node(
+            NodeData::Element(ElementData::html(local_name, Vec::new())),
+            None,
+        )
+    }
+
+    /// `Document.createTextNode`: a new, detached text node.
+    pub fn create_text_node(&mut self, data: &str) -> NodeId {
+        self.push_node(NodeData::Text(data.to_string()), None)
     }
 
     /// `Document.getElementById`: the real spec algorithm is "the first

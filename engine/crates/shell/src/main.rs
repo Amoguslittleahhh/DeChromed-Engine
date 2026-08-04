@@ -7,6 +7,11 @@
 //! and parsing a standalone XML document (A10). C1's real spec-shaped DOM
 //! API (`dom::api`/`dom::class_list`/`css::query`) is demonstrated next --
 //! nodeName, textContent, classList, querySelector/closest, cloneNode.
+//! C2's real capture/target/bubble event dispatch (`dom::events`) and
+//! task/microtask event-loop interleaving (`dom::event_loop`), and
+//! C3/C4's real embedded V8 (`js_bindings::Realm`) running JS that
+//! mutates a real `dom::Document` through `js_bindings::dom_binding`,
+//! are demonstrated further down.
 //! B1-B9 (box tree through
 //! fragment-tree queries + display list) are real now too, run below
 //! against a fixed 800px containing-block width (there's no window/
@@ -223,6 +228,71 @@ fn main() {
     let xml_doc = xml::parse_document("<config><item id=\"1\">value</item></config>")
         .expect("well-formed XML");
     println!("standalone XML document:\n{}", xml::serialize(&xml_doc));
+
+    // C2: real DOM event dispatch (capture/target/bubble, per
+    // `dom::events`) and the real HTML task/microtask event-loop
+    // interleaving rule (`dom::event_loop`).
+    let mut listeners = dom::events::EventListeners::new();
+    let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let order_capture = order.clone();
+    listeners.add_event_listener(body, "click", true, move |_ev| {
+        order_capture.borrow_mut().push("capture:body");
+    });
+    let order_target = order.clone();
+    listeners.add_event_listener(p, "click", false, move |_ev| {
+        order_target.borrow_mut().push("target:p");
+    });
+    let order_bubble = order.clone();
+    listeners.add_event_listener(body, "click", false, move |_ev| {
+        order_bubble.borrow_mut().push("bubble:body");
+    });
+    let mut click = dom::events::Event::new("click", true, true);
+    listeners.dispatch_event(&document, p, &mut click);
+    println!(
+        "event dispatch order (capture -> target -> bubble): {:?}",
+        order.borrow()
+    );
+
+    let mut event_loop = dom::event_loop::EventLoop::new();
+    let task_order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let t1 = task_order.clone();
+    event_loop.queue_task(move |el| {
+        t1.borrow_mut().push("task1");
+        let t1b = t1.clone();
+        el.queue_microtask(move |_| t1b.borrow_mut().push("microtask-from-task1"));
+    });
+    let t2 = task_order.clone();
+    event_loop.queue_task(move |_| t2.borrow_mut().push("task2"));
+    event_loop.run_task_queue_until_empty();
+    println!(
+        "event loop order (microtasks drain before the next task): {:?}",
+        task_order.borrow()
+    );
+
+    // C3/C4: a real embedded V8 isolate (`js_bindings::Realm`) running
+    // real JavaScript against a real (if minimal -- see `js_bindings::
+    // dom_binding`'s own module docs for what's bound and what isn't)
+    // `document` binding backed by an actual `dom::Document`.
+    let js_document = std::rc::Rc::new(std::cell::RefCell::new(html::parse_document(
+        "<!DOCTYPE html><html><body><p id=\"greeting\">hi</p></body></html>",
+    )));
+    let mut realm = js_bindings::Realm::new_with_document(js_document.clone());
+    let arithmetic = realm.run("1 + 2").expect("valid JS");
+    println!("V8: 1 + 2 = {arithmetic}");
+    realm
+        .run("document.setAttribute(document.getElementById('greeting'), 'data-touched', 'yes');")
+        .expect("valid JS");
+    let touched = js_document
+        .borrow()
+        .get_element_by_id("greeting")
+        .and_then(|id| js_document.borrow().get_attribute(id, "data-touched"));
+    println!(
+        "V8 mutated the real DOM: <p id=greeting>'s data-touched attribute is now {touched:?}"
+    );
+    match realm.run("undefinedVariable123") {
+        Ok(_) => unreachable!("referencing an undefined variable should throw"),
+        Err(err) => println!("V8 real exception capture: {err}"),
+    }
 
     println!(
         "(remaining Track B gaps -- vertical writing modes, GPU compositing/rasterization, \

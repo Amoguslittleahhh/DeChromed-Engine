@@ -20,6 +20,8 @@ use std::fmt;
 
 mod api;
 pub mod class_list;
+pub mod event_loop;
+pub mod events;
 pub use api::NodeType;
 
 /// The three namespaces A3/A8/A9's tree construction actually switches
@@ -36,6 +38,27 @@ pub const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 /// so a `NodeId` stays valid for the document's lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u32);
+
+impl NodeId {
+    /// The raw arena index -- for round-tripping a `NodeId` through a
+    /// non-Rust boundary (C4's V8 binding hands these out as JS numbers,
+    /// since a detached-but-created node, e.g. fresh from
+    /// `Document::create_element`, has no tree position to identify it
+    /// by; only the arena index works for those).
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    /// The inverse of [`NodeId::as_u32`]. Not validated against any
+    /// particular `Document` -- exactly like `Document::data`'s own
+    /// existing "panics if out of bounds" contract, an index from a
+    /// *different* document (or one beyond this document's current
+    /// arena length) is caller error, not something this constructor
+    /// can catch.
+    pub fn from_u32(index: u32) -> Self {
+        NodeId(index)
+    }
+}
 
 /// The document root: an arena of nodes plus the tree edges between them.
 ///

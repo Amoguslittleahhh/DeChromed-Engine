@@ -1046,29 +1046,103 @@ in `dom::api`, 6 in `dom::class_list`, and 7 in `css::query`, plus the
 shell demo running the whole API end to end (nodeName, textContent,
 classList mutation, querySelector/closest, cloneNode).
 
-### C2. Event loop & event dispatch
-Task queues/microtask queue ordering per the HTML spec (this ordering is
-subtle and web-observable — get it wrong and real sites break in confusing
-ways), `requestAnimationFrame` tied to the rendering pipeline, event
-capture/target/bubble dispatch with proper default-action handling.
-**Exit:** WPT `html/webappapis`, `dom/events` ≥70%.
+### C2. Event loop & event dispatch — *started (real capture/target/bubble dispatch, real task/microtask interleaving, requestAnimationFrame bookkeeping)*
+`dom::events` implements the actual DOM event dispatch algorithm — real
+capture (root→target, exclusive of target), at-target (both capture- and
+bubble-registered listeners on the target node fire here), and bubble
+(target→root, exclusive of target, only when `event.bubbles`) phases, with
+real `stopPropagation`/`stopImmediatePropagation`/`preventDefault`
+semantics (the last only takes effect when the event is `cancelable`).
+Listeners live in a side table (`EventListeners`, wrapping `&Document`)
+rather than as fields on `Document` itself, the same pattern
+`css::style_engine::StyleEngine` already established for computed styles.
+`dom::event_loop` implements the real HTML task/microtask interleaving
+rule — after every task, the microtask queue drains to genuine completion
+(including microtasks queued by microtasks during that same drain) before
+the next task starts — plus `requestAnimationFrame`/`cancelAnimationFrame`
+bookkeeping.
+**Known gaps:** no `Event.composed`/shadow-tree retargeting (no shadow DOM
+exists in this codebase at all); no passive-listener enforcement; a
+listener added to a node *during* that same node's dispatch pass doesn't
+fire in that pass (listeners are snapshotted per node before invocation);
+no real timers (`setTimeout`/`setInterval` — "queue a task" here is
+immediate, not delay-scheduled, since there's no wall-clock/reactor
+driving the loop yet); `requestAnimationFrame` callbacks run only when
+explicitly told to, not on a real compositor vsync tick (no render loop in
+Track F yet); one FIFO task queue, not the spec's per-task-source queues.
+**Exit not yet met** (WPT `html/webappapis`, `dom/events` need a JS engine
+to dispatch into this from script) — verified instead with 13
+self-authored unit tests (7 in `dom::events`, 6 in `dom::event_loop`)
+covering dispatch ordering, propagation/default-prevention semantics, and
+the nested-microtask-drains-before-next-task ordering rule specifically,
+plus the shell demo running both end to end.
 
-### C3. ECMAScript parser & AST
-Full ES2015+ grammar (this alone is bigger than most people expect: ASI
-rules, destructuring, template literals, generators/async syntax, classes,
-modules). State explicitly here whether the "one-on-one replica" intent
-means writing this yourself vs. embedding V8/SpiderMonkey — it changes
-every phase after this one (see "The JS engine question" below).
-**Exit:** parses the full Test262 corpus's syntax without embedding-engine
-help (if going purist), or bindings compile/run against an embedded engine
-(if going pragmatic).
+### C3. ECMAScript parser & AST — *resolved: embedding V8, not written from scratch (see "The JS engine question" below)*
+The engine-choice decision is made: `js_bindings::engine` embeds real V8
+via the `v8` crate (rusty_v8) rather than writing an ES2015+
+parser/interpreter/GC/JIT from scratch — confirmed feasible in this
+project's actual build/sandbox environment before committing to it (a
+throwaway probe crate built `v8 = "130"` and ran real JavaScript end to
+end). `Realm::new`/`Realm::run` bootstrap a real V8 platform/isolate/
+context exactly once (process-wide, via `std::sync::Once`) and compile +
+run real classic-script source, returning either the stringified
+completion value or a real `JsError` (message + line number) captured via
+V8's own `TryCatch` — covering both syntax errors and thrown runtime
+exceptions through the same path, since V8 reports both to `TryCatch`
+identically. All of this is written without `unsafe` (the workspace denies
+it): `v8`'s public API surface used here — `Isolate::new`, `HandleScope`,
+`Context`, `ContextScope`, `TryCatch`, `Script::compile`/`.run` — is itself
+safe Rust; V8's own internal `unsafe` is the dependency's concern, not
+this crate's.
+**Known gaps:** single global realm per isolate only (no multiple
+realms/iframes); no module system (`import`/`export`, classic-script
+`compile`/`run` only); no per-realm teardown (matches how real embedders
+use V8 — `V8::dispose` is a process-exit concern).
+**Exit met differently than either originally-stated option:** not
+"parses Test262 syntax standalone" (purist) nor merely "bindings compile"
+(pragmatic) — real JS actually *runs* against a real V8 isolate, verified
+with 7 self-authored tests (arithmetic, multi-statement programs, state
+persisting across `run()` calls in one realm, syntax errors, thrown
+exceptions, `ReferenceError` on an undefined variable, and realm
+isolation), plus the shell demo.
 
-### C4. Interpreter (bytecode VM, tree-walk first)
-A correctness-first tree-walking or simple bytecode interpreter — no JIT
-yet. Scoping (`var`/`let`/`const` semantics, closures, `this` binding
-rules), prototype chains, the full object model.
-**Exit:** Test262 language-syntax + basic built-ins pass rate tracked as
-the headline metric from here on.
+### C4. Interpreter (bytecode VM, tree-walk first) — *not applicable; superseded by C3's embedding decision. Real work instead: DOM↔V8 binding — started*
+Since C3 embeds V8 rather than writing an interpreter, there is no
+tree-walk/bytecode VM phase to build — V8 already is one. The real
+remaining C4-shaped work in this codebase is binding C1's DOM API to the
+now-real V8 runtime (this is effectively pulled forward from C8's "DOM↔JS
+bindings" phase). `js_bindings::dom_binding` binds a real `document`
+global object onto a `Realm`'s context, backed by an actual
+`Rc<RefCell<dom::Document>>` reachable from every V8 callback via
+`Isolate::set_slot`/`get_slot` (both safe methods — the standard rusty_v8
+way to stash `'static` host state on an isolate without needing captured
+closures, which `FunctionCallback`'s `extern "C" fn`-shaped signature has
+no room for). Exposed as plain functions (`document.getElementById`,
+`.createElement`, `.getAttribute`/`.setAttribute`/`.hasAttribute`/
+`.removeAttribute`, `.textContent`/`.setTextContent`, `.appendChild`,
+`.tagName`), with node handles round-tripped as JS numbers via a new
+`NodeId::as_u32`/`NodeId::from_u32` pair added to `dom` for exactly this
+(the arena index is stable and dense since `dom`'s arena never frees
+slots, so it round-trips even a freshly created, not-yet-attached node
+that has no tree position to identify it by any other way).
+**Known gaps:** node handles are bare integers, not real `Node`/`Element`/
+`Document` JS *objects* with prototype-chained methods (`el.getAttribute`
+isn't callable from JS yet — only `document.getAttribute(el, ...)` is;
+real wrapper objects need `ObjectTemplate`/accessor properties, deferred
+rather than built partially); no `addEventListener` binding yet (`dom::
+events` is real and tested on the Rust side, but nothing here calls it
+from JS); no live `NodeList` returned to JS (`getElementsByTagName` isn't
+bound); a stale/out-of-range `NodeId` handle is a no-op/`undefined`
+rather than a thrown exception, since this crate has no JS exception type
+of its own yet.
+**Exit not yet met** (WPT needs the fuller binding C8 describes) —
+verified instead with 5 self-authored tests exercising real two-way state
+(`getElementById` finding a real element, `setAttribute`/`getAttribute`
+round-tripping through actual `dom::Document` state, `createElement`+
+`appendChild` mutating the real tree structure, `hasAttribute`/
+`removeAttribute` reflecting real state, `tagName` matching real
+`nodeName` upper-casing), plus the shell demo running real JS that reads
+V8's own exception message back out after mutating and then breaking.
 
 ### C5. Standard library / built-ins
 `Object`/`Array`/`String`/`Map`/`Set`/`Promise`/`RegExp`/`Intl` — `Intl` in
@@ -1316,10 +1390,25 @@ pipeline for arbitrary real URLs, not a fixed demo set.
 
 ---
 
-## The JS engine question — decide this explicitly before Track C
+## The JS engine question — decided: pragmatic path (embed V8)
 
-This is the single biggest fork in the whole roadmap, so it's called out on
-its own rather than buried in C3:
+**Resolved.** This project embeds V8 via `rusty_v8` (the `v8` crate) —
+the pragmatic path below — rather than writing an ES2015+ parser/
+interpreter/GC/JIT from scratch. Feasibility was confirmed empirically in
+this project's actual build/sandbox environment before committing:
+building and running a throwaway probe crate against `v8 = "130"`
+successfully compiled (downloading a prebuilt static V8 library through
+cargo's own crates.io-mediated path) and executed real JavaScript
+end-to-end. See C3/C4 above for what's actually built:
+`js_bindings::engine::Realm` (a real isolate/context wrapper with genuine
+`TryCatch`-based exception capture) and `js_bindings::dom_binding` (a
+real, if intentionally partial, `document` binding backed by an actual
+`dom::Document`), both written with zero `unsafe` in this codebase's own
+code, respecting the workspace's `deny(unsafe_code)` lint (V8's own
+internal `unsafe` is the dependency's concern, not this one's).
+
+This is the single biggest fork in the whole roadmap, so the two options
+that were weighed are kept below for context:
 
 - **Pragmatic path:** embed an existing, battle-tested engine (`rusty_v8`
   bindings to V8, or `mozjs` bindings to SpiderMonkey) and put all original
@@ -1344,8 +1433,9 @@ picking one before C3 starts.
 
 - **Rust workspace**, one crate per major subsystem, mirroring how Servo
   and Ladybird are structured: `html`, `css`, `dom`, `layout`, `paint`,
-  `js` (or `js-bindings` if embedding), `net`, `media`, `a11y`, `devtools`,
-  `shell`. Crate boundaries double as the ownership boundaries a real team
+  `js_bindings` (embedding V8, per the resolved "JS engine question"
+  below), `net`, `media`, `a11y`, `devtools`, `shell`. Crate boundaries
+  double as the ownership boundaries a real team
   would staff along.
 - Pull in reference implementations to **test against**, not depend on
   directly, wherever the goal is "recreate" rather than "wrap" — e.g. run

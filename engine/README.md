@@ -95,9 +95,45 @@ in sync, because Rust's own borrow checker already forbids holding a
 stale reference across a mutation, which reproduces the DOM spec's
 "live" requirement without needing a mechanism to achieve it (see
 `dom::api`'s own module doc for the full argument). Known gaps: no
-`Range`/`Selection`/`MutationObserver`/cross-document `adoptNode`, and no
-JS binding reaches any of this yet (that's C2/C3+). See `ROADMAP.md`'s
-C1 entry for the rest.
+`Range`/`Selection`/`MutationObserver`/cross-document `adoptNode`.
+See `ROADMAP.md`'s C1 entry for the rest.
+
+**C2 (event loop & event dispatch) is a real first landing too**, in
+`crates/dom`'s new `events.rs`/`event_loop.rs` modules. `events.rs`
+implements the actual DOM dispatch algorithm -- real capture/target/bubble
+phases, `stopPropagation`/`stopImmediatePropagation`/`preventDefault`
+(the last honoring `cancelable`) -- with listeners kept in a side table
+(`EventListeners`, wrapping `&Document`) rather than as fields on
+`Document` itself, the same pattern `css::style_engine::StyleEngine`
+already uses for computed styles. `event_loop.rs` implements the real
+HTML task/microtask interleaving rule (the microtask queue drains to
+genuine completion, including microtasks queued by microtasks, before the
+next task starts) plus `requestAnimationFrame`/`cancelAnimationFrame`
+bookkeeping. See `ROADMAP.md`'s C2 entry for the known gaps (no shadow
+DOM/`composed`, no real timers, no vsync-tied rAF).
+
+**"The JS engine question" is resolved: this project embeds V8** (via
+the `v8`/rusty_v8 crate) rather than writing an ES2015+ engine from
+scratch -- confirmed to actually work in this project's build/sandbox
+environment before committing to it. `crates/js_bindings`'s `engine.rs`
+(C3) wraps a real V8 isolate/context (`Realm::new`/`Realm::run`),
+compiling and running real script source with genuine `TryCatch`-based
+exception capture (message + line, covering both syntax errors and
+thrown exceptions) -- all without `unsafe` in this codebase's own code,
+respecting the workspace's `deny(unsafe_code)` lint (V8's own internal
+`unsafe` is the dependency's concern). `dom_binding.rs` (C4) binds a
+real `document` global onto a `Realm`, backed by an actual
+`Rc<RefCell<dom::Document>>` reachable from V8 callbacks via
+`Isolate::set_slot`/`get_slot` -- `getElementById`/`createElement`/
+`getAttribute`/`setAttribute`/`hasAttribute`/`removeAttribute`/
+`textContent`/`setTextContent`/`appendChild`/`tagName` are real,
+round-tripping node handles as JS numbers through a new
+`NodeId::as_u32`/`from_u32` pair added to `dom` for this. Known gaps:
+node handles aren't real `Node`/`Element` JS objects yet (only
+`document.xyz(handle, ...)` free functions, not `handle.xyz(...)`
+methods), no `addEventListener` binding from JS yet, no live
+`NodeList` return values. See `ROADMAP.md`'s C3/C4 entries and "The JS
+engine question" section for the rest.
 
 The workspace targets Rust **edition 2024** (`engine/Cargo.toml`), using
 stable let-chains (`if let X = y && let A = b { ... }`) where they read
@@ -109,14 +145,14 @@ better than nested `if let`s.
 engine/
   Cargo.toml                 workspace manifest
   crates/
-    dom/                     tree representation (A2/A3+) plus C1's real addressable DOM API (api.rs/class_list.rs) -- started
+    dom/                     tree representation (A2/A3+) plus C1's real addressable DOM API (api.rs/class_list.rs) and C2's real event dispatch + task/microtask loop (events.rs/event_loop.rs) -- started
     html/                    A2 (tokenizer) + A3 (tree construction) + A8/A9 (SVG/MathML foreign content) -- all done
     css/                     A4-A7 (tokenizer/parser, selectors, cascade, CSSOM) -- all done; C1's query.rs (querySelector/querySelectorAll/closest) also started
     xml/                     A10 (standalone XML 1.0 parser + namespace resolution) -- done; also A8's standalone-SVG-document entry point
     layout/                  B1-B8 (box tree, block/inline layout, tables, flexbox, grid, positioning, multi-column, logical properties/RTL + real UAX #9 bidi/UAX #14 line-breaking) started; B9's query.rs (fragment-tree queries) also started
     text/                    B10 (real font shaping via rustybuzz + glyph outlines via ttf-parser, one embedded font) -- new crate, shared by layout (measurement) and paint (glyph painting)
     paint/                   B9 (display-list lowering + color parsing), B11 (software rasterizer, now with real glyph rasterization), B12 (layer compositor), and B13 (Canvas 2D primitives) all started; B13's WebGL/WebGPU half not started (see ROADMAP.md's B11 entry for why -- no GPU adapter in this environment)
-    js_bindings/              Track C's JS<->DOM binding layer -- placeholder, shape depends on "the JS engine question"; C1 itself (the DOM API this would bind to) now lives in dom/ and css/ instead
+    js_bindings/              C3's real embedded V8 (engine.rs, via rusty_v8) and C4's real document<->dom::Document binding (dom_binding.rs) -- started; "the JS engine question" is resolved (embed V8)
     net/                     D1-D3 (URL parsing, networking, resource loading) -- currently placeholders
     media/                   D5-D7 (images, audio/video, WebRTC) -- currently empty
     a11y/                    F2 (accessibility tree) -- currently placeholders
@@ -166,11 +202,15 @@ cargo run --release -p html5lib_harness --bin stress_test
 
 `crates/html5lib_harness` is **not** a full WPT (web-platform-tests) runner
 — WPT tests are `testharness.js` scripts that need a working JS engine and
-DOM to execute, and Track C doesn't exist yet. html5lib-tests' plain-JSON/
-`.dat` tokenizer/tree-construction test formats don't need any of that,
-which is exactly why A2/A3 use them as their exit criteria instead of WPT
-directly. A real WPT harness becomes possible once C1 (DOM) and a JS engine
-(C3-C8) exist to actually run `testharness.js` against.
+a DOM binding rich enough to run them. html5lib-tests' plain-JSON/`.dat`
+tokenizer/tree-construction test formats don't need any of that, which is
+exactly why A2/A3 use them as their exit criteria instead of WPT directly.
+A real WPT harness becomes possible once C4's `document`/`Node`/`Element`
+binding is fleshed out past its current "plain functions on bare node
+handles" state into real prototype-chained JS objects that
+`testharness.js` and real test bodies can call methods on directly (C1's
+DOM and C3's V8 embedding already exist -- see `ROADMAP.md`'s C3/C4
+entries for exactly what's bound today and what isn't yet).
 
 Test files are vendored under `crates/html5lib_harness/vendor/tokenizer/`
 and `crates/html5lib_harness/vendor/tree-construction/` (fetched from
