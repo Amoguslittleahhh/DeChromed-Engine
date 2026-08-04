@@ -643,17 +643,65 @@ distribution, `justify-content: center`, `flex-wrap` line-breaking,
 `flex-direction: column` stacking plus auto-height sizing, `align-items:
 stretch`) plus the shared stress-test fuzzer.
 
-### B5. Grid
-[CSS Grid Layout](https://www.w3.org/TR/css-grid-1/): track sizing
-algorithm (the hardest single algorithm in CSS layout — multiple resolution
-passes over `fr` units, intrinsic sizing, and auto-placement), named lines/
-areas, subgrid.
-**Exit:** WPT `css/css-grid` ≥75%.
+### B5. Grid — *started*
+A real but significantly scoped [CSS Grid Layout](https://www.w3.org/TR/css-grid-1/)
+in `layout::flow::layout_grid_container`: `grid-template-columns` track
+parsing (`<length>`, `<percentage>`, `fr`, `auto`) and `fr`-weighted width
+distribution (the same math B4's flex-grow already uses); rows are always
+implicit, sizing to the tallest item placed in them (or to a matching
+`Fixed` `grid-template-rows` entry, if the row index falls within its
+explicit track list); and a real, occupancy-tracking auto-placement
+algorithm (`grid-column`'s bare line number or `span N` forms claim their
+cells first, then unplaced items flow row-major into whatever's left).
+B1's `flex_items` helper (renamed only in spirit, not code) blockifies
+grid items identically to flex items, since the spec's blockification
+rule is the same for both.
 
-### B6. Positioning & stacking
-`position: relative/absolute/fixed/sticky`, containing-block resolution
-rules, stacking contexts, `z-index`, paint order per spec.
-**Exit:** WPT `css/css-position`, `css/CSS2/zindex` ≥80%.
+Known gaps, documented in both `box_tree.rs` and `flow.rs`'s own module
+docs: no `repeat()`/`minmax()`/named lines/subgrid; `grid-template-rows`'
+`fr`/`auto` tracks are effectively unused (no definite grid-container
+height exists in general to distribute them against — the same
+underlying "no intrinsic sizing" limitation B2/B4 already document);
+placement only reads `grid-column` (`grid-row` isn't implemented at all,
+and the `"start / end"` range syntax isn't either, only a bare line
+number or `span N`).
+**Exit not yet met** (no `repeat()`/`minmax()`/subgrid, no `grid-row`) —
+WPT `css/css-grid` needs a JS engine to run anyway (Track C); verified
+instead with 4 self-authored unit tests (`fr`-weighted column splitting
+plus row-wrap, explicit-column placement leaving earlier cells for
+auto-placed items, row height from tallest item, an explicit
+`grid-template-rows` track overriding content height) plus the shared
+stress-test fuzzer.
+
+### B6. Positioning & stacking — *started*
+`position: relative` is real and correctly scoped: the box stays fully
+in normal flow for sizing/margin-collapsing/sibling-positioning purposes
+(exactly as if unpositioned), and only its own final visual position
+shifts by `top`/`left` afterward. `absolute`/`fixed` are taken out of
+normal flow entirely (no margin collapsing, no vertical-stacking slot,
+no float interaction — the same treatment `float` already gets) and
+positioned via `top`/`left`, in `layout_block_children`.
+
+Known gaps, documented in `flow.rs`'s module docs: `absolute`/`fixed`
+are positioned relative to the **immediate parent's** content-box
+origin, not the spec's real "nearest positioned ancestor" (which needs
+ancestor-chain position-type tracking this phase doesn't implement), and
+for `fixed`, not the viewport either (no distinct viewport/scroll-
+container concept exists yet, so `fixed` behaves identically to
+`absolute` here); only `top`/`left` are read (`right`/`bottom` aren't),
+and only as pixel lengths (not percentages, which would need a definite
+containing-block dimension this phase doesn't resolve in general);
+`position: sticky` isn't implemented (behaves as `static`, since there's
+no scroll container to stick within); `z-index`/stacking contexts/paint
+order aren't addressed at all — there's no paint pipeline yet (B10-B12)
+for a stacking order to actually affect, so this is explicitly out of
+scope for this landing rather than faked.
+**Exit not yet met** (containing-block resolution simplified, no
+`sticky`, no `z-index`/stacking) — WPT `css/css-position`/`css/CSS2/
+zindex` need a JS engine to run anyway; verified instead with 2
+self-authored unit tests (`relative` offsetting without disturbing
+siblings, `absolute` being out-of-flow and offset-positioned) plus the
+shared stress-test fuzzer.
 
 ### B7. Fragmentation
 Multi-column layout (`column-count`/`column-width`), fragmentation for
@@ -1334,22 +1382,28 @@ That's "renders a real static webpage correctly"'s content-and-style half
 more complete with A8/A9's namespace-aware elements included.
 
 **B1 (box tree generation), B2 (block & inline formatting contexts), B3
-(table layout), and B4 (flexbox) are now started** in the new
-`engine/crates/layout` crate -- see their entries above for exactly
-what's real (display computation, anonymous-box wrapping, list markers,
-real box-model geometry, margin collapsing, line-breaking, float/clear,
-table row/column/colspan layout, flexbox's grow/shrink/wrap/justify/
-align algorithms) and what's still a documented gap (`::before`/
-`::after`, real grid box types, font-shaping-accurate text metrics,
-shrink-to-fit/intrinsic sizing, float-aware line narrowing, table
-`rowspan`/`border-collapse`/`border-spacing`, flex `order`/`gap`/
-column-direction wrap-and-stretch). Remaining work to fully close out
-B1-B4: pseudo-element matching in `css::cascade` (needed for generated
-content), the float/line-narrowing refinement, and the several
-intrinsic-sizing-dependent gaps that recur across B2-B4 (auto-width
-shrink-to-fit, flex's min-content shrink floor, table's min/max-content
-column sizing) -- worth tackling together once B10 (text shaping) exists
-to actually measure content, rather than three separate partial fixes.
-**B5 (grid)** is the natural next Track B phase; B6-B9 (positioning,
-fragmentation, writing modes, fragment tree & display list) follow after
-that.
+(table layout), B4 (flexbox), B5 (grid), and the start of B6
+(positioning) are now started** in the new `engine/crates/layout` crate
+-- see their entries above for exactly what's real (display computation,
+anonymous-box wrapping, list markers, real box-model geometry, margin
+collapsing, line-breaking, float/clear, table row/column/colspan layout,
+flexbox's grow/shrink/wrap/justify/align algorithms, grid's track sizing
++ occupancy-aware auto-placement, `position: relative`/`absolute`/
+`fixed`) and what's still a documented gap (`::before`/`::after`,
+font-shaping-accurate text metrics, shrink-to-fit/intrinsic sizing,
+float-aware line narrowing, table `rowspan`/`border-collapse`/
+`border-spacing`, flex `order`/`gap`/column-direction wrap-and-stretch,
+grid `repeat()`/`minmax()`/subgrid/`grid-row`, and B6's simplified
+"immediate parent, not nearest positioned ancestor" containing-block
+resolution plus no `sticky`/`z-index`/stacking). Remaining work to fully
+close out B1-B6: pseudo-element matching in `css::cascade` (needed for
+generated content), the float/line-narrowing refinement, the several
+intrinsic-sizing-dependent gaps that recur across B2/B4/B5 (auto-width
+shrink-to-fit, flex's min-content shrink floor, table/grid's min/max-
+content track sizing) -- worth tackling together once B10 (text shaping)
+exists to actually measure content -- and B6's real containing-block
+resolution (needs ancestor position-type tracking threaded through the
+layout recursion, deferred rather than half-built). **B7 (fragmentation)
+and B8 (writing modes)** are the natural next Track B phases; **B9**
+(fragment tree & display list, tying everything together with B10-B12's
+eventual paint pipeline) follows after that.

@@ -297,6 +297,16 @@ const PROPERTY_TABLE: &[(&str, bool, &str)] = &[
     ("align-items", false, "normal"),
     ("align-self", false, "auto"),
     ("align-content", false, "normal"),
+    // B5: Grid Layout longhands (all non-inherited).
+    ("grid-template-columns", false, "none"),
+    ("grid-template-rows", false, "none"),
+    ("grid-column", false, "auto"),
+    ("grid-row", false, "auto"),
+    // B6: Positioning offsets (all non-inherited, per spec).
+    ("top", false, "auto"),
+    ("right", false, "auto"),
+    ("bottom", false, "auto"),
+    ("left", false, "auto"),
     // A8: a handful of SVG presentation properties (inherited per
     // <https://www.w3.org/TR/SVG2/propidx.html>, unlike most CSS box
     // properties) -- enough for these to cascade/inherit correctly onto

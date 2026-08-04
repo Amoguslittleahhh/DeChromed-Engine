@@ -149,6 +149,9 @@ const HTML_SEEDS: &[&str] = &[
     // exercise layout_table/layout_flex_container together with the rest
     // of the fuzzer's HTML+CSS combinations.
     "<div style=\"display:flex\"><table><thead><tr><th colspan=\"2\">h</th></tr></thead><tbody><tr><td>a</td><td><div style=\"display:flex;flex-direction:column\">x<span>y</span></div></td></tr></tbody></table><p>item</p></div>",
+    // B5/B6: a grid with explicit + auto-placed items, plus relative and
+    // absolute positioning.
+    "<div style=\"display:grid;grid-template-columns:1fr 2fr\"><div style=\"grid-column:2\">a</div><div>b</div><div style=\"position:relative;top:5px\">c</div><div style=\"position:absolute;left:10px\">d</div></div>",
 ];
 
 const CSS_SEEDS: &[&str] = &[
@@ -161,6 +164,8 @@ const CSS_SEEDS: &[&str] = &[
     "@layer base { .a { color: red; & .b { color: blue; } } }",
     // B3/B4: table/flex display values plus flexbox longhands.
     "table { display: table; } tr { display: table-row; } td { display: table-cell; width: 40px; } .f { display: flex; flex-wrap: wrap; flex-grow: 1; flex-shrink: 2; flex-basis: 10%; justify-content: space-between; align-items: center; }",
+    // B5/B6: grid template/placement and positioning longhands.
+    ".g { display: grid; grid-template-columns: 50px 1fr auto; grid-template-rows: 30px; } .item { grid-column: span 2; } .p { position: absolute; top: 10%; left: 5px; right: 0; bottom: 0; }",
 ];
 
 const SELECTOR_SEEDS: &[&str] = &[

@@ -9,14 +9,16 @@
 //! wrapped in a synthetic block box so the container's children are either
 //! *all* block-level or *all* inline-level -- never mixed).
 //!
-//! B3 (table layout) and B4 (flexbox) add their own box kinds here too --
-//! `display: table` builds a real row/cell structure (splicing row-groups
-//! transparently, per `build_table_rows`), and `display: flex`/
-//! `inline-flex` "blockify" every direct child into a flex item (always
-//! wrapping stray inline-level content into an anonymous item, unlike an
-//! ordinary block box's conditional anonymous-block wrapping) -- see
-//! `flow.rs`'s module docs for what the actual table/flex layout
-//! algorithms do and don't cover.
+//! B3 (table layout), B4 (flexbox), and B5 (grid) add their own box kinds
+//! here too -- `display: table` builds a real row/cell structure
+//! (splicing row-groups transparently, per `build_table_rows`), and
+//! `display: flex`/`inline-flex`/`grid`/`inline-grid` all "blockify"
+//! every direct child into an item (always wrapping stray inline-level
+//! content into an anonymous item, unlike an ordinary block box's
+//! conditional anonymous-block wrapping) via the same [`flex_items`]
+//! helper -- CSS Grid's own spec blockifies its items identically to
+//! Flexbox's rule. See `flow.rs`'s module docs for what the actual
+//! table/flex/grid layout algorithms do and don't cover.
 //!
 //! Known gaps, documented up front rather than silently assumed away:
 //! - **No `::before`/`::after` generated content.** That needs
@@ -24,10 +26,10 @@
 //!   selector's `PseudoElement` subclass currently always fails to match
 //!   any real DOM node -- see `css::selectors`' module docs), which
 //!   doesn't exist yet. Tracked as follow-up work, not silently dropped.
-//! - **`display: grid`/`table-column`/`table-caption`/etc still collapse
-//!   to plain block-level** (B5's own job, and `<caption>`/table columns
-//!   are out of scope for this initial table landing) -- a real, harmless
-//!   fallback, not a crash, but not the real spec box type either.
+//! - **`display: table-column`/`table-caption`/etc still collapse to
+//!   plain block-level** (`<caption>`/table columns are out of scope for
+//!   this initial table landing) -- a real, harmless fallback, not a
+//!   crash, but not the real spec box type either.
 //! - **List markers are simplified**: only `disc`/`circle`/`square`/
 //!   `decimal` `list-style-type` keywords are recognized (anything else
 //!   falls back to a disc-style bullet); markers are always rendered
@@ -81,6 +83,8 @@ pub enum Display {
     TableRowGroup,
     TableRow,
     TableCell,
+    Grid,
+    InlineGrid,
 }
 
 pub fn display_of(style: Option<&ComputedStyle>) -> Display {
@@ -100,7 +104,9 @@ pub fn display_of(style: Option<&ComputedStyle>) -> Display {
         "table-row-group" | "table-header-group" | "table-footer-group" => Display::TableRowGroup,
         "table-row" => Display::TableRow,
         "table-cell" => Display::TableCell,
-        // See module docs' "grid/table-column/table-caption" known gap.
+        "grid" => Display::Grid,
+        "inline-grid" => Display::InlineGrid,
+        // See module docs' "table-column/table-caption" known gap.
         _ => Display::Block,
     }
 }
@@ -131,6 +137,10 @@ pub enum BoxKind {
         colspan: usize,
         children: Vec<LayoutBox>,
     },
+    /// B5: children are already-blockified grid items (see
+    /// [`flex_items`], reused as-is -- CSS Grid blockifies its direct
+    /// children the same way Flexbox does).
+    GridContainer(Vec<LayoutBox>),
 }
 
 /// A single box in the box tree. `node: None` marks an anonymous box (a
@@ -233,6 +243,18 @@ fn append_child_boxes(doc: &Document, styles: &StyleMap, node: NodeId, out: &mut
                             BoxLevel::Block
                         },
                         kind: BoxKind::FlexContainer(items),
+                    });
+                }
+                Display::Grid | Display::InlineGrid => {
+                    let items = flex_items(build_children(doc, styles, node));
+                    out.push(LayoutBox {
+                        node: Some(node),
+                        level: if display == Display::InlineGrid {
+                            BoxLevel::InlineBlock
+                        } else {
+                            BoxLevel::Block
+                        },
+                        kind: BoxKind::GridContainer(items),
                     });
                 }
                 Display::Table => {

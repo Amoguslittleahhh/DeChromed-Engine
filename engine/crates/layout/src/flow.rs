@@ -1,12 +1,16 @@
 //! B2: block & inline formatting contexts -- turning a box tree (B1) into
 //! a fragment tree of positioned, sized boxes. Also B3 (table layout,
-//! [`layout_table`]) and B4 (flexbox, [`layout_flex_container`]).
+//! [`layout_table`]), B4 (flexbox, [`layout_flex_container`]), B5 (grid,
+//! [`layout_grid_container`]), and the start of B6 (`position: relative`/
+//! `absolute`/`fixed`, in [`layout_block_children`]).
 //!
 //! Reference: <https://www.w3.org/TR/CSS22/visuren.html#normal-flow>,
 //! <https://www.w3.org/TR/CSS22/box.html#box-dimensions>,
 //! <https://www.w3.org/TR/CSS22/visudet.html> (width/height resolution),
 //! <https://www.w3.org/TR/CSS22/box.html#collapsing-margins> (margin
-//! collapsing), <https://www.w3.org/TR/css-flexbox-1/> (B4).
+//! collapsing), <https://www.w3.org/TR/css-flexbox-1/> (B4),
+//! <https://www.w3.org/TR/css-grid-1/> (B5),
+//! <https://www.w3.org/TR/CSS22/visuren.html#propdef-position> (B6).
 //!
 //! ## What's real here
 //! - Full box-model geometry: margin/border/padding/content-box widths
@@ -71,6 +75,32 @@
 //!   multi-line `align-content` spacing aren't implemented. See
 //!   [`layout_flex_container`]'s own doc comment for the axis-agnostic
 //!   approach the algorithm takes.
+//! - **B5 grid is significantly scoped**: columns come from
+//!   `grid-template-columns` only (rows are always implicit, sizing to
+//!   content or a matching `Fixed` `grid-template-rows` entry -- `fr`/
+//!   `auto` row tracks are effectively unused, since there's no definite
+//!   grid container height to distribute them against in general);
+//!   `repeat()`, `minmax()`, named lines, and subgrid aren't implemented;
+//!   placement only reads `grid-column` (`grid-row` isn't implemented,
+//!   and the `"start / end"` range syntax isn't either -- only a bare
+//!   line number or `span N`). See [`layout_grid_container`]'s own doc
+//!   comment for exactly what the placement/sizing algorithm does.
+//! - **B6 positioning is just started**: `position: relative` is real
+//!   (still fully in-flow for sizing/margin-collapsing/sibling
+//!   positioning purposes, only its own final visual position shifts).
+//!   `absolute`/`fixed` are simplified -- both are taken out of normal
+//!   flow and positioned via `top`/`left` (pixel lengths only, not
+//!   percentages, and `right`/`bottom` aren't read at all) relative to
+//!   the **immediate parent's** content-box origin, not the spec's real
+//!   "nearest positioned ancestor" (which needs ancestor-chain
+//!   position-type tracking this phase doesn't implement) or, for
+//!   `fixed`, the viewport (no distinct viewport/scroll-container
+//!   concept exists yet, so `fixed` behaves identically to `absolute`
+//!   here). `position: sticky` isn't implemented at all (behaves as
+//!   `static`, since there's no scroll container to stick within).
+//!   `z-index`/stacking contexts/paint order aren't addressed by this
+//!   landing -- there's no paint pipeline yet (B10-B12) for a stacking
+//!   order to actually affect, so it's out of scope rather than faked.
 
 use crate::box_tree::{BoxKind, BoxLevel, ComputedStyle, LayoutBox, StyleMap};
 use crate::values::{self, LengthPercentageAuto};
@@ -141,6 +171,23 @@ fn get<'a>(style: Option<&'a ComputedStyle>, name: &str, default: &'a str) -> &'
         .and_then(|s| s.get(name))
         .map(String::as_str)
         .unwrap_or(default)
+}
+
+/// B6: resolves `top`/`right`/`bottom`/`left` -- pixel lengths only (not
+/// percentages, which would need a definite containing-block dimension
+/// this phase doesn't resolve in general -- see module docs' positioning
+/// known gap); `auto` or anything else unresolvable returns `None`.
+fn resolve_offset(
+    style: Option<&ComputedStyle>,
+    property: &str,
+    font_size_px: f64,
+    root_font_size_px: f64,
+) -> Option<f64> {
+    values::parse_length_px(
+        get(style, property, "auto"),
+        font_size_px,
+        root_font_size_px,
+    )
 }
 
 /// Lays out `root` (B1's box tree) as if it were the sole child of an
@@ -401,6 +448,40 @@ fn layout_box(
                 text: None,
             }
         }
+        BoxKind::GridContainer(items) => {
+            let (child_fragments, content_height) = layout_grid_container(
+                items,
+                styles,
+                style,
+                model.content_width,
+                font_size_px,
+                font_size_raw.as_deref(),
+                root_font_size_px,
+            );
+            let explicit_height = values::parse_length_percentage_auto(
+                get(style, "height", "auto"),
+                font_size_px,
+                root_font_size_px,
+            );
+            let height = match explicit_height {
+                LengthPercentageAuto::Length(px) => px,
+                LengthPercentageAuto::Percentage(_) | LengthPercentageAuto::Auto => content_height,
+            };
+            Fragment {
+                node: b.node,
+                content_rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: model.content_width,
+                    height,
+                },
+                margin: model.margin,
+                border: model.border,
+                padding: model.padding,
+                children: child_fragments,
+                text: None,
+            }
+        }
         BoxKind::Table(rows) => {
             let (child_fragments, content_height) = layout_table(
                 rows,
@@ -510,6 +591,32 @@ fn layout_block_children(
 
     for child in children {
         let style = child.node.and_then(|n| styles.get(&n));
+        let position = get(style, "position", "static");
+
+        if position == "absolute" || position == "fixed" {
+            // B6: taken out of normal flow entirely (no margin
+            // collapsing, no cursor_y contribution, no float
+            // interaction) and positioned via `top`/`left` -- see
+            // module docs for this phase's containing-block
+            // simplification (always the immediate parent, not the
+            // spec's "nearest positioned ancestor") and why `fixed`
+            // behaves identically to `absolute` here (no viewport
+            // concept to give it distinct behavior).
+            let mut fragment = layout_box(
+                child,
+                styles,
+                containing_width,
+                font_size_px,
+                font_size_raw,
+                root_font_size_px,
+            );
+            let x = resolve_offset(style, "left", font_size_px, root_font_size_px).unwrap_or(0.0);
+            let y = resolve_offset(style, "top", font_size_px, root_font_size_px).unwrap_or(0.0);
+            reposition(&mut fragment, x, y);
+            out.push(fragment);
+            continue;
+        }
+
         let float = get(style, "float", "none");
         let clear = get(style, "clear", "none");
 
@@ -565,6 +672,15 @@ fn layout_block_children(
         reposition(&mut fragment, margin_left, cursor_y);
         cursor_y += fragment.border_box().height;
         prev_margin_bottom = Some(fragment.margin.bottom);
+        if position == "relative" {
+            // B6: still fully participates in normal flow (sizing,
+            // margin collapsing, and every sibling's position are
+            // computed as if this offset didn't exist) -- only the
+            // box's own visual position shifts afterward.
+            let dx = resolve_offset(style, "left", font_size_px, root_font_size_px).unwrap_or(0.0);
+            let dy = resolve_offset(style, "top", font_size_px, root_font_size_px).unwrap_or(0.0);
+            shift(&mut fragment, dx, dy);
+        }
         out.push(fragment);
     }
     if let Some(bottom) = prev_margin_bottom {
@@ -1089,6 +1205,242 @@ fn layout_flex_item_content(
     }
 }
 
+/// B5: a resolved grid track -- either a fixed pixel size or a `fr`-style
+/// weight sharing whatever space is left after every `Fixed` track is
+/// subtracted. `auto` tracks are treated as `Fraction(1.0)` (a documented
+/// simplification -- a real `auto` track sizes to its content, which
+/// needs intrinsic sizing this project doesn't have yet).
+#[derive(Debug, Clone, Copy)]
+enum TrackSize {
+    Fixed(f64),
+    Fraction(f64),
+}
+
+/// Parses `grid-template-columns`/`grid-template-rows`'s value into a
+/// track list. Only bare `<length>`, `<percentage>`, `fr`, and `auto`
+/// tokens are recognized -- `repeat()`, `minmax()`, named lines, and
+/// subgrid aren't implemented (see module docs); an unparseable token
+/// falls back to a `0`-width fixed track rather than panicking.
+fn parse_track_list(
+    value: &str,
+    available_for_percentage: f64,
+    font_size_px: f64,
+    root_font_size_px: f64,
+) -> Vec<TrackSize> {
+    if value == "none" {
+        return Vec::new();
+    }
+    value
+        .split_whitespace()
+        .map(|token| {
+            if let Some(n) = token.strip_suffix("fr") {
+                TrackSize::Fraction(n.parse::<f64>().unwrap_or(1.0).max(0.0))
+            } else if token == "auto" {
+                TrackSize::Fraction(1.0)
+            } else if let Some(n) = token.strip_suffix('%') {
+                TrackSize::Fixed(available_for_percentage * n.parse().unwrap_or(0.0) / 100.0)
+            } else {
+                TrackSize::Fixed(
+                    values::parse_length_px(token, font_size_px, root_font_size_px).unwrap_or(0.0),
+                )
+            }
+        })
+        .collect()
+}
+
+/// Resolves each track's final pixel size: `Fixed` tracks keep their
+/// value; the space left over (available minus the sum of fixed tracks)
+/// splits among `Fraction` tracks proportional to their weight.
+fn resolve_track_sizes(tracks: &[TrackSize], available: f64) -> Vec<f64> {
+    let fixed_total: f64 = tracks
+        .iter()
+        .map(|t| match t {
+            TrackSize::Fixed(px) => *px,
+            TrackSize::Fraction(_) => 0.0,
+        })
+        .sum();
+    let fraction_total: f64 = tracks
+        .iter()
+        .map(|t| match t {
+            TrackSize::Fraction(w) => *w,
+            TrackSize::Fixed(_) => 0.0,
+        })
+        .sum();
+    let remaining = (available - fixed_total).max(0.0);
+    tracks
+        .iter()
+        .map(|t| match t {
+            TrackSize::Fixed(px) => *px,
+            TrackSize::Fraction(w) if fraction_total > 0.0 => remaining * (w / fraction_total),
+            TrackSize::Fraction(_) => 0.0,
+        })
+        .collect()
+}
+
+fn track_prefix_sums(sizes: &[f64]) -> Vec<f64> {
+    let mut out = vec![0.0; sizes.len() + 1];
+    for (i, size) in sizes.iter().enumerate() {
+        out[i + 1] = out[i] + size;
+    }
+    out
+}
+
+/// B5: resolves `grid-column`/`grid-row`'s value into a `(explicit
+/// 0-based start line, span)` pair -- `None` start means auto-placed.
+/// Only three forms are recognized: a bare integer (`"2"`, 1-based, span
+/// 1), `"span N"` (auto start, explicit span), and `"auto"`; the
+/// `"start / end"` range syntax isn't implemented (a documented gap --
+/// see module docs), and unparseable/other input falls back to `auto`.
+fn resolve_grid_placement(style: Option<&ComputedStyle>, property: &str) -> (Option<usize>, usize) {
+    let raw = get(style, property, "auto").trim();
+    if raw == "auto" {
+        return (None, 1);
+    }
+    if let Some(rest) = raw.strip_prefix("span") {
+        let span = rest.trim().parse::<usize>().unwrap_or(1).max(1);
+        return (None, span);
+    }
+    if let Ok(n) = raw.parse::<i64>() {
+        let start = (n - 1).max(0) as usize;
+        return (Some(start), 1);
+    }
+    (None, 1)
+}
+
+/// B5: [CSS Grid Layout](https://www.w3.org/TR/css-grid-1/), real but
+/// significantly scoped -- see module docs for the full list of cuts.
+/// Column tracks come from `grid-template-columns` (a single implicit
+/// full-width column if absent); rows are **always implicit**, growing
+/// one at a time as auto-placement needs them, and size to the tallest
+/// item placed in them (or to `grid-template-rows`' matching `Fixed`
+/// track, if one exists at that row index) -- `grid-template-rows`'
+/// `fr`/`auto` entries are effectively unused, since there's no definite
+/// grid container height to distribute them against in the general case.
+/// Placement only reads `grid-column` (`grid-row` isn't implemented, see
+/// module docs); un-placed items auto-flow row-major, skipping cells an
+/// earlier explicitly-placed item already claimed.
+fn layout_grid_container(
+    items: &[LayoutBox],
+    styles: &StyleMap,
+    container_style: Option<&ComputedStyle>,
+    content_width: f64,
+    font_size_px: f64,
+    font_size_raw: Option<&str>,
+    root_font_size_px: f64,
+) -> (Vec<Fragment>, f64) {
+    let column_tracks = parse_track_list(
+        get(container_style, "grid-template-columns", "none"),
+        content_width,
+        font_size_px,
+        root_font_size_px,
+    );
+    let column_tracks = if column_tracks.is_empty() {
+        vec![TrackSize::Fixed(content_width)]
+    } else {
+        column_tracks
+    };
+    let column_count = column_tracks.len();
+    let column_widths = resolve_track_sizes(&column_tracks, content_width);
+    let column_x = track_prefix_sums(&column_widths);
+
+    let row_tracks = parse_track_list(
+        get(container_style, "grid-template-rows", "none"),
+        0.0,
+        font_size_px,
+        root_font_size_px,
+    );
+    let explicit_row_height = |row: usize| -> Option<f64> {
+        match row_tracks.get(row) {
+            Some(TrackSize::Fixed(px)) => Some(*px),
+            _ => None,
+        }
+    };
+
+    // Placement pass: explicitly-column-placed items search forward from
+    // the current auto-placement cursor row for the first row where their
+    // column span is free; auto-placed items advance the cursor row-major,
+    // skipping any cell an earlier item already claimed.
+    let mut occupied: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut placements: Vec<(usize, usize, usize)> = Vec::with_capacity(items.len()); // (row, col_start, span)
+    let mut cursor_col = 0usize;
+    let mut cursor_row = 0usize;
+    for item in items {
+        let style = item.node.and_then(|n| styles.get(&n));
+        let (explicit_start, span) = resolve_grid_placement(style, "grid-column");
+        let span = span.min(column_count.max(1));
+        let (row, col_start) = match explicit_start {
+            Some(start) => {
+                let start = start.min(column_count.saturating_sub(1));
+                let mut row = cursor_row;
+                loop {
+                    if (start..(start + span).min(column_count))
+                        .all(|c| !occupied.contains(&(row, c)))
+                    {
+                        break;
+                    }
+                    row += 1;
+                }
+                (row, start)
+            }
+            None => loop {
+                if cursor_col + span > column_count {
+                    cursor_col = 0;
+                    cursor_row += 1;
+                    continue;
+                }
+                if (cursor_col..cursor_col + span).all(|c| !occupied.contains(&(cursor_row, c))) {
+                    let placed = (cursor_row, cursor_col);
+                    cursor_col += span;
+                    break placed;
+                }
+                cursor_col += 1;
+            },
+        };
+        for c in col_start..(col_start + span).min(column_count) {
+            occupied.insert((row, c));
+        }
+        placements.push((row, col_start, span));
+    }
+
+    // Lay out each item at its spanned column width (an ordinary
+    // auto-width block box correctly fills that span -- unlike Flexbox,
+    // no box-model bypass is needed here) and find each row's height.
+    let mut item_fragments = Vec::with_capacity(items.len());
+    let row_count = placements
+        .iter()
+        .map(|(row, _, _)| row + 1)
+        .max()
+        .unwrap_or(0);
+    let mut row_heights: Vec<f64> = vec![0.0; row_count];
+    for (item, &(row, col_start, span)) in items.iter().zip(&placements) {
+        let col_end = (col_start + span).min(column_count);
+        let span_width = (column_x[col_end] - column_x[col_start]).max(0.0);
+        let fragment = layout_box(
+            item,
+            styles,
+            span_width,
+            font_size_px,
+            font_size_raw,
+            root_font_size_px,
+        );
+        row_heights[row] = row_heights[row].max(fragment.border_box().height);
+        item_fragments.push(fragment);
+    }
+    for (row, height) in row_heights.iter_mut().enumerate() {
+        if let Some(explicit) = explicit_row_height(row) {
+            *height = explicit;
+        }
+    }
+    let row_y = track_prefix_sums(&row_heights);
+
+    for (fragment, &(row, col_start, _)) in item_fragments.iter_mut().zip(&placements) {
+        reposition(fragment, column_x[col_start], row_y[row]);
+    }
+
+    let content_height = row_y.last().copied().unwrap_or(0.0);
+    (item_fragments, content_height)
+}
+
 fn reposition(fragment: &mut Fragment, x: f64, y: f64) {
     let dx = x - fragment.border_box().x;
     let dy = y - fragment.border_box().y;
@@ -1169,13 +1521,14 @@ fn flatten_inline<'a>(
                 }
             }
         }
-        // A flex/table box directly inside an inline formatting context
-        // is an unusual edge case (B1's `flex_items`/table dispatch
-        // always produce block-level boxes, so this only happens if one
-        // somehow ends up as `display: inline`-adjacent content) -- drop
-        // it rather than trying to flatten table/flex-internal structure
-        // into words, a documented gap.
+        // A flex/grid/table box directly inside an inline formatting
+        // context is an unusual edge case (B1's `flex_items`/table
+        // dispatch always produce block-level boxes, so this only
+        // happens if one somehow ends up as `display: inline`-adjacent
+        // content) -- drop it rather than trying to flatten table/flex/
+        // grid-internal structure into words, a documented gap.
         BoxKind::FlexContainer(_)
+        | BoxKind::GridContainer(_)
         | BoxKind::Table(_)
         | BoxKind::TableRow(_)
         | BoxKind::TableCell { .. } => {}
@@ -1930,5 +2283,171 @@ mod tests {
         // stretch, so it should stretch to the line's cross size -- the
         // tallest item, `a`'s explicit 10px.
         assert_eq!(fragment.children[1].content_rect.height, 10.0);
+    }
+
+    #[test]
+    fn grid_columns_split_by_fr_weight_and_wrap_to_new_row() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let container = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, container, "div", &[]);
+        let b = el(&mut doc, container, "div", &[]);
+        let c = el(&mut doc, container, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(
+            &mut styles,
+            container,
+            &[("display", "grid"), ("grid-template-columns", "1fr 2fr")],
+        );
+        set_style(&mut styles, a, &[("display", "block"), ("height", "10px")]);
+        set_style(&mut styles, b, &[("display", "block"), ("height", "10px")]);
+        set_style(&mut styles, c, &[("display", "block"), ("height", "10px")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 300.0);
+        // 300px split 1:2 -> 100px, 200px columns.
+        assert_eq!(fragment.children[0].content_rect.width, 100.0);
+        assert_eq!(fragment.children[1].content_rect.x, 100.0);
+        assert_eq!(fragment.children[1].content_rect.width, 200.0);
+        // Only 2 columns -- the third item wraps to a new row.
+        assert_eq!(fragment.children[2].content_rect.x, 0.0);
+        assert_eq!(fragment.children[2].content_rect.y, 10.0);
+    }
+
+    #[test]
+    fn grid_explicit_column_placement_leaves_earlier_cells_for_auto_items() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let container = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, container, "div", &[]);
+        let b = el(&mut doc, container, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(
+            &mut styles,
+            container,
+            &[
+                ("display", "grid"),
+                ("grid-template-columns", "100px 100px 100px"),
+            ],
+        );
+        // `a` explicitly claims column 2 (1-based) = 0-based column 1.
+        set_style(
+            &mut styles,
+            a,
+            &[("display", "block"), ("grid-column", "2")],
+        );
+        // `b` is auto-placed and should land in the still-free column 0.
+        set_style(&mut styles, b, &[("display", "block")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 300.0);
+        assert_eq!(fragment.children[0].content_rect.x, 100.0);
+        assert_eq!(fragment.children[1].content_rect.x, 0.0);
+    }
+
+    #[test]
+    fn grid_row_height_comes_from_tallest_item_in_that_row() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let container = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, container, "div", &[]);
+        let b = el(&mut doc, container, "div", &[]);
+        let c = el(&mut doc, container, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(
+            &mut styles,
+            container,
+            &[("display", "grid"), ("grid-template-columns", "50px 50px")],
+        );
+        set_style(&mut styles, a, &[("display", "block"), ("height", "30px")]);
+        set_style(&mut styles, b, &[("display", "block"), ("height", "10px")]);
+        set_style(&mut styles, c, &[("display", "block"), ("height", "5px")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 100.0);
+        // Row 0's height is 30px (the tallest of a/b), so row 1's `c`
+        // starts at y=30.
+        assert_eq!(fragment.children[2].content_rect.y, 30.0);
+        assert_eq!(fragment.content_rect.height, 35.0);
+    }
+
+    #[test]
+    fn grid_explicit_row_track_overrides_content_height() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let container = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, container, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(
+            &mut styles,
+            container,
+            &[
+                ("display", "grid"),
+                ("grid-template-columns", "100px"),
+                ("grid-template-rows", "50px"),
+            ],
+        );
+        set_style(&mut styles, a, &[("display", "block"), ("height", "5px")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 100.0);
+        assert_eq!(fragment.content_rect.height, 50.0);
+    }
+
+    #[test]
+    fn position_relative_offsets_without_disturbing_siblings() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let parent = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, parent, "div", &[]);
+        let b = el(&mut doc, parent, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(&mut styles, parent, &[("display", "block")]);
+        set_style(
+            &mut styles,
+            a,
+            &[
+                ("display", "block"),
+                ("height", "10px"),
+                ("position", "relative"),
+                ("top", "5px"),
+                ("left", "3px"),
+            ],
+        );
+        set_style(&mut styles, b, &[("display", "block"), ("height", "10px")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 100.0);
+        // `a` visually shifts by (3, 5)...
+        assert_eq!(fragment.children[0].content_rect.x, 3.0);
+        assert_eq!(fragment.children[0].content_rect.y, 5.0);
+        // ...but `b` is positioned exactly where it would be if `a` had
+        // never moved (still-in-flow, so it stacks below `a`'s original
+        // 10px-tall box, not the offset one).
+        assert_eq!(fragment.children[1].content_rect.y, 10.0);
+    }
+
+    #[test]
+    fn position_absolute_is_out_of_flow_and_positioned_by_offsets() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let parent = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, parent, "div", &[]);
+        let b = el(&mut doc, parent, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(&mut styles, parent, &[("display", "block")]);
+        set_style(
+            &mut styles,
+            a,
+            &[
+                ("display", "block"),
+                ("height", "10px"),
+                ("position", "absolute"),
+                ("top", "40px"),
+                ("left", "20px"),
+            ],
+        );
+        set_style(&mut styles, b, &[("display", "block"), ("height", "10px")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 100.0);
+        assert_eq!(fragment.children[0].content_rect.x, 20.0);
+        assert_eq!(fragment.children[0].content_rect.y, 40.0);
+        // `b` doesn't see `a` at all -- it's the first in-flow box.
+        assert_eq!(fragment.children[1].content_rect.y, 0.0);
     }
 }
