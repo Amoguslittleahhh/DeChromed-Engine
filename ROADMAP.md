@@ -703,18 +703,70 @@ self-authored unit tests (`relative` offsetting without disturbing
 siblings, `absolute` being out-of-flow and offset-positioned) plus the
 shared stress-test fuzzer.
 
-### B7. Fragmentation
-Multi-column layout (`column-count`/`column-width`), fragmentation for
-print/pagination (`break-before`/`break-after`/`break-inside`) — the
-subsystem most engines get wrong or skip; genuine parity requires it.
-**Exit:** WPT `css/css-multicol`, `css/css-break` ≥60%.
+### B7. Fragmentation — *started*
+A real multi-column implementation in `layout::flow::layout_multicol`:
+`column-count`/`column-width` resolution (including the actual spec rule
+for when both are set — the smaller of "however many `column-count`
+columns" and "however many `column-width`-sized columns fit" wins), and
+genuine height-based slicing of already-flowed content into real
+side-by-side columns, honoring `break-before`/`break-after: always`/
+`column` as forced breaks and defaulting to CSS's `column-fill: balance`
+(the initial value) for the rest. Children are flowed once at the
+resolved *column width* (so text/block content wraps at the correct
+measure) and the resulting sequence is then sliced by height — this
+works for both block-level and purely-inline content, since both
+formatting contexts already return the same `Fragment` sequence shape.
 
-### B8. Writing modes & internationalized layout
-Vertical writing modes (`writing-mode: vertical-rl`), logical properties
-(`margin-inline-start` etc. instead of physical `left`/`right`), full
-Unicode Bidirectional Algorithm (UAX #9) for RTL/LTR mixed text.
-**Exit:** WPT `css/css-writing-modes`, `css/css-logical` ≥65%; bidi
-conformance against the Unicode BidiTest data files.
+Known gaps, documented in the module's own doc comments: no
+fragmentation *within* a single child (a child taller than a column
+target just overflows/extends past it, rather than being split — so
+`break-inside: avoid` is trivially always honored, since nothing splits
+inside a fragment regardless); `column-fill: auto` isn't implemented
+(always balances); `column-rule` (the visible divider) isn't implemented
+(no paint pipeline exists yet to draw it); `column-gap: normal` resolves
+to a stated, reasonable `1em` choice rather than one true spec-mandated
+value (there isn't one).
+**Exit not yet met** (no within-child fragmentation, no `column-fill:
+auto`/`column-rule`) — WPT `css/css-multicol`/`css/css-break` need a JS
+engine to run anyway (Track C); verified instead with 2 self-authored
+unit tests (even balancing across 3 columns, `break-before: always`
+forcing a column regardless of natural balance) plus the shared
+stress-test fuzzer.
+
+### B8. Writing modes & internationalized layout — *started (logical properties + `direction: rtl` only)*
+Real logical-property resolution in `layout::flow::resolve_box_model`:
+`margin-inline-start/-end`, `margin-block-start/-end`,
+`padding-inline-start/-end`, and `padding-block-start/-end` all resolve
+to the correct physical side (block-start/-end always map to top/bottom,
+since only `horizontal-tb` writing mode is supported; inline-start/-end
+map to left/right according to `direction`) when a stylesheet doesn't
+set the equivalent physical longhand directly. `direction: rtl` also has
+a real effect on inline layout (`layout::flow::layout_inline_children`):
+each already-built line is mirrored within the full containing width,
+correctly reversing visual left/right order while preserving logical
+(source) order, so the first word in reading order ends up rightmost, as
+RTL requires.
+
+**Vertical writing modes (`writing-mode: vertical-rl`/`vertical-lr`)
+are explicitly not implemented at all in this landing** — real vertical
+writing modes swap which axis is "block" and which is "inline"
+throughout *every* formatting context this crate has (block, inline,
+table, flex, grid), which needs the same kind of axis-agnostic rewrite
+B4's flexbox algorithm already does for its own two axes, but applied
+project-wide. That's a real architectural undertaking on its own, stated
+plainly as future work rather than faked via a cosmetic post-hoc
+rotation of otherwise-horizontal layout output. The full Unicode
+Bidirectional Algorithm (UAX #9) also isn't implemented — mixed-
+direction text within one inline formatting context isn't reordered
+per-run, only the container's own `direction` is honored uniformly for
+the whole context.
+**Exit not yet met** (no vertical writing modes, no UAX #9 bidi) — WPT
+`css/css-writing-modes`/`css/css-logical` need a JS engine to run
+anyway, and bidi conformance against the Unicode BidiTest data files
+needs the UAX #9 algorithm this phase doesn't implement; verified
+instead with 2 self-authored unit tests (RTL inline-content mirroring,
+logical-margin-to-physical-side mapping in both directions) plus the
+shared stress-test fuzzer.
 
 ### B9. Fragment tree & display list
 Replace any toy "list of boxes" with a real intermediate representation:
@@ -1381,29 +1433,32 @@ That's "renders a real static webpage correctly"'s content-and-style half
 (layout) only needs a styled tree, which has existed since A6 and is now
 more complete with A8/A9's namespace-aware elements included.
 
-**B1 (box tree generation), B2 (block & inline formatting contexts), B3
-(table layout), B4 (flexbox), B5 (grid), and the start of B6
-(positioning) are now started** in the new `engine/crates/layout` crate
--- see their entries above for exactly what's real (display computation,
+**B1 (box tree generation) through B8 (writing modes & internationalized
+layout) are all now started** in the new `engine/crates/layout` crate --
+see their entries above for exactly what's real (display computation,
 anonymous-box wrapping, list markers, real box-model geometry, margin
 collapsing, line-breaking, float/clear, table row/column/colspan layout,
 flexbox's grow/shrink/wrap/justify/align algorithms, grid's track sizing
 + occupancy-aware auto-placement, `position: relative`/`absolute`/
-`fixed`) and what's still a documented gap (`::before`/`::after`,
-font-shaping-accurate text metrics, shrink-to-fit/intrinsic sizing,
-float-aware line narrowing, table `rowspan`/`border-collapse`/
-`border-spacing`, flex `order`/`gap`/column-direction wrap-and-stretch,
-grid `repeat()`/`minmax()`/subgrid/`grid-row`, and B6's simplified
-"immediate parent, not nearest positioned ancestor" containing-block
-resolution plus no `sticky`/`z-index`/stacking). Remaining work to fully
-close out B1-B6: pseudo-element matching in `css::cascade` (needed for
-generated content), the float/line-narrowing refinement, the several
-intrinsic-sizing-dependent gaps that recur across B2/B4/B5 (auto-width
-shrink-to-fit, flex's min-content shrink floor, table/grid's min/max-
-content track sizing) -- worth tackling together once B10 (text shaping)
-exists to actually measure content -- and B6's real containing-block
+`fixed`, real multi-column balancing + forced breaks, and logical
+margin/padding properties + `direction: rtl` inline mirroring) and what's
+still a documented gap (`::before`/`::after`, font-shaping-accurate text
+metrics, shrink-to-fit/intrinsic sizing, float-aware line narrowing,
+table `rowspan`/`border-collapse`/`border-spacing`, flex `order`/`gap`/
+column-direction wrap-and-stretch, grid `repeat()`/`minmax()`/subgrid/
+`grid-row`, B6's simplified containing-block resolution plus no
+`sticky`/`z-index`/stacking, B7's no within-child fragmentation/
+`column-rule`, and B8's complete absence of vertical writing modes/UAX
+#9 bidi -- the two biggest remaining Track B gaps by far). Remaining
+work to fully close out B1-B8: pseudo-element matching in `css::cascade`
+(needed for generated content), the float/line-narrowing refinement, the
+several intrinsic-sizing-dependent gaps that recur across B2/B4/B5
+(auto-width shrink-to-fit, flex's min-content shrink floor, table/grid's
+min/max-content track sizing) -- worth tackling together once B10 (text
+shaping) exists to actually measure content -- B6's real containing-block
 resolution (needs ancestor position-type tracking threaded through the
-layout recursion, deferred rather than half-built). **B7 (fragmentation)
-and B8 (writing modes)** are the natural next Track B phases; **B9**
-(fragment tree & display list, tying everything together with B10-B12's
-eventual paint pipeline) follows after that.
+layout recursion), and B8's vertical-writing-mode axis-agnostic rewrite
+(a genuinely large undertaking, deferred rather than half-built or
+faked). **B9 (fragment tree & display list)** is the natural next Track
+B phase, tying everything above together with B10-B12's eventual paint
+pipeline.

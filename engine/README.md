@@ -14,19 +14,21 @@ invalidation-set-driven incremental restyling, and a real standalone XML
 1.0 parser (`crates/xml`) with namespace resolution (XSLT explicitly
 dropped, per `ROADMAP.md`'s own long-standing note on it).
 
-**Track B (layout) is now started**: B1 (box tree generation), B2
-(block & inline formatting contexts), B3 (table layout), B4 (flexbox),
-B5 (grid), and the start of B6 (positioning) all have a real, tested
-first landing in `crates/layout` -- `display` computation, anonymous-box
+**Track B (layout) is now started**: B1 (box tree generation) through B8
+(writing modes & internationalized layout) all have a real, tested first
+landing in `crates/layout` -- `display` computation, anonymous-box
 generation, list markers, real box-model geometry, CSS2.1 margin
 collapsing, line-breaking, `float`/`clear`, table row/column/`colspan`
 layout, a real (row + column direction) flexbox grow/shrink/wrap/
 `justify-content`/`align-items` implementation, grid track sizing +
-occupancy-aware auto-placement, and `position: relative`/`absolute`/
-`fixed`. See `ROADMAP.md`'s B1-B6 entries for exactly what's real vs. a
-documented gap (`::before`/`::after` generated content, the several gaps
-that trace back to "no intrinsic sizing yet", and B6's simplified
-containing-block resolution are the biggest ones). `crates/shell/src/main.rs`
+occupancy-aware auto-placement, `position: relative`/`absolute`/`fixed`,
+real multi-column balancing with forced `break-before`/`-after`, and
+logical margin/padding properties + `direction: rtl` inline-content
+mirroring. See `ROADMAP.md`'s B1-B8 entries for exactly what's real vs.
+a documented gap (`::before`/`::after` generated content, the several
+gaps that trace back to "no intrinsic sizing yet", B6's simplified
+containing-block resolution, and B8's complete absence of vertical
+writing modes/UAX #9 bidi are the biggest ones). `crates/shell/src/main.rs`
 runs the real pipeline end to end, including this layout stage.
 
 The workspace targets Rust **edition 2024** (`engine/Cargo.toml`), using
@@ -43,7 +45,7 @@ engine/
     html/                    A2 (tokenizer) + A3 (tree construction) + A8/A9 (SVG/MathML foreign content) -- all done
     css/                     A4-A7 (tokenizer/parser, selectors, cascade, CSSOM) -- all done
     xml/                     A10 (standalone XML 1.0 parser + namespace resolution) -- done; also A8's standalone-SVG-document entry point
-    layout/                  B1-B5 + start of B6 (box tree, block/inline layout, tables, flexbox, grid, positioning) -- started; B7-B9 (fragmentation, writing modes, fragment tree) still placeholders
+    layout/                  B1-B8 (box tree, block/inline layout, tables, flexbox, grid, positioning, multi-column, logical properties/RTL) -- started; B9 (fragment tree & display list) still a placeholder
     paint/                   B10-B12 (text shaping, rasterization, compositing) -- currently placeholders
     js_bindings/              Track C -- placeholder, shape depends on "the JS engine question"
     net/                     D1-D3 (URL parsing, networking, resource loading) -- currently placeholders

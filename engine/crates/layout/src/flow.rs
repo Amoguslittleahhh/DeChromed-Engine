@@ -1,8 +1,11 @@
 //! B2: block & inline formatting contexts -- turning a box tree (B1) into
 //! a fragment tree of positioned, sized boxes. Also B3 (table layout,
 //! [`layout_table`]), B4 (flexbox, [`layout_flex_container`]), B5 (grid,
-//! [`layout_grid_container`]), and the start of B6 (`position: relative`/
-//! `absolute`/`fixed`, in [`layout_block_children`]).
+//! [`layout_grid_container`]), the start of B6 (`position: relative`/
+//! `absolute`/`fixed`, in [`layout_block_children`]), the start of B7
+//! (multi-column, [`layout_multicol`]), and the start of B8 (`direction:
+//! rtl` in [`layout_inline_children`]; logical margin/padding properties
+//! in [`resolve_box_model`]).
 //!
 //! Reference: <https://www.w3.org/TR/CSS22/visuren.html#normal-flow>,
 //! <https://www.w3.org/TR/CSS22/box.html#box-dimensions>,
@@ -10,7 +13,10 @@
 //! <https://www.w3.org/TR/CSS22/box.html#collapsing-margins> (margin
 //! collapsing), <https://www.w3.org/TR/css-flexbox-1/> (B4),
 //! <https://www.w3.org/TR/css-grid-1/> (B5),
-//! <https://www.w3.org/TR/CSS22/visuren.html#propdef-position> (B6).
+//! <https://www.w3.org/TR/CSS22/visuren.html#propdef-position> (B6),
+//! <https://www.w3.org/TR/css-multicol-1/> (B7),
+//! <https://www.w3.org/TR/css-writing-modes-4/>,
+//! <https://www.w3.org/TR/css-logical-1/> (B8).
 //!
 //! ## What's real here
 //! - Full box-model geometry: margin/border/padding/content-box widths
@@ -101,6 +107,41 @@
 //!   `z-index`/stacking contexts/paint order aren't addressed by this
 //!   landing -- there's no paint pipeline yet (B10-B12) for a stacking
 //!   order to actually affect, so it's out of scope rather than faked.
+//! - **B7 multi-column is real but doesn't fragment *within* a child.**
+//!   `column-count`/`column-width` (including the real "smaller of the
+//!   two, when both are set" resolution) and `break-before`/`-after:
+//!   always`/`column` all work, slicing already-flowed content into real
+//!   side-by-side columns; `break-inside` is trivially always honored
+//!   (nothing here ever splits within one child fragment regardless).
+//!   `column-fill: auto` isn't implemented -- columns always balance
+//!   (the initial `column-fill: balance` behavior). `column-rule`
+//!   (the visible divider) isn't implemented -- no paint pipeline exists
+//!   yet to draw it. `column-gap: normal` resolves to `1em`, this
+//!   project's own reasonable choice stated plainly rather than pretending
+//!   there's one true spec-mandated value. See [`layout_multicol`]'s own
+//!   doc comment for the balancing/slicing algorithm.
+//! - **B8 is scoped to logical properties and `direction: rtl` in
+//!   horizontal writing mode -- vertical writing modes
+//!   (`writing-mode: vertical-rl`/`vertical-lr`) aren't implemented at
+//!   all.** Real vertical writing modes swap which axis is "block" and
+//!   which is "inline" throughout every formatting context this module
+//!   has (block/inline/table/flex/grid), which needs the same kind of
+//!   axis-agnostic rewrite B4's flexbox algorithm already does, but
+//!   applied project-wide -- a real architectural undertaking, not
+//!   attempted here rather than faked via a cosmetic post-hoc rotation.
+//!   What *is* real: `margin-inline-start/-end`/`-block-start/-end` and
+//!   `padding-inline-start/-end`/`-block-start/-end` resolve to the
+//!   correct physical side based on `direction` (block-start/-end always
+//!   map to top/bottom, since only `horizontal-tb` is supported); when a
+//!   stylesheet sets *both* the physical and logical form for one side,
+//!   the physical one wins here, unlike real CSS's "they're the same
+//!   underlying value, whichever was declared last wins" aliasing (a
+//!   documented simplification, see [`resolve_box_model`]). `direction:
+//!   rtl` correctly mirrors an inline formatting context's line
+//!   contents (see [`layout_inline_children`]) but doesn't implement the
+//!   Unicode Bidirectional Algorithm (UAX #9) -- mixed-direction text
+//!   within one inline formatting context isn't reordered per-run, only
+//!   the container's own `direction` is honored uniformly.
 
 use crate::box_tree::{BoxKind, BoxLevel, ComputedStyle, LayoutBox, StyleMap};
 use crate::values::{self, LengthPercentageAuto};
@@ -267,22 +308,42 @@ fn resolve_box_model(
     font_size_px: f64,
     root_font_size_px: f64,
 ) -> BoxModel {
-    let resolve = |name: &str| -> f64 {
-        match values::parse_length_percentage_auto(
-            get(style, name, "0"),
-            font_size_px,
-            root_font_size_px,
-        ) {
+    // B8: a physical side's own longhand always wins if set; otherwise
+    // fall back to the corresponding logical property (block-start/-end
+    // always map to top/bottom -- only `horizontal-tb` is supported, see
+    // module docs -- and inline-start/-end map to left/right according
+    // to `direction`). Real CSS treats a physical/logical pair for the
+    // same side as literal aliases for one underlying value (whichever
+    // was declared *last* wins); this is a simplified "physical always
+    // wins if both are set" rule instead, a documented gap.
+    let resolve_side = |physical: &str, logical: &str| -> f64 {
+        let raw = style
+            .and_then(|s| s.get(physical))
+            .or_else(|| style.and_then(|s| s.get(logical)))
+            .map(String::as_str)
+            .unwrap_or("0");
+        match values::parse_length_percentage_auto(raw, font_size_px, root_font_size_px) {
             LengthPercentageAuto::Length(px) => px,
             LengthPercentageAuto::Percentage(pct) => containing_width * pct / 100.0,
             LengthPercentageAuto::Auto => 0.0,
         }
     };
+    let direction_rtl = get(style, "direction", "ltr") == "rtl";
+    let inline_start = if direction_rtl {
+        "-inline-end"
+    } else {
+        "-inline-start"
+    };
+    let inline_end = if direction_rtl {
+        "-inline-start"
+    } else {
+        "-inline-end"
+    };
     let margin = EdgeSizes {
-        top: resolve("margin-top"),
-        right: resolve("margin-right"),
-        bottom: resolve("margin-bottom"),
-        left: resolve("margin-left"),
+        top: resolve_side("margin-top", "margin-block-start"),
+        right: resolve_side("margin-right", &format!("margin{inline_end}")),
+        bottom: resolve_side("margin-bottom", "margin-block-end"),
+        left: resolve_side("margin-left", &format!("margin{inline_start}")),
     };
     // `css::cascade`'s property table only has a single (non-per-side)
     // `border-width`/`border-style`, so all four sides always share one
@@ -303,10 +364,10 @@ fn resolve_box_model(
         left: border_width_px,
     };
     let padding = EdgeSizes {
-        top: resolve("padding-top"),
-        right: resolve("padding-right"),
-        bottom: resolve("padding-bottom"),
-        left: resolve("padding-left"),
+        top: resolve_side("padding-top", "padding-block-start"),
+        right: resolve_side("padding-right", &format!("padding{inline_end}")),
+        bottom: resolve_side("padding-bottom", "padding-block-end"),
+        left: resolve_side("padding-left", &format!("padding{inline_start}")),
     };
     let non_content_width =
         margin.left + margin.right + border.left + border.right + padding.left + padding.right;
@@ -333,6 +394,120 @@ fn collapse_margins(a: f64, b: f64) -> f64 {
     let positive_max = a.max(0.0).max(b.max(0.0));
     let negative_max = (-a).max(0.0).max((-b).max(0.0));
     positive_max - negative_max
+}
+
+/// B7: resolves `column-count`/`column-width` into an effective number
+/// of columns (`1` when neither is set -- not a multi-column context at
+/// all). When both are set, real CSS uses whichever is *smaller*
+/// (`column-count` caps how many `column-width`-sized columns actually
+/// fit) -- implemented here exactly.
+fn resolve_effective_column_count(
+    style: Option<&ComputedStyle>,
+    content_width: f64,
+    font_size_px: f64,
+    root_font_size_px: f64,
+) -> usize {
+    let count_raw = get(style, "column-count", "auto");
+    let width_raw = get(style, "column-width", "auto");
+    if count_raw == "auto" && width_raw == "auto" {
+        return 1;
+    }
+    let by_count = count_raw.parse::<usize>().ok().filter(|&n| n > 0);
+    let by_width = values::parse_length_px(width_raw, font_size_px, root_font_size_px)
+        .filter(|&w| w > 0.0)
+        .map(|w| ((content_width / w).floor() as usize).max(1));
+    match (by_count, by_width) {
+        (Some(c), Some(w)) => c.min(w).max(1),
+        (Some(c), None) => c.max(1),
+        (None, Some(w)) => w,
+        (None, None) => 1,
+    }
+}
+
+/// `column-gap: normal` resolves to `1em` in every real UA; there's no
+/// spec-mandated exact value, so this project's own choice is stated
+/// plainly rather than left to look like a mystery constant.
+fn resolve_column_gap(
+    style: Option<&ComputedStyle>,
+    font_size_px: f64,
+    root_font_size_px: f64,
+) -> f64 {
+    match get(style, "column-gap", "normal") {
+        "normal" => font_size_px,
+        other => {
+            values::parse_length_px(other, font_size_px, root_font_size_px).unwrap_or(font_size_px)
+        }
+    }
+}
+
+/// B7: [multi-column layout](https://www.w3.org/TR/css-multicol-1/),
+/// real but scoped -- see module docs. `flowed_children` is the result
+/// of laying the box's children out *once*, at `column_width`, as if
+/// into one impossibly tall single column (so text/block content
+/// already wraps at the correct measure); this function then slices
+/// that sequence into `column_count` real columns by height, without
+/// ever splitting a single child fragment's own content across a column
+/// boundary (only `break-inside: avoid`'s *effect* -- since nothing
+/// here ever splits within a fragment regardless, "avoid" is trivially
+/// always honored). `break-before`/`break-after: always`/`column` force
+/// a new column at that point; otherwise a new column starts once
+/// adding the next child would exceed `single_column_content_height /
+/// column_count` (CSS's `column-fill: balance`, the initial value --
+/// `column-fill: auto` isn't implemented, this always balances).
+/// Columns beyond `column_count` are never created (the last column
+/// simply overflows if forced breaks or unbalanceable content demand
+/// more space than that), matching real UAs' handling of an explicit
+/// `column-count` that can't be honored while also balancing.
+fn layout_multicol(
+    flowed_children: Vec<Fragment>,
+    single_column_content_height: f64,
+    styles: &StyleMap,
+    column_count: usize,
+    column_width: f64,
+    gap: f64,
+) -> (Vec<Fragment>, f64) {
+    let target_height = single_column_content_height / column_count as f64;
+    let mut out = Vec::with_capacity(flowed_children.len());
+    let mut column_index = 0usize;
+    let mut column_start_y = 0.0;
+    let mut column_has_content = false;
+    // Set by the previous fragment's `break-after`; consumed at the top
+    // of the next iteration alongside that fragment's own `break-before`.
+    let mut pending_forced_break = false;
+    let mut column_heights = vec![0.0f64; column_count];
+
+    for mut fragment in flowed_children {
+        let style = fragment.node.and_then(|n| styles.get(&n));
+        let forced_break = pending_forced_break
+            || matches!(get(style, "break-before", "auto"), "column" | "always");
+        pending_forced_break = false;
+        let original_top = fragment.border_box().y;
+        let original_bottom = original_top + fragment.border_box().height;
+        let relative_bottom = original_bottom - column_start_y;
+
+        if column_has_content
+            && column_index + 1 < column_count
+            && (forced_break || relative_bottom > target_height)
+        {
+            column_index += 1;
+            column_start_y = original_top;
+        }
+
+        let local_y = original_top - column_start_y;
+        let target_x = fragment.border_box().x + column_index as f64 * (column_width + gap);
+        reposition(&mut fragment, target_x, local_y);
+        column_heights[column_index] =
+            column_heights[column_index].max(local_y + fragment.border_box().height);
+        column_has_content = true;
+
+        if matches!(get(style, "break-after", "auto"), "column" | "always") {
+            pending_forced_break = true;
+        }
+        out.push(fragment);
+    }
+
+    let content_height = column_heights.iter().copied().fold(0.0, f64::max);
+    (out, content_height)
 }
 
 fn layout_box(
@@ -370,7 +545,53 @@ fn layout_box(
         },
         BoxKind::Container(children) => {
             let is_bfc = children.iter().any(|c| c.level == BoxLevel::Block);
-            let (child_fragments, content_height) = if is_bfc {
+            // B7: a multi-column context flows its children at the
+            // *column* width (not the full content width -- text needs
+            // to wrap at the narrower measure), then slices the
+            // resulting single tall "column" of content into
+            // `column_count` real columns by height. See
+            // `layout_multicol`'s own doc comment for the slicing
+            // algorithm.
+            let column_count = resolve_effective_column_count(
+                style,
+                model.content_width,
+                font_size_px,
+                root_font_size_px,
+            );
+            let (child_fragments, content_height) = if column_count > 1 {
+                let gap = resolve_column_gap(style, font_size_px, root_font_size_px);
+                let column_width = ((model.content_width - gap * (column_count as f64 - 1.0))
+                    / column_count as f64)
+                    .max(0.0);
+                let (flowed, single_column_height) = if is_bfc {
+                    layout_block_children(
+                        children,
+                        styles,
+                        column_width,
+                        font_size_px,
+                        font_size_raw.as_deref(),
+                        root_font_size_px,
+                    )
+                } else {
+                    layout_inline_children(
+                        children,
+                        styles,
+                        column_width,
+                        font_size_px,
+                        font_size_raw.as_deref(),
+                        root_font_size_px,
+                        b.node,
+                    )
+                };
+                layout_multicol(
+                    flowed,
+                    single_column_height,
+                    styles,
+                    column_count,
+                    column_width,
+                    gap,
+                )
+            } else if is_bfc {
                 layout_block_children(
                     children,
                     styles,
@@ -1565,6 +1786,22 @@ fn layout_inline_children(
     root_font_size_px: f64,
     container_node: Option<NodeId>,
 ) -> (Vec<Fragment>, f64) {
+    // B8: `direction: rtl`'s real effect on an inline formatting context.
+    // Lines are built exactly as for LTR (greedy left-to-right packing,
+    // unchanged below); each finished line is then mirrored within the
+    // full containing width, which correctly reverses the line's visual
+    // left/right order while preserving each item's logical (source)
+    // order -- the first word ends up rightmost, as RTL requires. This
+    // doesn't implement the full Unicode Bidirectional Algorithm
+    // (UAX #9): mixed-direction text within one inline formatting
+    // context isn't reordered per-run, only the container's own
+    // `direction` is honored uniformly -- a documented gap.
+    let direction_rtl = container_node
+        .and_then(|n| styles.get(&n))
+        .and_then(|s| s.get("direction"))
+        .map(|d| d == "rtl")
+        .unwrap_or(false);
+
     let mut items = Vec::new();
     for child in children {
         flatten_inline(
@@ -1667,7 +1904,14 @@ fn layout_inline_children(
         }
         let height = line_max_height[i];
         for fragment in &mut line {
-            shift(fragment, 0.0, cursor_y);
+            let dx = if direction_rtl {
+                let mirrored_x =
+                    containing_width - (fragment.content_rect.x + fragment.content_rect.width);
+                mirrored_x - fragment.content_rect.x
+            } else {
+                0.0
+            };
+            shift(fragment, dx, cursor_y);
         }
         cursor_y += height;
         out.push(Fragment {
@@ -2449,5 +2693,146 @@ mod tests {
         assert_eq!(fragment.children[0].content_rect.y, 40.0);
         // `b` doesn't see `a` at all -- it's the first in-flow box.
         assert_eq!(fragment.children[1].content_rect.y, 0.0);
+    }
+
+    #[test]
+    fn multicol_balances_children_evenly_across_columns() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let container = el(&mut doc, root, "div", &[]);
+        let mut items = Vec::new();
+        for _ in 0..6 {
+            items.push(el(&mut doc, container, "div", &[]));
+        }
+        let mut styles = StyleMap::new();
+        set_style(
+            &mut styles,
+            container,
+            &[
+                ("display", "block"),
+                ("column-count", "3"),
+                ("column-gap", "0"),
+            ],
+        );
+        for &item in &items {
+            set_style(
+                &mut styles,
+                item,
+                &[("display", "block"), ("height", "10px")],
+            );
+        }
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 300.0);
+        // column_width = 300/3 = 100px; 60px of content balanced 20px per
+        // column -> items [0,1] in column 0, [2,3] in column 1 (x=100),
+        // [4,5] in column 2 (x=200), each restarting at y=0.
+        assert_eq!(fragment.children[0].content_rect.x, 0.0);
+        assert_eq!(fragment.children[1].content_rect.y, 10.0);
+        assert_eq!(fragment.children[2].content_rect.x, 100.0);
+        assert_eq!(fragment.children[2].content_rect.y, 0.0);
+        assert_eq!(fragment.children[4].content_rect.x, 200.0);
+        assert_eq!(fragment.children[4].content_rect.y, 0.0);
+    }
+
+    #[test]
+    fn multicol_break_before_forces_a_new_column() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let container = el(&mut doc, root, "div", &[]);
+        let a = el(&mut doc, container, "div", &[]);
+        let b = el(&mut doc, container, "div", &[]);
+        let c = el(&mut doc, container, "div", &[]);
+        let d = el(&mut doc, container, "div", &[]);
+        let mut styles = StyleMap::new();
+        set_style(
+            &mut styles,
+            container,
+            &[
+                ("display", "block"),
+                ("column-count", "2"),
+                ("column-gap", "0"),
+            ],
+        );
+        // 4 items x 1px = 4px total, target height 2px per column. Natural
+        // balancing alone would keep `a`+`b` together in column 0 (`b`'s
+        // relative bottom is exactly 2px, not *over* the 2px target) --
+        // `break-before: always` on `b` forces it into column 1 anyway,
+        // isolating the forced-break behavior from natural balancing.
+        set_style(&mut styles, a, &[("display", "block"), ("height", "1px")]);
+        set_style(
+            &mut styles,
+            b,
+            &[
+                ("display", "block"),
+                ("height", "1px"),
+                ("break-before", "always"),
+            ],
+        );
+        set_style(&mut styles, c, &[("display", "block"), ("height", "1px")]);
+        set_style(&mut styles, d, &[("display", "block"), ("height", "1px")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 200.0);
+        assert_eq!(fragment.children[0].content_rect.x, 0.0);
+        assert_eq!(fragment.children[0].content_rect.y, 0.0);
+        assert_eq!(fragment.children[1].content_rect.x, 100.0);
+        assert_eq!(fragment.children[1].content_rect.y, 0.0);
+    }
+
+    #[test]
+    fn direction_rtl_mirrors_inline_content_within_the_line() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let p = el(&mut doc, root, "p", &[]);
+        doc.append(p, NodeData::Text("hi".into()));
+        let mut styles = StyleMap::new();
+        set_style(
+            &mut styles,
+            p,
+            &[("display", "block"), ("direction", "rtl")],
+        );
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 100.0);
+        // "hi" is 2 chars -> 16px wide at the 16px default font size;
+        // LTR would place it at x=0, RTL mirrors it flush against the
+        // right edge: 100 - 16 = 84.
+        let word = &fragment.children[0].children[0];
+        assert_eq!(word.content_rect.x, 84.0);
+    }
+
+    #[test]
+    fn logical_margin_maps_to_the_correct_physical_side_per_direction() {
+        let mut ltr_doc = Document::new();
+        let ltr_root = ltr_doc.root();
+        let ltr = el(&mut ltr_doc, ltr_root, "div", &[]);
+        let mut ltr_styles = StyleMap::new();
+        set_style(
+            &mut ltr_styles,
+            ltr,
+            &[("display", "block"), ("margin-inline-start", "10px")],
+        );
+        let ltr_tree = build_box_tree(&ltr_doc, &ltr_styles).unwrap();
+        let ltr_fragment = layout(&ltr_tree, &ltr_styles, 200.0);
+        // LTR: inline-start maps to the physical left edge.
+        assert_eq!(ltr_fragment.margin.left, 10.0);
+        assert_eq!(ltr_fragment.margin.right, 0.0);
+
+        let mut rtl_doc = Document::new();
+        let rtl_root = rtl_doc.root();
+        let rtl = el(&mut rtl_doc, rtl_root, "div", &[]);
+        let mut rtl_styles = StyleMap::new();
+        set_style(
+            &mut rtl_styles,
+            rtl,
+            &[
+                ("display", "block"),
+                ("direction", "rtl"),
+                ("margin-inline-start", "10px"),
+            ],
+        );
+        let rtl_tree = build_box_tree(&rtl_doc, &rtl_styles).unwrap();
+        let rtl_fragment = layout(&rtl_tree, &rtl_styles, 200.0);
+        // RTL: inline-start maps to the physical right edge instead.
+        assert_eq!(rtl_fragment.margin.right, 10.0);
+        assert_eq!(rtl_fragment.margin.left, 0.0);
     }
 }

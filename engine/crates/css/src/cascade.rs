@@ -307,6 +307,29 @@ const PROPERTY_TABLE: &[(&str, bool, &str)] = &[
     ("right", false, "auto"),
     ("bottom", false, "auto"),
     ("left", false, "auto"),
+    // B7: Fragmentation (multi-column; all non-inherited, per spec).
+    ("column-count", false, "auto"),
+    ("column-width", false, "auto"),
+    ("column-gap", false, "normal"),
+    ("break-before", false, "auto"),
+    ("break-after", false, "auto"),
+    ("break-inside", false, "auto"),
+    // B8: writing modes & internationalized layout. `direction` is
+    // inherited per spec; `writing-mode` is recognized but only
+    // `horizontal-tb` is honored by layout (see `layout::flow`'s module
+    // docs) -- inherited per spec regardless, so a stylesheet that sets
+    // it is at least tracked correctly even though nothing consumes
+    // anything but the initial value yet.
+    ("direction", true, "ltr"),
+    ("writing-mode", true, "horizontal-tb"),
+    ("margin-inline-start", false, "0"),
+    ("margin-inline-end", false, "0"),
+    ("margin-block-start", false, "0"),
+    ("margin-block-end", false, "0"),
+    ("padding-inline-start", false, "0"),
+    ("padding-inline-end", false, "0"),
+    ("padding-block-start", false, "0"),
+    ("padding-block-end", false, "0"),
     // A8: a handful of SVG presentation properties (inherited per
     // <https://www.w3.org/TR/SVG2/propidx.html>, unlike most CSS box
     // properties) -- enough for these to cascade/inherit correctly onto

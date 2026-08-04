@@ -152,6 +152,8 @@ const HTML_SEEDS: &[&str] = &[
     // B5/B6: a grid with explicit + auto-placed items, plus relative and
     // absolute positioning.
     "<div style=\"display:grid;grid-template-columns:1fr 2fr\"><div style=\"grid-column:2\">a</div><div>b</div><div style=\"position:relative;top:5px\">c</div><div style=\"position:absolute;left:10px\">d</div></div>",
+    // B7/B8: multi-column with a forced break, plus RTL/logical properties.
+    "<div style=\"column-count:3;direction:rtl\"><p style=\"margin-inline-start:5px\">one</p><p style=\"break-before:always\">two</p><p>three four five</p></div>",
 ];
 
 const CSS_SEEDS: &[&str] = &[
@@ -166,6 +168,9 @@ const CSS_SEEDS: &[&str] = &[
     "table { display: table; } tr { display: table-row; } td { display: table-cell; width: 40px; } .f { display: flex; flex-wrap: wrap; flex-grow: 1; flex-shrink: 2; flex-basis: 10%; justify-content: space-between; align-items: center; }",
     // B5/B6: grid template/placement and positioning longhands.
     ".g { display: grid; grid-template-columns: 50px 1fr auto; grid-template-rows: 30px; } .item { grid-column: span 2; } .p { position: absolute; top: 10%; left: 5px; right: 0; bottom: 0; }",
+    // B7/B8: multi-column, break properties, direction, and logical
+    // margin/padding longhands.
+    ".m { column-count: 3; column-width: 50px; column-gap: 10px; } .b { break-before: always; break-after: avoid; break-inside: avoid; } .d { direction: rtl; writing-mode: vertical-rl; margin-inline-start: 4px; margin-block-end: 2px; padding-inline-end: 1px; }",
 ];
 
 const SELECTOR_SEEDS: &[&str] = &[
