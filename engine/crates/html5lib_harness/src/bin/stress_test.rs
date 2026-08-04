@@ -598,8 +598,9 @@ fn main() {
         let ltr = rng.next_range(2) == 0;
         text_report.try_input(s.clone(), |s| {
             let run = text::shape(&font, s, font_size);
+            let scale = font_size / font.units_per_em() as f64;
             for glyph in &run.glyphs {
-                let _ = text::glyph_outline(&font, glyph.glyph_id);
+                let _ = text::glyph_outline(&font, glyph.glyph_id, scale);
             }
             let _ = text::shape_with_direction(&font, s, font_size, ltr);
         });

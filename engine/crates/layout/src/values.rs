@@ -117,22 +117,34 @@ pub fn resolve_font_size_px(value: &str, parent_font_size_px: f64, root_font_siz
 /// B10: real text measurement, replacing the earlier landing's flat
 /// per-character-table approximation with genuine shaping (`text::shape`)
 /// against this engine's one embedded font (DejaVu Sans -- see
-/// `crates/text`'s own module docs and `assets/fonts/README.md`). The
-/// font is parsed once and cached for the process's lifetime, since
-/// shaping is real, non-trivial work that every inline layout pass calls
-/// repeatedly.
-fn font() -> &'static text::Font {
-    static FONT: std::sync::OnceLock<text::Font> = std::sync::OnceLock::new();
-    FONT.get_or_init(text::Font::dejavu_sans)
-}
-
+/// `crates/text`'s own module docs and `assets/fonts/README.md`), via
+/// `text::default_font()` -- the one process-lifetime-cached parse of it,
+/// shared with `paint::raster` rather than each crate parsing its own
+/// copy.
+///
 /// The real shaped width of `text` at `font_size_px`, via `text::shape` --
 /// genuine kerning/ligature-aware advances from the embedded font's own
 /// GSUB/GPOS tables, not a per-character ratio approximation. See
 /// `crates/text`'s own module docs for exactly what's still a documented
-/// gap (one embedded font, no fallback, no hinting).
+/// gap (one embedded font, no fallback, no hinting). Guesses `text`'s own
+/// direction from its content; a caller that already knows the real
+/// resolved bidi direction for this text (e.g. `layout::flow`'s own UAX
+/// #9 pass) should prefer [`text_width_px_directional`] instead, for the
+/// same reason `text::shape_with_direction`'s own doc comment gives.
 pub fn text_width_px(text: &str, font_size_px: f64) -> f64 {
-    text::shape(font(), text, font_size_px).width_px
+    text::shape(text::default_font(), text, font_size_px).width_px
+}
+
+/// Like [`text_width_px`], but shapes with an explicit direction instead
+/// of guessing one from `text`'s own content -- what `layout::flow`
+/// calls for every word, now that its real UAX #9 pass has already
+/// resolved each word's actual embedding level. Guessing per-word instead
+/// (what this crate did before this fix) can disagree with that resolved
+/// level for direction-neutral text (digits, punctuation) embedded in an
+/// RTL run, since such a substring has no strong-direction character of
+/// its own to key a guess off of.
+pub fn text_width_px_directional(text: &str, font_size_px: f64, ltr: bool) -> f64 {
+    text::shape_with_direction(text::default_font(), text, font_size_px, ltr).width_px
 }
 
 #[cfg(test)]

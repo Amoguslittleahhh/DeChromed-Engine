@@ -34,6 +34,14 @@ pub enum DisplayItem {
         rect: Rect,
         text: String,
         color: Color,
+        /// The font size to shape/rasterize `text` at, in CSS pixels --
+        /// an explicit field rather than an implicit "the rasterizer
+        /// infers it from `rect.height`" convention, so a future
+        /// `DrawText` producer (e.g. a `<canvas>` text API) can't
+        /// silently mis-size text by setting `rect.height` to something
+        /// other than the font size (a line-box height, say) with no
+        /// compiler signal that the old convention was broken.
+        font_size_px: f64,
     },
 }
 
@@ -66,6 +74,14 @@ fn build(
                 rect: fragment.content_rect,
                 text: text.clone(),
                 color,
+                // `layout::flow` sets a word fragment's `content_rect.
+                // height` to exactly its own resolved font size (see
+                // `Fragment`'s construction in `layout_inline_children`)
+                // -- reading it here, once, at the one place that
+                // convention is actually established, keeps the
+                // assumption in one visible spot instead of the
+                // rasterizer re-deriving it implicitly a crate away.
+                font_size_px: fragment.content_rect.height,
             });
         }
         return;

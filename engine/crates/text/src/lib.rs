@@ -68,6 +68,17 @@ impl Font {
     }
 }
 
+/// A process-lifetime-cached [`Font::dejavu_sans`] -- shaping/outline
+/// extraction against the embedded font is real, non-trivial work
+/// (parsing the whole TTF table set), and both `layout` (measurement)
+/// and `paint` (rendering) need it, so this is the one place that parsing
+/// happens rather than each consumer crate hand-rolling its own
+/// `OnceLock` around a second call to [`Font::dejavu_sans`].
+pub fn default_font() -> &'static Font {
+    static FONT: std::sync::OnceLock<Font> = std::sync::OnceLock::new();
+    FONT.get_or_init(Font::dejavu_sans)
+}
+
 /// One shaped glyph: which glyph (not which character -- shaping can
 /// merge/reorder/substitute characters into glyphs, e.g. ligatures), and
 /// its real advance/offset in CSS pixels at the font size shaping was
@@ -156,8 +167,21 @@ pub struct GlyphOutline {
 /// Real outline extraction (via `ttf-parser`) for `glyph_id` in `font`,
 /// flattening any curves along the way. `None` if the font has no outline
 /// for this glyph (e.g. `.notdef`, or a genuinely empty glyph like space).
-pub fn glyph_outline(font: &Font, glyph_id: u16) -> Option<GlyphOutline> {
-    let mut collector = OutlineCollector::default();
+///
+/// `scale` is the same `font_size_px / font.units_per_em()` factor a
+/// caller is about to apply to these (still font-unit) coordinates when
+/// actually rendering them -- it's used only to pick how finely each
+/// curve gets flattened (see [`segments_for`]), so a tiny glyph doesn't
+/// pay for detail no pixel will ever show, and a huge one doesn't come
+/// out visibly faceted. Pass `1.0` if the eventual render scale isn't
+/// known yet; that reproduces this function's original fixed-8-segment
+/// behavior at ordinary body-text scales (font-unit deviation happens to
+/// land in the same range `segments_for` would pick for a ~16px glyph).
+pub fn glyph_outline(font: &Font, glyph_id: u16, scale: f64) -> Option<GlyphOutline> {
+    let mut collector = OutlineCollector {
+        scale,
+        ..OutlineCollector::default()
+    };
     font.face
         .outline_glyph(ttf_parser::GlyphId(glyph_id), &mut collector)?;
     collector.finish();
@@ -166,11 +190,26 @@ pub fn glyph_outline(font: &Font, glyph_id: u16) -> Option<GlyphOutline> {
     })
 }
 
-/// How many straight segments a flattened quadratic/cubic curve gets --
-/// coarse enough to be cheap, fine enough that DejaVu Sans's rounded
-/// letterforms (e.g. `o`, `e`) don't look visibly faceted at ordinary
-/// body text sizes.
-const CURVE_SEGMENTS: usize = 8;
+/// No single flattened curve segment should span more than this many
+/// *device* pixels (post-scale) -- the real tolerance a scale-aware
+/// flattener should target, replacing a single fixed subdivision count
+/// that was either too coarse (visibly faceted rounded letterforms like
+/// `o`/`e` at large sizes) or wastefully fine (tiny glyphs subdividing
+/// curves no pixel could ever resolve) at every size but one.
+const MAX_PX_PER_CURVE_SEGMENT: f64 = 3.0;
+/// Clamped so a degenerate (near-zero-length or absurdly long) curve still
+/// gets a sane, bounded amount of work.
+const MIN_CURVE_SEGMENTS: usize = 2;
+const MAX_CURVE_SEGMENTS: usize = 32;
+
+/// Picks a curve's subdivision count from its rough on-screen (device
+/// pixel) chord length at `scale`, instead of one constant used at every
+/// font size.
+fn segments_for(p0: (f64, f64), p_end: (f64, f64), scale: f64) -> usize {
+    let device_px_length = ((p_end.0 - p0.0).hypot(p_end.1 - p0.1) * scale).abs();
+    let segments = (device_px_length / MAX_PX_PER_CURVE_SEGMENT).ceil() as usize;
+    segments.clamp(MIN_CURVE_SEGMENTS, MAX_CURVE_SEGMENTS)
+}
 
 #[derive(Default)]
 struct OutlineCollector {
@@ -178,6 +217,7 @@ struct OutlineCollector {
     current: Vec<(f64, f64)>,
     start: (f64, f64),
     last: (f64, f64),
+    scale: f64,
 }
 
 impl OutlineCollector {
@@ -207,8 +247,9 @@ impl OutlineBuilder for OutlineCollector {
         let p0 = self.last;
         let p1 = (x1 as f64, y1 as f64);
         let p2 = (x as f64, y as f64);
-        for i in 1..=CURVE_SEGMENTS {
-            let t = i as f64 / CURVE_SEGMENTS as f64;
+        let segments = segments_for(p0, p2, self.scale);
+        for i in 1..=segments {
+            let t = i as f64 / segments as f64;
             let mt = 1.0 - t;
             let px = mt * mt * p0.0 + 2.0 * mt * t * p1.0 + t * t * p2.0;
             let py = mt * mt * p0.1 + 2.0 * mt * t * p1.1 + t * t * p2.1;
@@ -222,8 +263,9 @@ impl OutlineBuilder for OutlineCollector {
         let p1 = (x1 as f64, y1 as f64);
         let p2 = (x2 as f64, y2 as f64);
         let p3 = (x as f64, y as f64);
-        for i in 1..=CURVE_SEGMENTS {
-            let t = i as f64 / CURVE_SEGMENTS as f64;
+        let segments = segments_for(p0, p3, self.scale);
+        for i in 1..=segments {
+            let t = i as f64 / segments as f64;
             let mt = 1.0 - t;
             let px = mt * mt * mt * p0.0
                 + 3.0 * mt * mt * t * p1.0
@@ -301,7 +343,8 @@ mod tests {
     fn a_visible_glyph_has_a_nonempty_outline() {
         let font = Font::dejavu_sans();
         let run = shape(&font, "o", 16.0);
-        let outline = glyph_outline(&font, run.glyphs[0].glyph_id).expect("'o' has an outline");
+        let outline =
+            glyph_outline(&font, run.glyphs[0].glyph_id, 1.0).expect("'o' has an outline");
         assert!(!outline.contours.is_empty());
         // "o" is a real letterform with a hole -- two contours (outer +
         // inner), same nonzero-winding-hole story as canvas2d's own donut
@@ -310,10 +353,30 @@ mod tests {
     }
 
     #[test]
+    fn curve_flattening_gets_finer_at_a_larger_render_scale() {
+        // A real scale-aware flattener should subdivide a curve more at a
+        // larger scale (more device pixels for the same font-unit curve
+        // to potentially look faceted over) and less at a tiny one --
+        // not the same fixed segment count regardless of how big the
+        // glyph will actually be rendered.
+        let font = Font::dejavu_sans();
+        let run = shape(&font, "o", 16.0);
+        let glyph_id = run.glyphs[0].glyph_id;
+        let tiny = glyph_outline(&font, glyph_id, 0.01).unwrap();
+        let huge = glyph_outline(&font, glyph_id, 50.0).unwrap();
+        let tiny_points: usize = tiny.contours.iter().map(|c| c.len()).sum();
+        let huge_points: usize = huge.contours.iter().map(|c| c.len()).sum();
+        assert!(
+            huge_points > tiny_points,
+            "expected more flattened points at a larger scale: tiny={tiny_points} huge={huge_points}"
+        );
+    }
+
+    #[test]
     fn a_space_glyph_has_no_outline() {
         let font = Font::dejavu_sans();
         let run = shape(&font, " ", 16.0);
-        let outline = glyph_outline(&font, run.glyphs[0].glyph_id);
+        let outline = glyph_outline(&font, run.glyphs[0].glyph_id, 1.0);
         assert!(outline.is_none_or(|o| o.contours.is_empty()));
     }
 
@@ -323,7 +386,7 @@ mod tests {
         for c in (0x20u8..0x7f).map(char::from) {
             let run = shape(&font, &c.to_string(), 16.0);
             for glyph in &run.glyphs {
-                let _ = glyph_outline(&font, glyph.glyph_id);
+                let _ = glyph_outline(&font, glyph.glyph_id, 1.0);
             }
         }
     }

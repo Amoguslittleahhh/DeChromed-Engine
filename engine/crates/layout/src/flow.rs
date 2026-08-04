@@ -1826,12 +1826,18 @@ fn line_break_segments(text: &str) -> Vec<(String, bool)> {
     out
 }
 
-/// B10: real shaped text width (`crate::values::text_width_px`, backed by
-/// `text::shape` against the embedded DejaVu Sans font) -- see
-/// `crates/text`'s own module docs for exactly what's still a documented
-/// gap (one embedded font, no fallback/hinting).
-fn word_width(text: &str, font_size_px: f64) -> f64 {
-    values::text_width_px(text, font_size_px)
+/// B10: real shaped text width (`crate::values::text_width_px_directional`,
+/// backed by `text::shape_with_direction` against the embedded DejaVu Sans
+/// font) -- see `crates/text`'s own module docs for exactly what's still
+/// a documented gap (one embedded font, no fallback/hinting). Takes `ltr`
+/// from the item's own real resolved UAX #9 embedding level (B8) rather
+/// than guessing direction from the word's own text, so a direction-
+/// neutral segment (digits, punctuation) embedded in an RTL run shapes
+/// with the level the surrounding bidi analysis actually resolved, not
+/// whatever `text::shape`'s own per-word guess would produce for it in
+/// isolation.
+fn word_width(text: &str, font_size_px: f64, ltr: bool) -> f64 {
+    values::text_width_px_directional(text, font_size_px, ltr)
 }
 
 fn space_width(font_size_px: f64) -> f64 {
@@ -1908,7 +1914,13 @@ fn layout_inline_children(
     let bidi = ParagraphBidiInfo::new(&synthetic, Some(base_level));
     let item_levels: Vec<BidiLevel> = item_byte_starts.iter().map(|&i| bidi.levels[i]).collect();
 
-    let mut lines: Vec<Vec<(Fragment, f64, BidiLevel)>> = vec![Vec::new()];
+    // Each line item's own `glued` flag (see `InlineItem::Word`'s doc
+    // comment) rides along in this tuple all the way to the visual-reorder
+    // pass below, so that pass can suppress the inter-item space for a
+    // pair that should render with none -- not just the initial packing
+    // pass, which is the only place an earlier version of this function
+    // consulted the flag.
+    let mut lines: Vec<Vec<(Fragment, f64, BidiLevel, bool)>> = vec![Vec::new()];
     let mut line_widths: Vec<f64> = vec![0.0];
     let mut line_max_font: Vec<f64> = vec![font_size_px];
     let default_line_height = line_height_px(None, font_size_px, root_font_size_px);
@@ -1924,7 +1936,7 @@ fn layout_inline_children(
                 font_size_px,
                 glued_to_previous,
             } => {
-                let w = word_width(&text, font_size_px);
+                let w = word_width(&text, font_size_px, !level.is_rtl());
                 let style = style_node.and_then(|n| styles.get(&n));
                 let lh = line_height_px(style, font_size_px, root_font_size_px);
                 (
@@ -1981,14 +1993,14 @@ fn layout_inline_children(
             line_widths[current] = width;
             line_max_font[current] = line_max_font[current].max(item_font_size);
             line_max_height[current] = line_max_height[current].max(item_line_height);
-            lines[current].push((fragment, item_font_size, level));
+            lines[current].push((fragment, item_font_size, level, glued));
         } else {
             let x = line_widths[current] + extra;
             reposition(&mut fragment, x, 0.0);
             line_widths[current] = x + width;
             line_max_font[current] = line_max_font[current].max(item_font_size);
             line_max_height[current] = line_max_height[current].max(item_line_height);
-            lines[current].push((fragment, item_font_size, level));
+            lines[current].push((fragment, item_font_size, level, glued));
         }
     }
 
@@ -2009,14 +2021,32 @@ fn layout_inline_children(
         // "fully reversed" (what the old whole-line mirror always did),
         // but for real mixed-direction content reorders only the runs
         // that need it, correctly nested.
-        let levels: Vec<BidiLevel> = line.iter().map(|(_, _, level)| *level).collect();
+        let levels: Vec<BidiLevel> = line.iter().map(|(_, _, level, _)| *level).collect();
         let order = ParagraphBidiInfo::reorder_visual(&levels);
         let mut cursor_x = 0.0;
         for (visual_i, &orig_idx) in order.iter().enumerate() {
-            let (fragment, item_font_size, _level) = &mut line[orig_idx];
-            if visual_i > 0 {
-                cursor_x += space_width(*item_font_size);
+            // A UAX #14 "glued" item (see `InlineItem::Word`'s doc
+            // comment, e.g. the `"quality"` half of a hyphen-split
+            // `"high-quality"`) still shouldn't get a space inserted
+            // before it here -- but only if reordering left it exactly
+            // where packing put it, immediately after its own logical
+            // predecessor (`orig_idx - 1`) in *this* visual slot too.
+            // Bidi reordering groups same-level runs together, so a
+            // glued pair (always the same script/direction, with no
+            // separating neutral character) stays adjacent in the
+            // overwhelming common case; falling back to inserting a
+            // space in the rare case reordering does separate them is
+            // the safe direction to be wrong in (a stray space beats
+            // silently merging two now-unrelated-looking items).
+            let glued_here = line[orig_idx].3
+                && visual_i > 0
+                && orig_idx > 0
+                && order[visual_i - 1] == orig_idx - 1;
+            let item_font_size = line[orig_idx].1;
+            if visual_i > 0 && !glued_here {
+                cursor_x += space_width(item_font_size);
             }
+            let fragment = &mut line[orig_idx].0;
             let dx = cursor_x - fragment.content_rect.x;
             shift(fragment, dx, cursor_y);
             cursor_x += fragment.content_rect.width;
@@ -2031,7 +2061,7 @@ fn layout_inline_children(
         // space when `direction: rtl` is in effect.
         if direction_rtl {
             let align_shift = containing_width - cursor_x;
-            for (fragment, _, _) in &mut line {
+            for (fragment, _, _, _) in &mut line {
                 shift(fragment, align_shift, 0.0);
             }
         }
@@ -2048,7 +2078,7 @@ fn layout_inline_children(
             margin: EdgeSizes::default(),
             border: EdgeSizes::default(),
             padding: EdgeSizes::default(),
-            children: line.into_iter().map(|(f, _, _)| f).collect(),
+            children: line.into_iter().map(|(f, _, _, _)| f).collect(),
             text: None,
         });
     }
@@ -2995,6 +3025,35 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].children[0].text.as_deref(), Some("high-"));
         assert_eq!(lines[1].children[0].text.as_deref(), Some("quality"));
+    }
+
+    #[test]
+    fn a_glued_hyphenated_split_that_fits_on_one_line_renders_with_no_gap() {
+        // The companion case to the wrap test above: when both UAX #14
+        // segments of a hyphenated word fit on the *same* line, they must
+        // render flush against each other with zero gap -- the bidi
+        // visual-reorder pass runs for every line (not just wrapped ones)
+        // and must not reinsert a space between a glued pair it didn't
+        // itself separate onto different lines.
+        let mut doc = Document::new();
+        let root = doc.root();
+        let p = el(&mut doc, root, "p", &[]);
+        doc.append(p, NodeData::Text("high-quality".into()));
+        let mut styles = StyleMap::new();
+        set_style(&mut styles, p, &[("display", "block")]);
+        let tree = build_box_tree(&doc, &styles).unwrap();
+        let fragment = layout(&tree, &styles, 800.0);
+        let lines = &fragment.children;
+        assert_eq!(lines.len(), 1);
+        let words = &lines[0].children;
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].text.as_deref(), Some("high-"));
+        assert_eq!(words[1].text.as_deref(), Some("quality"));
+        assert_eq!(
+            words[1].content_rect.x,
+            words[0].content_rect.x + words[0].content_rect.width,
+            "glued segments must be flush against each other, no inter-item space"
+        );
     }
 
     #[test]

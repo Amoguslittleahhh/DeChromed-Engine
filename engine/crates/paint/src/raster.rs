@@ -7,15 +7,16 @@
 //!
 //! **What it draws:** `DisplayItem::FillRect` (solid rectangles) and, now,
 //! `DisplayItem::DrawText` too -- real glyph rasterization, not a
-//! placeholder: each `DrawText` item is shaped by `text::shape` (real
-//! HarfBuzz-equivalent shaping) at `rect.height` as the font size (the
-//! same convention `layout::flow` uses when it sets a word fragment's
-//! `content_rect.height` to its own font size), then every shaped glyph's
-//! real outline (`text::glyph_outline`, from `ttf-parser`) is filled with
-//! the exact same nonzero-winding scanline fill `canvas2d::fill` already
-//! implements for arbitrary paths -- text painting is not a separate,
-//! special-cased renderer, it's this rasterizer's own real path-fill
-//! algorithm applied to real glyph shapes.
+//! placeholder: each `DrawText` item carries its own explicit
+//! `font_size_px` (set by `paint::display_list`, the one place the
+//! "a word fragment's box height is its font size" convention is actually
+//! established) and is shaped by `text::shape` (real HarfBuzz-equivalent
+//! shaping) at that size, then every shaped glyph's real outline
+//! (`text::glyph_outline`, from `ttf-parser`) is filled with the exact
+//! same nonzero-winding scanline fill `canvas2d::fill` already implements
+//! for arbitrary paths -- text painting is not a separate, special-cased
+//! renderer, it's this rasterizer's own real path-fill algorithm applied
+//! to real glyph shapes.
 //!
 //! **Known gaps:** no anti-aliasing anywhere (both rectangle edges and
 //! glyph edges are hard pixel boundaries); no clipping (nothing
@@ -23,18 +24,21 @@
 //! as the baseline" half of B11's own entry -- a GPU path was evaluated
 //! and is deferred, see `ROADMAP.md`'s B11 entry for why); text painting
 //! inherits `crates/text`'s own scoping limits (one embedded font, no
-//! fallback, no hinting -- see that crate's module docs).
+//! fallback, no hinting -- see that crate's module docs). `draw_text`
+//! also doesn't yet have access to each glyph run's real resolved UAX #9
+//! embedding level (unlike `layout::values::text_width_px_directional`,
+//! which does) -- `Fragment` doesn't carry that per-text-fragment
+//! direction through from `layout::flow` yet, so shaping here still
+//! falls back to `text::shape`'s own per-run guess. This narrows, rather
+//! than closes, what was originally a measurement-*and*-painting gap:
+//! layout measurement is now correct for direction-neutral text embedded
+//! in an RTL run; painted glyph order for that same narrow case can still
+//! disagree with it.
 
 use crate::canvas2d::{self, Path2D};
 use crate::color::Color;
 use crate::display_list::{DisplayItem, DisplayList};
 use layout::Rect;
-use std::sync::OnceLock;
-
-fn font() -> &'static text::Font {
-    static FONT: OnceLock<text::Font> = OnceLock::new();
-    FONT.get_or_init(text::Font::dejavu_sans)
-}
 
 /// An RGBA8 pixel buffer, row-major, 4 bytes per pixel.
 #[derive(Debug, Clone)]
@@ -183,9 +187,12 @@ pub fn rasterize(list: &DisplayList, width: usize, height: usize) -> Canvas {
     for item in &list.items {
         match item {
             DisplayItem::FillRect { rect, color } => fill_rect(&mut canvas, rect, *color),
-            DisplayItem::DrawText { rect, text, color } => {
-                draw_text(&mut canvas, rect, text, *color)
-            }
+            DisplayItem::DrawText {
+                rect,
+                text,
+                color,
+                font_size_px,
+            } => draw_text(&mut canvas, rect, text, *color, *font_size_px),
         }
     }
     canvas
@@ -193,18 +200,17 @@ pub fn rasterize(list: &DisplayList, width: usize, height: usize) -> Canvas {
 
 /// Real glyph rasterization for one `DrawText` item -- see module docs
 /// for the shaping/outline/fill pipeline this drives.
-fn draw_text(canvas: &mut Canvas, rect: &Rect, text: &str, color: Color) {
-    let font_size_px = rect.height;
+fn draw_text(canvas: &mut Canvas, rect: &Rect, text: &str, color: Color, font_size_px: f64) {
     if font_size_px <= 0.0 || text.is_empty() {
         return;
     }
-    let font = font();
+    let font = text::default_font();
     let shaped = text::shape(font, text, font_size_px);
     let scale = font_size_px / font.units_per_em() as f64;
     let baseline_y = rect.y + font.ascender() as f64 * scale;
     let mut pen_x = rect.x;
     for glyph in &shaped.glyphs {
-        if let Some(outline) = text::glyph_outline(font, glyph.glyph_id) {
+        if let Some(outline) = text::glyph_outline(font, glyph.glyph_id, scale) {
             let mut path = Path2D::new();
             for contour in &outline.contours {
                 let mut points = contour.iter();
@@ -325,6 +331,7 @@ mod tests {
                 },
                 text: "M".to_string(),
                 color: Color::rgb(0, 0, 0),
+                font_size_px: 20.0,
             }],
         };
         let canvas = rasterize(&list, 30, 30);
@@ -353,6 +360,7 @@ mod tests {
                 },
                 text: String::new(),
                 color: Color::rgb(0, 0, 0),
+                font_size_px: 5.0,
             }],
         };
         let canvas = rasterize(&list, 10, 10);
@@ -371,6 +379,7 @@ mod tests {
                 },
                 text: "hello".to_string(),
                 color: Color::rgb(0, 0, 0),
+                font_size_px: 16.0,
             }],
         };
         let canvas = rasterize(&list, 10, 10);
@@ -378,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_text_with_zero_height_rect_does_not_panic() {
+    fn draw_text_with_zero_font_size_does_not_panic() {
         let list = DisplayList {
             items: vec![DisplayItem::DrawText {
                 rect: Rect {
@@ -389,6 +398,7 @@ mod tests {
                 },
                 text: "hello".to_string(),
                 color: Color::rgb(0, 0, 0),
+                font_size_px: 0.0,
             }],
         };
         let canvas = rasterize(&list, 10, 10);
