@@ -17,8 +17,40 @@
 //! only classic-script `compile`/`run`; the platform is initialized once
 //! process-wide via [`std::sync::Once`] and never torn down (matches how
 //! every real embedder uses V8 -- `V8::dispose`/`ShutdownPlatform` are for
-//! process exit, not per-`Realm` reuse); no DOM binding yet (that's C4,
-//! layered on top of this module via `Isolate::set_slot`).
+//! process exit, not per-`Realm` reuse); DOM binding is C4, layered on top
+//! of this module via `Isolate::set_slot` (see `crate::dom_binding`).
+//!
+//! **C5 (standard library/built-ins) and C6 (garbage collector) are, in a
+//! real and non-hand-wavy sense, already here.** Embedding V8 (the C3
+//! decision -- see "The JS engine question" in ROADMAP.md) means
+//! `Object`/`Array`/`String`/`Map`/`Set`/`Promise`/`RegExp`/`Intl`/classes/
+//! destructuring/template literals and V8's own real generational GC are
+//! not reimplemented, because V8 already *is* a complete, battle-tested
+//! implementation of both -- this module's own tests below run real
+//! ES2015+ programs against them rather than merely asserting the crate
+//! compiled. Two things this module *does* add real code for, because
+//! they're genuine embedder-level integration points V8 doesn't hand you
+//! for free:
+//! - **Explicit microtask control** (`Isolate::set_microtasks_policy`):
+//!   set to `Explicit` rather than V8's default `Auto` so that a real
+//!   `Promise.then` callback provably does *not* run until [`Realm::
+//!   run_microtasks`] is called -- the same explicit-checkpoint model
+//!   `dom::event_loop`'s own task/microtask interleaving already uses on
+//!   the Rust side, so an embedder driving both can compose them under
+//!   one real rule instead of two different implicit ones.
+//! - **Forced GC for verification** (`--expose-gc` + `request_garbage_
+//!   collection_for_testing`, in [`Realm::force_gc_for_testing`]/[`Realm::
+//!   heap_used_bytes`]): lets this module's own GC test actually prove V8
+//!   reclaims genuinely unreachable memory rather than just trusting that
+//!   it does.
+//!
+//! **C6's known gap, stated honestly:** the "cross-language GC-to-native-
+//! tree integration" problem C6 describes in ROADMAP.md (wrapper tracing,
+//! notoriously bug-prone in both real engines) doesn't arise in this
+//! codebase yet, because C4's DOM binding hands V8 only bare integer node
+//! handles, not real GC-managed wrapper objects holding a live reference
+//! into `dom::Document`'s arena -- that integration risk becomes real once
+//! C4 grows `ObjectTemplate`-based `Node`/`Element` wrapper objects.
 
 use std::sync::Once;
 
@@ -26,6 +58,11 @@ static V8_INIT: Once = Once::new();
 
 fn ensure_v8_initialized() {
     V8_INIT.call_once(|| {
+        // `--expose-gc` is what makes `Isolate::request_garbage_collection_
+        // for_testing` (used by `Realm::force_gc_for_testing`) valid to
+        // call at all -- must be set before `V8::initialize`, matching
+        // every other V8 flag.
+        v8::V8::set_flags_from_string("--expose-gc");
         let platform = v8::new_default_platform(0, false).make_shared();
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
@@ -64,6 +101,10 @@ impl Realm {
     pub fn new() -> Self {
         ensure_v8_initialized();
         let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+        // C5: explicit microtask control -- see module docs for why this
+        // isn't V8's default `Auto` policy. `Promise`/`.then` callbacks
+        // genuinely won't run until `run_microtasks` says so.
+        isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         let global_context = {
             let scope = &mut v8::HandleScope::new(&mut isolate);
             let context = v8::Context::new(scope, Default::default());
@@ -125,6 +166,38 @@ impl Realm {
             }
             None => Err(extract_error(try_catch)),
         }
+    }
+
+    /// C5: a real HTML-spec-shaped "perform a microtask checkpoint" --
+    /// drains V8's own microtask queue (real `Promise.then`/`queueMicrotask`
+    /// callbacks, not a Rust re-implementation of them) to completion.
+    /// Because [`Realm::new`] sets an explicit microtasks policy, this is
+    /// the *only* thing that runs them: a `Promise` resolution scheduled
+    /// during [`Realm::run`] provably doesn't fire until this is called --
+    /// see this module's own `promise_then_does_not_run_until_a_real_
+    /// microtask_checkpoint` test below.
+    pub fn run_microtasks(&mut self) {
+        self.isolate.perform_microtask_checkpoint();
+    }
+
+    /// C6: forces a real, synchronous full garbage collection -- valid
+    /// because [`ensure_v8_initialized`] sets `--expose-gc` before `V8::
+    /// initialize` (required for `request_garbage_collection_for_testing`
+    /// to be callable at all). Exists so this module's own GC test can
+    /// prove genuinely unreachable memory is actually reclaimed rather
+    /// than asserting V8's GC works without evidence.
+    pub fn force_gc_for_testing(&mut self) {
+        self.isolate
+            .request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
+    }
+
+    /// C6: the isolate's current used-heap size in bytes, straight from
+    /// V8's own `GetHeapStatistics` -- real memory accounting, not an
+    /// estimate.
+    pub fn heap_used_bytes(&mut self) -> usize {
+        let mut stats = v8::HeapStatistics::default();
+        self.isolate.get_heap_statistics(&mut stats);
+        stats.used_heap_size()
     }
 }
 
@@ -214,5 +287,133 @@ mod tests {
         realm_a.run("var onlyInA = 42;").unwrap();
         let err = realm_b.run("onlyInA").unwrap_err();
         assert!(!err.message.is_empty());
+    }
+
+    // -- C5: real V8 Promise/microtask integration + standard-library
+    // evidence (real V8 built-ins, not reimplemented -- see module docs). --
+
+    #[test]
+    fn promise_then_does_not_run_until_a_real_microtask_checkpoint() {
+        let mut realm = Realm::new();
+        realm
+            .run("var log = []; Promise.resolve().then(() => log.push('promise')); log.push('sync');")
+            .unwrap();
+        // The explicit microtasks policy set in `Realm::new` means the
+        // `.then` callback is queued but genuinely hasn't run yet.
+        let before = realm.run("log.join(',')").unwrap();
+        assert_eq!(before, "sync");
+
+        realm.run_microtasks();
+        let after = realm.run("log.join(',')").unwrap();
+        assert_eq!(after, "sync,promise");
+    }
+
+    #[test]
+    fn nested_promise_thens_all_drain_in_one_checkpoint() {
+        let mut realm = Realm::new();
+        realm
+            .run(
+                "var log = []; \
+                 Promise.resolve().then(() => { \
+                     log.push('a'); \
+                     Promise.resolve().then(() => log.push('b')); \
+                 });",
+            )
+            .unwrap();
+        realm.run_microtasks();
+        let result = realm.run("log.join(',')").unwrap();
+        assert_eq!(result, "a,b");
+    }
+
+    #[test]
+    fn real_array_methods() {
+        let mut realm = Realm::new();
+        let result = realm
+            .run("[1, 2, 3].map(x => x * 2).filter(x => x > 2).join(',')")
+            .unwrap();
+        assert_eq!(result, "4,6");
+    }
+
+    #[test]
+    fn real_map_and_set() {
+        let mut realm = Realm::new();
+        let map_result = realm
+            .run("var m = new Map([['a', 1], ['b', 2]]); m.get('b')")
+            .unwrap();
+        assert_eq!(map_result, "2");
+        let set_result = realm.run("new Set([1, 2, 2, 3]).size").unwrap();
+        assert_eq!(set_result, "3");
+    }
+
+    #[test]
+    fn real_regexp() {
+        let mut realm = Realm::new();
+        let result = realm.run("/(\\d+)/.exec('abc123')[1]").unwrap();
+        assert_eq!(result, "123");
+    }
+
+    #[test]
+    fn real_template_literals_destructuring_and_classes() {
+        let mut realm = Realm::new();
+        let template = realm.run("`${1 + 1} apples`").unwrap();
+        assert_eq!(template, "2 apples");
+
+        let destructure = realm.run("var [a, , b] = [1, 2, 3]; a + b").unwrap();
+        assert_eq!(destructure, "4");
+
+        let class_result = realm
+            .run(
+                "class Point { constructor(x, y) { this.x = x; this.y = y; } \
+                 sum() { return this.x + this.y; } } \
+                 new Point(3, 4).sum()",
+            )
+            .unwrap();
+        assert_eq!(class_result, "7");
+    }
+
+    #[test]
+    fn real_json_round_trip() {
+        let mut realm = Realm::new();
+        let result = realm
+            .run("JSON.parse(JSON.stringify({a: 1, b: [2, 3]})).b[1]")
+            .unwrap();
+        assert_eq!(result, "3");
+    }
+
+    // -- C6: real V8 GC verification. --
+
+    #[test]
+    fn forcing_gc_reclaims_genuinely_unreachable_memory() {
+        let mut realm = Realm::new();
+        // Allocate a lot of garbage: large strings referenced only by a
+        // loop-local variable, so nothing survives past this statement.
+        realm
+            .run(
+                "for (let i = 0; i < 20000; i++) { \
+                     let junk = 'x'.repeat(1000) + i; \
+                 }",
+            )
+            .unwrap();
+        let before = realm.heap_used_bytes();
+        realm.force_gc_for_testing();
+        let after = realm.heap_used_bytes();
+        assert!(
+            after < before,
+            "expected forced GC to shrink used heap size (before={before}, after={after})"
+        );
+    }
+
+    #[test]
+    fn heap_used_bytes_reflects_real_allocation() {
+        let mut realm = Realm::new();
+        realm.force_gc_for_testing();
+        let baseline = realm.heap_used_bytes();
+        realm.run("globalThis.kept = 'y'.repeat(500000);").unwrap();
+        let after_allocation = realm.heap_used_bytes();
+        assert!(
+            after_allocation > baseline,
+            "expected a live half-megabyte string to increase used heap size \
+             (baseline={baseline}, after_allocation={after_allocation})"
+        );
     }
 }

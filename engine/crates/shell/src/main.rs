@@ -11,7 +11,9 @@
 //! task/microtask event-loop interleaving (`dom::event_loop`), and
 //! C3/C4's real embedded V8 (`js_bindings::Realm`) running JS that
 //! mutates a real `dom::Document` through `js_bindings::dom_binding`,
-//! are demonstrated further down.
+//! and C5/C6's real V8 standard-library built-ins (Promise/Array/Set/
+//! template literals) under explicit microtask control plus a forced,
+//! verified garbage collection, are demonstrated further down.
 //! B1-B9 (box tree through
 //! fragment-tree queries + display list) are real now too, run below
 //! against a fixed 800px containing-block width (there's no window/
@@ -293,6 +295,40 @@ fn main() {
         Ok(_) => unreachable!("referencing an undefined variable should throw"),
         Err(err) => println!("V8 real exception capture: {err}"),
     }
+
+    // C5: real V8 standard-library built-ins (Promise, Array, classes,
+    // ...) and explicit microtask control -- a real `Promise.then`
+    // callback provably doesn't run until `run_microtasks()` says so,
+    // matching `dom::event_loop`'s own explicit-checkpoint model above.
+    realm
+        .run("globalThis.promiseLog = []; Promise.resolve().then(() => promiseLog.push('then')); promiseLog.push('sync');")
+        .expect("valid JS");
+    println!(
+        "V8 Promise.then before a microtask checkpoint: {}",
+        realm.run("promiseLog.join(',')").expect("valid JS")
+    );
+    realm.run_microtasks();
+    println!(
+        "V8 Promise.then after run_microtasks(): {}",
+        realm.run("promiseLog.join(',')").expect("valid JS")
+    );
+    let stdlib = realm
+        .run("[1, 2, 3].map(x => x * 2).join(',') + ' / ' + new Set([1, 1, 2]).size + ' / ' + `${1 + 1} apples`")
+        .expect("valid JS");
+    println!("V8 real Array/Set/template-literal built-ins: {stdlib}");
+
+    // C6: V8's own real generational GC -- force a full collection and
+    // show the isolate's used-heap size actually shrinks, not asserted
+    // blindly.
+    realm
+        .run("for (let i = 0; i < 20000; i++) { let junk = 'x'.repeat(1000) + i; }")
+        .expect("valid JS");
+    let heap_before_gc = realm.heap_used_bytes();
+    realm.force_gc_for_testing();
+    let heap_after_gc = realm.heap_used_bytes();
+    println!(
+        "V8 real GC: used heap {heap_before_gc} bytes before force_gc_for_testing() -> {heap_after_gc} bytes after"
+    );
 
     println!(
         "(remaining Track B gaps -- vertical writing modes, GPU compositing/rasterization, \

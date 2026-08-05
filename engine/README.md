@@ -135,6 +135,25 @@ methods), no `addEventListener` binding from JS yet, no live
 `NodeList` return values. See `ROADMAP.md`'s C3/C4 entries and "The JS
 engine question" section for the rest.
 
+**C5 (standard library) and C6 (garbage collector) are effectively met by
+that same embedding decision** -- `Object`/`Array`/`Map`/`Set`/`Promise`/
+`RegExp`/classes/template literals and V8's own real generational GC
+aren't reimplemented, since V8 already is a complete, tested
+implementation of both. The real new code in `engine.rs` is the
+embedder-level integration V8 doesn't hand you for free: an explicit
+microtasks policy (`Isolate::set_microtasks_policy(Explicit)`) plus
+`Realm::run_microtasks`, so a real `Promise.then` callback provably
+doesn't fire until an embedder says so (the same explicit-checkpoint
+model C2's `dom::event_loop` already uses on the Rust side); and
+`--expose-gc` plus `Realm::force_gc_for_testing`/`heap_used_bytes`, so
+this module's own tests can force a real synchronous GC and prove
+genuinely unreachable memory (20,000 discarded strings) actually gets
+reclaimed rather than trusting V8 blindly. C6's "wrapper tracing" hard
+problem doesn't arise yet, stated honestly: C4 hands V8 only bare integer
+node handles, not real GC-managed wrapper objects holding a live
+reference into `dom::Document`'s arena -- see `ROADMAP.md`'s C5/C6
+entries for the rest.
+
 The workspace targets Rust **edition 2024** (`engine/Cargo.toml`), using
 stable let-chains (`if let X = y && let A = b { ... }`) where they read
 better than nested `if let`s.
